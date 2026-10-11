@@ -541,8 +541,14 @@ def _json_safe(value: Any, depth: int = 0) -> Any:
     return f"<{type(value).__name__}>"
 
 
-def _snapshot(args: inspect.BoundArguments) -> dict[str, Any]:
-    return {name: _json_safe(value) for name, value in args.arguments.items() if name not in ("self", "cls")}
+def _snapshot(codec: RetrievalCodec[Any], args: inspect.BoundArguments) -> dict[str, Any]:
+    """The event's params. A recording error, like the others: an argument that cannot be read
+    is logged once and the snapshot is {}, so the hook runs the call and restores the knob."""
+    try:
+        return {name: _json_safe(value) for name, value in args.arguments.items() if name not in ("self", "cls")}
+    except Exception as e:
+        _log_once(f"snapshot:{codec.source}", f"contexteval could not snapshot the {codec.source} call arguments", e)
+        return {}
 
 
 # Each intercept is one decision before the library call and one after it, split so the sync
@@ -675,7 +681,7 @@ def _begin_retrieval(codec: RetrievalCodec[Any], args: inspect.BoundArguments) -
         return None
     outer = _Outermost(top_k=run.intervention.top_k)
     restore = _take_top_k(codec, args, outer)
-    params = _snapshot(args)
+    params = _snapshot(codec, args)
     return _PendingRetrieval(codec, run, args, params, _retrieving.set(outer), restore, perf_counter(), outer)
 
 
