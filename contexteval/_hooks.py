@@ -22,13 +22,12 @@ import copy
 import importlib
 import importlib.util
 import inspect
-import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Literal, Mapping, Union
 
 from . import _capture as capture
-from ._capture import InstallReport, LLMAdapter, Mode, Restore, RetrievalCodec
+from ._capture import InstallReport, LLMAdapter, Mode, Restore, RetrievalCodec, override_attr
 from ._intervention import InterventionNotApplicable
 from ._store import Store, find_project
 from .types import Chunk
@@ -204,37 +203,6 @@ class PineconeCodec(RetrievalCodec[Any]):
 # returns. Their LLM wrappers (ChatOpenAI, llama_index OpenAI, ...) call the official SDKs,
 # which the adapters below already hook, so no LLM rows are needed for them.
 
-_knob_lock = threading.Lock()
-# (id(instance), attribute) -> (the user's value, calls currently overriding it)
-_knobs: dict[tuple[int, str], tuple[Any, int]] = {}
-
-
-def _override_attr(instance: Any, attr: str, value: Any) -> Restore:
-    """Set `instance.attr` for one call and return what puts the user's value back.
-
-    Calls that overlap on one instance (an app that gathers two retrievals for one question)
-    all want the same value, because one run has one intervention: the first one in saves the
-    user's value and the last one out restores it, so no call restores another call's override.
-    Two runs wanting different values on one shared instance are not supported; the runner
-    executes one question at a time (plan item 7)."""
-    key = (id(instance), attr)
-    with _knob_lock:
-        saved, depth = _knobs.get(key, (getattr(instance, attr), 0))
-        _knobs[key] = (saved, depth + 1)
-        setattr(instance, attr, value)
-
-    def restore() -> None:
-        with _knob_lock:
-            saved, depth = _knobs[key]
-            if depth > 1:
-                _knobs[key] = (saved, depth - 1)
-            else:
-                del _knobs[key]
-                setattr(instance, attr, saved)
-
-    return restore
-
-
 @dataclass(frozen=True)
 class LangChainRetrieverCodec(RetrievalCodec[Any]):
     """langchain_core BaseRetriever.invoke(input, config=None, **kwargs) -> list[Document].
@@ -263,9 +231,9 @@ class LangChainRetrieverCodec(RetrievalCodec[Any]):
             kwargs["k"] = top_k
         search_kwargs = getattr(instance, "search_kwargs", None)
         if isinstance(search_kwargs, Mapping):
-            return _override_attr(instance, "search_kwargs", {**search_kwargs, "k": top_k})
+            return override_attr(instance, "search_kwargs", {**search_kwargs, "k": top_k})
         if isinstance(getattr(instance, "k", None), int):
-            return _override_attr(instance, "k", top_k)
+            return override_attr(instance, "k", top_k)
         raise InterventionNotApplicable(f"langchain: top_k={top_k} requested but {type(instance).__name__} has no search_kwargs or k")
 
     def decode(self, result: Any) -> tuple[Chunk, ...]:
@@ -312,7 +280,7 @@ class LlamaIndexRetrieverCodec(RetrievalCodec[Any]):
         instance = args.arguments.get("self")
         if not isinstance(getattr(instance, "similarity_top_k", None), int):
             raise InterventionNotApplicable(f"llamaindex: top_k={top_k} requested but {type(instance).__name__} has no similarity_top_k")
-        return _override_attr(instance, "similarity_top_k", top_k)
+        return override_attr(instance, "similarity_top_k", top_k)
 
     def decode(self, result: Any) -> tuple[Chunk, ...]:
         return tuple(
@@ -548,6 +516,7 @@ def uninstall_all() -> None:
     while _patched:
         owner, name, original = _patched.pop()
         setattr(owner, name, original)
+    capture.forget_knobs()
 
 
 # --- entry points -----------------------------------------------------------

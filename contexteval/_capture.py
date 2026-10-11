@@ -288,6 +288,7 @@ def reset_process() -> None:
     _process.logged.clear()
     _ambient.set(None)
     _retrieving.set(None)
+    forget_knobs()
 
 
 WRITER_QUEUE_MAX = 256  # closed buffers waiting for the writer; beyond this they are dropped and counted
@@ -445,6 +446,43 @@ def _current_run() -> ActiveRun | _Ambient | None:
 
 
 Restore = Callable[[], None]
+
+_knob_lock = threading.Lock()
+# (id(instance), attribute) -> (the user's value, calls currently overriding it)
+_knobs: dict[tuple[int, str], tuple[Any, int]] = {}
+
+
+def override_attr(instance: Any, attr: str, value: Any) -> Restore:
+    """Set `instance.attr` for one call and return what puts the user's value back.
+
+    Calls that overlap on one instance (an app that gathers two retrievals for one question)
+    all want the same value, because one run has one intervention: the first one in saves the
+    user's value and the last one out restores it, so no call restores another call's override.
+    Two runs wanting different values on one shared instance are not supported; the runner
+    executes one question at a time (plan item 7). The entry is recorded only once setattr
+    succeeded, so a setter that rejects the value leaves nothing for a later restore to skip."""
+    key = (id(instance), attr)
+    with _knob_lock:
+        saved, depth = _knobs.get(key, (getattr(instance, attr), 0))
+        setattr(instance, attr, value)
+        _knobs[key] = (saved, depth + 1)
+
+    def restore() -> None:
+        with _knob_lock:
+            saved, depth = _knobs[key]
+            if depth > 1:
+                _knobs[key] = (saved, depth - 1)
+            else:
+                del _knobs[key]
+                setattr(instance, attr, saved)
+
+    return restore
+
+
+def forget_knobs() -> None:
+    """Test seam, with reset_process and _hooks.uninstall_all: drop every saved knob value."""
+    with _knob_lock:
+        _knobs.clear()
 
 
 @runtime_checkable

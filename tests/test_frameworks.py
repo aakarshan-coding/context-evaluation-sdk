@@ -223,7 +223,7 @@ def test_knob_is_restored_when_the_retriever_raises(hooks: None) -> None:
         with pytest.raises(ValueError, match="index is down"):
             boom.invoke(QUESTION)
     assert boom.search_kwargs == {"k": 1}
-    assert _hooks._knobs == {}
+    assert capture._knobs == {}
 
 
 def test_custom_langchain_retriever_over_hooked_chroma_takes_top_k_from_the_inner_call(hooks: None, chroma_col: Any) -> None:
@@ -258,7 +258,7 @@ def test_wrapper_retriever_hands_top_k_to_its_base_retriever(hooks: None, lc_ret
     assert ev.source == "langchain" and len(ev.retrieved) == 4 and ev.params["k"] == 4
     assert [c.text for c in ev.retrieved] == [d.page_content for d in docs]
     assert lc_retriever.search_kwargs is users_kwargs and users_kwargs == {"k": 2}
-    assert _hooks._knobs == {}
+    assert capture._knobs == {}
 
 
 def test_per_call_k_is_overridden_and_the_event_records_the_applied_value(hooks: None, lc_retriever: Any) -> None:
@@ -299,11 +299,11 @@ def test_failed_knob_setattr_leaves_no_entry_and_a_later_restore_restores(hooks:
         with pytest.raises(InterventionNotApplicable, match="llamaindex: cannot set top_k=20"):
             retriever.retrieve(QUESTION)
     assert run.not_applicable is not None and retriever.similarity_top_k == 2
-    assert _hooks._knobs == {}
+    assert capture._knobs == {}
     with capture.active_run(QUESTION, Intervention(top_k=5)) as run:
         assert len(retriever.retrieve(QUESTION)) == 5
     assert run.retrievals[0].params["similarity_top_k"] == 5
-    assert retriever.similarity_top_k == 2 and _hooks._knobs == {}
+    assert retriever.similarity_top_k == 2 and capture._knobs == {}
 
 
 def test_retriever_without_a_top_k_knob_refuses_a_top_k_intervention(hooks: None) -> None:
@@ -337,7 +337,7 @@ def test_concurrent_overrides_on_one_retriever_restore_the_users_value(hooks: No
     assert [len(docs) for docs in results] == [3, 3]
     assert len(run.retrievals) == 2 and all(len(e.retrieved) == 3 for e in run.retrievals)
     assert lc_retriever.search_kwargs is users_kwargs and users_kwargs == {"k": 2}
-    assert _hooks._knobs == {}
+    assert capture._knobs == {}
 
 
 # --- transforms return the framework's own types --------------------------------------------
