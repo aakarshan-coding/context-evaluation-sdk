@@ -136,6 +136,27 @@ class FixedLI(LIBaseRetriever):
         return [NodeWithScore(node=TextNode(text=DOCS["d1"], id_="d1"), score=0.5)]
 
 
+class CappedLI(LIBaseRetriever):
+    """A LlamaIndex retriever whose similarity_top_k setter rejects values over 10."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._top_k = 2
+
+    @property
+    def similarity_top_k(self) -> int:
+        return self._top_k
+
+    @similarity_top_k.setter
+    def similarity_top_k(self, value: int) -> None:
+        if value > 10:
+            raise ValueError("similarity_top_k must be at most 10")
+        self._top_k = value
+
+    def _retrieve(self, query_bundle: QueryBundle) -> list[NodeWithScore]:
+        return [NodeWithScore(node=TextNode(text=t, id_=k), score=0.5) for k, t in list(DOCS.items())[: self._top_k]]
+
+
 # --- capture ------------------------------------------------------------------------------
 
 
@@ -266,6 +287,23 @@ def test_decorated_function_without_a_knob_takes_top_k_from_the_hooked_store_ins
         hits = search(QUESTION)
     assert len(hits) == 3
     assert [(e.source, len(e.retrieved), e.params["n_results"]) for e in run.retrievals] == [("retriever:search", 3, 3)]
+
+
+def test_failed_knob_setattr_leaves_no_entry_and_a_later_restore_restores(hooks: None) -> None:
+    """Review P4. Defect: the knob entry was recorded before `setattr` ran, so a setter that
+    rejects the experiment's value leaked a depth-1 entry; the next override on that retriever
+    saw depth 2 and its restore only decremented, leaving the user's retriever at the
+    experiment's value for the rest of the process."""
+    retriever = CappedLI()
+    with capture.active_run(QUESTION, Intervention(top_k=20)) as run:
+        with pytest.raises(InterventionNotApplicable, match="llamaindex: cannot set top_k=20"):
+            retriever.retrieve(QUESTION)
+    assert run.not_applicable is not None and retriever.similarity_top_k == 2
+    assert _hooks._knobs == {}
+    with capture.active_run(QUESTION, Intervention(top_k=5)) as run:
+        assert len(retriever.retrieve(QUESTION)) == 5
+    assert run.retrievals[0].params["similarity_top_k"] == 5
+    assert retriever.similarity_top_k == 2 and _hooks._knobs == {}
 
 
 def test_retriever_without_a_top_k_knob_refuses_a_top_k_intervention(hooks: None) -> None:
