@@ -67,7 +67,7 @@ class Chunk:
 
 @dataclass(frozen=True)
 class RetrievalEvent:
-    source: str  # "chromadb" | "pinecone" | "retriever:<function name>"
+    source: str  # "chromadb" | "pinecone" | "langchain" | "llamaindex" | "retriever:<function name>"
     query: str | None  # None when the store was queried by vector only
     params: Mapping[str, Any]  # JSON-safe snapshot of the call's params after overrides
     retrieved: tuple[Chunk, ...]  # what the store returned

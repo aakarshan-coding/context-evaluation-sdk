@@ -3,7 +3,7 @@
 Public surface is deliberately two names for app code plus read-only types:
 
     import contexteval
-    contexteval.init()                      # hook chromadb, pinecone, openai, anthropic
+    contexteval.init()                      # hook chromadb, pinecone, langchain, llama_index, openai, anthropic
 
     @contexteval.retriever(top_k="k")       # custom retrieval (pgvector, SQL, APIs)
     def search(query: str, k: int = 5) -> list[dict]: ...

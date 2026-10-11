@@ -2,6 +2,16 @@
 
 This project follows [Semantic Versioning](https://semver.org/). Each release lists what changed for people who use contexteval.
 
+## Unreleased
+
+### Added
+
+- LangChain and LlamaIndex apps work without changes. contexteval hooks LangChain `BaseRetriever.invoke` and `ainvoke` and LlamaIndex `BaseRetriever.retrieve` and `aretrieve`. Captured chunks, `top_k` experiments (through `search_kwargs["k"]` or `similarity_top_k`, set per call and restored), and diagnosis replays work as for chromadb, and injected evidence arrives as a `Document` or a `NodeWithScore`. New extras `langchain` and `llamaindex`.
+
+### Fixed
+
+- A retrieval that reaches a hooked store from inside another hooked retrieval (langchain-chroma over chromadb, or a `@contexteval.retriever` function that queries chromadb) is recorded once, not twice, and an experiment setting applies to it once.
+
 ## 0.2.0 (v1.1, 2026-10-11)
 
 ### Changed

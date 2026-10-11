@@ -10,7 +10,7 @@ Most RAG failures are context failures, and they come in three kinds:
 
 Each label points at a different fix. Missing calls for better retrieval, such as a larger `top_k`. Irrelevant calls for a reranker or fewer chunks. Ignored calls for a different chunk order or shorter chunks. contexteval then lets you test those fixes against your test set with one command.
 
-You do not change your app. contexteval hooks chromadb, pinecone, OpenAI, and Anthropic from the outside. Custom retrieval needs one decorator.
+You do not change your app. contexteval hooks chromadb, pinecone, LangChain and LlamaIndex retrievers, OpenAI, and Anthropic from the outside. Custom retrieval needs one decorator.
 
 ## Install
 
@@ -30,7 +30,7 @@ cd context-evaluation-sdk
 pip install ".[demo]"
 ```
 
-The extras are `openai`, `anthropic`, `chroma`, `pinecone`, and `demo` (chromadb plus openai). Install the ones your app uses, for example `pip install "contexteval[openai,chroma]"`, or `pip install ".[openai,chroma]"` from source.
+The extras are `openai`, `anthropic`, `chroma`, `pinecone`, `langchain`, `llamaindex`, and `demo` (chromadb plus openai). Install the ones your app uses, for example `pip install "contexteval[openai,chroma]"`, or `pip install ".[openai,chroma]"` from source. An app that already has its libraries installed needs no extra; the extras only install those libraries.
 
 Release steps for maintainers are in [docs/RELEASING.md](https://github.com/aakarshan-coding/context-evaluation-sdk/blob/main/docs/RELEASING.md).
 
@@ -132,7 +132,18 @@ The whole workflow made 39 calls to `gpt-4.1-mini` and cost $0.0038 in our run. 
 
 contexteval needs one function that takes a question and returns an answer string. You pass it to the CLI as `module:function`. The CLI imports the module from the current directory.
 
-If your app queries chromadb or pinecone and calls OpenAI or Anthropic, it works as is. contexteval patches those clients before it imports your module.
+If your app queries chromadb or pinecone, or retrieves through a LangChain or LlamaIndex retriever, and calls OpenAI or Anthropic, directly or through the framework's chat model, it works as is. contexteval patches those classes before it imports your module.
+
+### Supported stacks
+
+| Layer | Hooked |
+|---|---|
+| Vector stores | chromadb `Collection.query` and `AsyncCollection.query`; pinecone `Index.query` |
+| Frameworks | LangChain `BaseRetriever.invoke` and `ainvoke`, so any retriever, including `VectorStoreRetriever` over langchain-chroma or another vector store; LlamaIndex `BaseRetriever.retrieve` and `aretrieve`, so any retriever, including `VectorIndexRetriever` |
+| LLM clients | OpenAI chat completions and responses, Anthropic messages, sync and async. Framework chat models such as `ChatOpenAI` call these SDKs, so they are covered through them |
+| Anything else | `@contexteval.retriever` on your search function |
+
+A framework retriever that queries a hooked store underneath, such as langchain-chroma over chromadb, records one retrieval, owned by the retriever. A `top_k` experiment sets the framework's own knob for each call and puts it back afterwards: `search_kwargs["k"]` (or a `k` field) on a LangChain retriever, `similarity_top_k` on a LlamaIndex retriever. Injected evidence reaches your code as a `Document` or a `NodeWithScore`, so your prompt code needs no change.
 
 If your app retrieves some other way (pgvector, SQL, a search API, hand-written code), mark the search function with `@contexteval.retriever`. Name the parameter that controls how many results come back, so experiments can change it. Each result item is a string or a dict whose text sits under `text`:
 
@@ -240,9 +251,12 @@ LLM calls go to your provider with your own key, read from `OPENAI_API_KEY` or `
 
 The estimate counts characters divided by 4 as tokens, priced from a built-in table. It assumes every answer needs an LLM grade, so the real cost is usually lower. contexteval does not report actual spend after a command. Your provider's usage page has the exact figure.
 
-## Limits in v1
+## Limits
 
-- Hooked calls are chromadb `Collection.query` and `AsyncCollection.query`, pinecone `Index.query`, OpenAI chat completions and responses (`OpenAI` and `AsyncOpenAI`), and Anthropic messages (`Anthropic` and `AsyncAnthropic`). The pinecone hook is tested against mocks only, and pinecone's async index is not hooked.
+- Hooked calls are chromadb `Collection.query` and `AsyncCollection.query`, pinecone `Index.query`, LangChain `BaseRetriever.invoke` and `ainvoke`, LlamaIndex `BaseRetriever.retrieve` and `aretrieve`, OpenAI chat completions and responses (`OpenAI` and `AsyncOpenAI`), and Anthropic messages (`Anthropic` and `AsyncAnthropic`). The pinecone hook is tested against mocks only, and pinecone's async index is not hooked.
+- The framework hooks are tested with langchain-core 1.6, langchain-chroma, and llama-index-core 0.14. `ChatOpenAI` and the LlamaIndex OpenAI LLM are covered through the SDK hooks; the test suite exercises that path with a stand-in chat model that calls the openai SDK, not the framework LLM packages themselves.
+- A `top_k` experiment on a LangChain or LlamaIndex retriever needs `search_kwargs`, a `k` field, or `similarity_top_k` on the retriever. Without one the experiment stops with an error instead of running the baseline. The knob is set per call and restored, also when the call raises. Two runs that want different `top_k` values on one shared retriever at the same time are not supported; the CLI runs one question at a time, so this does not arise there.
+- The outermost hooked retrieval owns the event. A `@contexteval.retriever` function that queries chromadb inside records one retrieval, as a framework retriever does. If it runs that query on a thread pool of its own, the inner query is recorded as well, because the thread has no copy of the calling context.
 - `@contexteval.retriever` accepts `async def` functions, and `answer` may be `async def`. The CLI runs an async `answer` on one event loop for the whole command, so clients bound to the loop stay valid across questions. In production each asyncio task has its own capture buffer.
 - pgvector has no client library to hook. Use `@contexteval.retriever` on your query function.
 - Production traces are split by a heuristic. Each LLM call closes one trace that holds the retrievals since the previous LLM call. An agent that calls the LLM several times per question produces several traces.
@@ -254,7 +268,7 @@ The estimate counts characters divided by 4 as tokens, priced from a built-in ta
 
 ## Roadmap
 
-- v2. An automatic sweep that picks experiments from the labels: larger `top_k` for missing, reranking for irrelevant, reordering for ignored. LangChain and LlamaIndex plugins.
+- v2. LangChain and LlamaIndex support (done). An automatic sweep that picks experiments from the labels: larger `top_k` for missing, reranking for irrelevant, reordering for ignored.
 - v3. A background optimizer that replays sampled production traces and suggests changes. OpenTelemetry import.
 - v4. Support for long-running tool agents. A hosted team version.
 

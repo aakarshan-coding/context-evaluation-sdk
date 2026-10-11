@@ -11,7 +11,7 @@ requires-python = ">=3.10"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "aakarshan-coding" }]
-keywords = ["rag", "llm", "evaluation", "retrieval", "context", "diagnosis", "openai", "anthropic", "chromadb", "pinecone"]
+keywords = ["rag", "llm", "evaluation", "retrieval", "context", "diagnosis", "openai", "anthropic", "chromadb", "pinecone", "langchain", "llamaindex"]
 # No "License ::" classifier: PEP 639 metadata carries the license in `license` above, and setuptools rejects both.
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -39,8 +39,10 @@ openai = ["openai>=1.40"]
 anthropic = ["anthropic>=0.34"]
 chroma = ["chromadb>=0.5"]
 pinecone = ["pinecone>=5"]
+langchain = ["langchain-core>=0.3"]
+llamaindex = ["llama-index-core>=0.11"]
 demo = ["chromadb>=0.5", "openai>=1.40"]
-dev = ["pytest>=8", "chromadb>=0.5", "openai>=1.40", "anthropic>=0.34", "httpx"]
+dev = ["pytest>=8", "chromadb>=0.5", "openai>=1.40", "anthropic>=0.34", "httpx", "langchain-core>=0.3", "langchain-chroma", "llama-index-core>=0.11"]
 
 [project.scripts]
 contexteval = "contexteval._cli:main"
