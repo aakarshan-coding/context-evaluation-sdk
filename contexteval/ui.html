@@ -64,7 +64,7 @@ select {
   font: inherit; color: var(--text); background: var(--panel);
   border: 1px solid var(--border); border-radius: 6px; padding: 4px 8px; max-width: 100%;
 }
-main { max-width: 1280px; margin: 0 auto; padding: 16px; display: grid; gap: 16px; }
+main { max-width: 1280px; margin: 0 auto; padding: 16px; display: grid; gap: 16px; grid-template-columns: minmax(0, 1fr); }
 .split { display: grid; gap: 16px; grid-template-columns: minmax(0, 1fr); }
 @media (min-width: 900px) { .split { grid-template-columns: minmax(280px, 2fr) minmax(0, 3fr); } }
 section {
@@ -122,7 +122,8 @@ ul.replays { margin: 4px 0 0; padding-left: 18px; font-size: 13.5px; }
 .table-wrap { overflow-x: auto; }
 table { border-collapse: collapse; width: 100%; font-size: 14px; }
 th, td { text-align: right; padding: 6px 10px; border-bottom: 1px solid var(--border); white-space: nowrap; }
-th:first-child, td:first-child { text-align: left; white-space: normal; overflow-wrap: anywhere; }
+th:first-child, td:first-child { text-align: left; white-space: normal; min-width: 8em; }
+th { white-space: normal; }
 th { font-size: 12px; color: var(--muted); font-weight: 600; }
 tr.best td { font-weight: 600; }
 .bar { display: inline-block; height: 8px; border-radius: 4px; background: var(--accent); vertical-align: middle; margin-right: 6px; }
@@ -220,8 +221,10 @@ function writeHash() {
 }
 
 function runLabel(run) {
-  const counts = run.passed + run.failed > 0 ? ` ${run.passed}/${run.passed + run.failed} passed` : ` ${run.traces} traces`;
-  return `#${run.id} ${run.kind} ${run.setting}${counts}`;
+  const graded = run.passed + run.failed;
+  const counts = graded > 0 ? `${run.passed}/${graded} passed` : `${run.traces} traces`;
+  const setting = run.setting === "baseline" ? "" : ` ${run.setting}`;
+  return `#${run.id} ${run.kind}${setting}, ${counts}`;
 }
 
 async function loadRuns() {
@@ -275,7 +278,7 @@ function renderFailures() {
       type: "button",
       "aria-current": t.id === state.traceId ? "true" : "false",
       "data-trace": t.id,
-      onclick: () => selectTrace(t.id),
+      onclick: () => selectTrace(t.id, true),
     },
       el("span", {}, t.passed === false ? badge(t.diagnosis) : passBadge(t.passed),
         el("span", { className: "q", text: t.question })),
@@ -305,7 +308,7 @@ function chunkItem(chunk, opts) {
 
 const CITED_TEXT = { irrelevant: "removed by replay", ignored: "gold position before replay" };
 
-async function selectTrace(traceId) {
+async function selectTrace(traceId, reveal) {
   state.traceId = traceId;
   writeHash();
   for (const b of document.querySelectorAll("#failures button")) {
@@ -377,6 +380,8 @@ async function selectTrace(traceId) {
     el("span", { text: `${m.output_tokens} output tokens` }),
     el("span", { text: fmt(m.latency_ms, 0) + " ms" }),
     el("span", { text: m.cost_usd === null ? "cost n/a" : "$" + fmt(m.cost_usd, 4) })));
+  // Stacked layout on narrow screens puts the detail below the list, out of sight.
+  if (reveal && matchMedia("(max-width: 899px)").matches) detail.parentElement.scrollIntoView({ behavior: "smooth" });
 }
 
 async function loadExperiments() {
@@ -394,7 +399,8 @@ async function loadExperiments() {
     clear(tableBox).append(experimentTable(x.rows));
   };
   picker.addEventListener("change", render);
-  box.append(experiments.length > 1 ? el("p", {}, el("label", { className: "muted" }, "Experiment ", picker)) : null, tableBox);
+  if (experiments.length > 1) box.append(el("p", {}, el("label", { className: "muted" }, "Experiment ", picker)));
+  box.append(tableBox);
   render();
 }
 
