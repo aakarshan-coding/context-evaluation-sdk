@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from contexteval._intervention import BASELINE, Order, Setting
-from contexteval._store import PROJECT_DIR_NAME, Store, find_project
+from contexteval._store import PROJECT_DIR_NAME, SCHEMA_VERSION, Store, find_project
 from contexteval.types import (
     Answered,
     CaseId,
@@ -177,12 +177,58 @@ def test_experiment_table_aggregates_per_run(store: Store) -> None:
     store.add_trace(base, _trace(test=TestOutcome(CASE.id, True, "substring")))
     store.add_trace(big, _trace(test=TestOutcome(CASE.id, True, "substring"), cost=None))
     rows = store.experiment_table(eid)
-    assert [(r.setting_name, r.cases, r.passed, r.accuracy) for r in rows] == [("baseline", 2, 1, 0.5), ("top_k=10", 1, 1, 1.0)]
+    assert [(r.run_id, r.setting_name, r.cases, r.passed, r.accuracy) for r in rows] == [(base, "baseline", 2, 1, 0.5), (big, "top_k=10", 1, 1, 1.0)]
     assert rows[0].mean_input_tokens == 20 and rows[0].mean_latency_ms == 130.0
     assert rows[0].total_cost_usd == pytest.approx(0.002)
     assert rows[1].total_cost_usd is None
-    assert store.experiments() == [(eid, store.experiments()[0][1])]
+    (info,) = store.experiments()
+    assert (info.id, info.kind, info.report) == (eid, "manual", None) and store.experiment(eid) == info
     assert store.experiment_table(eid + 1) == []  # type: ignore[operator]
+    with pytest.raises(KeyError):
+        store.experiment(eid + 1)  # type: ignore[operator]
+
+
+def test_sweep_experiment_keeps_its_kind_and_report(store: Store) -> None:
+    """Defect: a sweep is stored as a plain experiment, so the dashboard and the CLI cannot tell
+    it from a hand-run grid or find its recommendation; or the report does not round-trip."""
+    manual = store.new_experiment()
+    sweep = store.new_experiment("sweep")
+    report = {"recommended_run": 7, "rounds": [[2, 3]], "labels": {"missing/not_retrieved": 2}}
+    store.save_experiment_report(sweep, report)
+    assert [(e.id, e.kind, e.report) for e in store.experiments()] == [(sweep, "sweep", report), (manual, "manual", None)]
+    store.save_experiment_report(sweep, {"recommended_run": None})
+    assert store.experiment(sweep).report == {"recommended_run": None}
+    with pytest.raises(sqlite3.IntegrityError):
+        store.new_experiment("guess")  # type: ignore[arg-type]
+
+
+def test_v1_database_migrates_and_a_newer_one_is_refused(tmp_path: Path) -> None:
+    """Defect: a project created by 0.2.0 (schema 1, experiments without kind or report) fails to
+    open after upgrading, or its experiments come back without a kind; a database written by a
+    newer build must still be refused instead of read with the wrong columns."""
+    directory = tmp_path / PROJECT_DIR_NAME
+    directory.mkdir()
+    conn = sqlite3.connect(str(directory / "contexteval.db"))
+    conn.executescript(
+        "CREATE TABLE experiments (id INTEGER PRIMARY KEY, created_at TEXT NOT NULL);"
+        "INSERT INTO experiments (created_at) VALUES ('2026-10-11T00:00:00+00:00');"
+        "PRAGMA user_version=1;"
+    )
+    conn.close()
+    store = Store.open(tmp_path)
+    try:
+        (old,) = store.experiments()
+        assert (old.kind, old.report, old.created_at) == ("manual", None, "2026-10-11T00:00:00+00:00")
+        assert store.new_experiment("sweep") == old.id + 1
+        assert store._conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+    finally:
+        store.close()
+    newer = sqlite3.connect(str(directory / "contexteval.db"))
+    newer.execute(f"PRAGMA user_version={SCHEMA_VERSION + 1}")
+    newer.commit()
+    newer.close()
+    with pytest.raises(RuntimeError, match=f"schema version {SCHEMA_VERSION + 1}"):
+        Store.open(tmp_path)
 
 
 def test_mean_app_tokens_reads_latest_baseline(store: Store) -> None:

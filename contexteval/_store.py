@@ -13,7 +13,7 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Literal
+from typing import Any, Iterable, Literal, Mapping
 
 from ._intervention import Setting
 from .types import (
@@ -49,9 +49,10 @@ from .types import (
 
 PROJECT_DIR_NAME = ".contexteval"
 DB_FILE = "contexteval.db"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 RunKind = Literal["baseline", "experiment", "production"]
+ExperimentKind = Literal["manual", "sweep"]
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS test_cases (
@@ -65,7 +66,9 @@ CREATE TABLE IF NOT EXISTS test_cases (
 );
 CREATE TABLE IF NOT EXISTS experiments (
   id         INTEGER PRIMARY KEY,
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  kind       TEXT NOT NULL DEFAULT 'manual' CHECK (kind IN ('manual','sweep')),
+  report     TEXT                            -- sweep report JSON, owned by _sweep; NULL for manual
 );
 CREATE TABLE IF NOT EXISTS runs (
   id            INTEGER PRIMARY KEY,
@@ -104,6 +107,15 @@ CREATE TABLE IF NOT EXISTS diagnoses (
 );
 CREATE INDEX IF NOT EXISTS traces_run ON traces(run_id);
 """
+
+# Schema version -> statements that bring it to the next version. Each runs once, under the
+# version check in Store.open, so an old project opens in place instead of being refused.
+_MIGRATIONS: dict[int, str] = {
+    1: """
+    ALTER TABLE experiments ADD COLUMN kind TEXT NOT NULL DEFAULT 'manual' CHECK (kind IN ('manual','sweep'));
+    ALTER TABLE experiments ADD COLUMN report TEXT;
+    """,
+}
 
 
 def find_project(start: Path) -> Path | None:
@@ -244,6 +256,14 @@ class RunSummary:
     failed: int  # graded traces that failed; ungraded (production) traces count in neither
 
 
+@dataclass(frozen=True)
+class ExperimentInfo:
+    id: ExperimentId
+    kind: ExperimentKind
+    created_at: str
+    report: dict[str, Any] | None  # the sweep's stored report (its JSON shape belongs to _sweep)
+
+
 _TRACE_COLUMNS = """
     t.id, t.run_id, r.setting, t.case_id, t.question, t.answer, t.error, t.passed, t.grade_method,
     t.retrievals, t.llm_calls, t.in_prompt, t.input_tokens, t.output_tokens, t.latency_ms, t.cost_usd,
@@ -272,10 +292,13 @@ class Store:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys=ON")
         version = conn.execute("PRAGMA user_version").fetchone()[0]
-        if version not in (0, SCHEMA_VERSION):
+        if version not in (0, SCHEMA_VERSION, *_MIGRATIONS):
             conn.close()
             raise RuntimeError(f"{directory / DB_FILE}: schema version {version}, this build reads {SCHEMA_VERSION}")
         with conn:
+            while 0 < version < SCHEMA_VERSION:
+                conn.executescript(_MIGRATIONS[version])
+                version += 1
             conn.executescript(_SCHEMA)
             conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         return cls(conn)
@@ -439,15 +462,20 @@ class Store:
             )
 
     # experiments
-    def new_experiment(self) -> ExperimentId:
+    def new_experiment(self, kind: ExperimentKind = "manual") -> ExperimentId:
         with self._conn:
-            cur = self._conn.execute("INSERT INTO experiments (created_at) VALUES (?)", (_now(),))
+            cur = self._conn.execute("INSERT INTO experiments (created_at, kind) VALUES (?, ?)", (_now(), kind))
         return ExperimentId(cur.lastrowid)
+
+    def save_experiment_report(self, experiment: ExperimentId, report: Mapping[str, Any]) -> None:
+        """Replaces the report, so a sweep can store its outcome once every run is in."""
+        with self._conn:
+            self._conn.execute("UPDATE experiments SET report = ? WHERE id = ?", (json.dumps(report), experiment))
 
     def experiment_table(self, experiment: ExperimentId) -> list[ExperimentRow]:
         """GROUP BY run over traces: count, sum(passed), avg(input_tokens), avg(latency), sum(cost)."""
         rows = self._conn.execute(
-            """SELECT r.setting, COUNT(t.id), COALESCE(SUM(t.passed), 0), COALESCE(AVG(t.input_tokens), 0),
+            """SELECT r.id, r.setting, COUNT(t.id), COALESCE(SUM(t.passed), 0), COALESCE(AVG(t.input_tokens), 0),
                       COALESCE(AVG(t.latency_ms), 0), SUM(t.cost_usd), COUNT(t.cost_usd)
                FROM runs r LEFT JOIN traces t ON t.run_id = r.id
                WHERE r.experiment_id = ?
@@ -455,9 +483,10 @@ class Store:
             (experiment,),
         ).fetchall()
         table = []
-        for setting, cases, passed, mean_in, mean_lat, cost, priced in rows:
+        for run_id, setting, cases, passed, mean_in, mean_lat, cost, priced in rows:
             table.append(
                 ExperimentRow(
+                    run_id=RunId(run_id),
                     setting_name=Setting.from_json(json.loads(setting)).name,
                     cases=cases,
                     passed=passed,
@@ -469,12 +498,20 @@ class Store:
             )
         return table
 
-    def experiments(self) -> list[tuple[ExperimentId, str]]:
-        """(id, created_at), newest first."""
-        return [
-            (ExperimentId(eid), created_at)
-            for eid, created_at in self._conn.execute("SELECT id, created_at FROM experiments ORDER BY id DESC")
-        ]
+    def experiments(self) -> list[ExperimentInfo]:
+        """Newest first."""
+        return [self._experiment(row) for row in self._conn.execute("SELECT id, kind, created_at, report FROM experiments ORDER BY id DESC")]
+
+    def experiment(self, experiment: ExperimentId) -> ExperimentInfo:
+        row = self._conn.execute("SELECT id, kind, created_at, report FROM experiments WHERE id = ?", (experiment,)).fetchone()
+        if row is None:
+            raise KeyError(f"no experiment {experiment}")
+        return self._experiment(row)
+
+    @staticmethod
+    def _experiment(row: tuple[Any, ...]) -> ExperimentInfo:
+        eid, kind, created_at, report = row
+        return ExperimentInfo(id=ExperimentId(eid), kind=kind, created_at=created_at, report=json.loads(report) if report is not None else None)
 
     def mean_app_tokens(self) -> tuple[int, int] | None:
         """Mean (input, output) app tokens per trace from the latest baseline. Feeds cost estimates."""

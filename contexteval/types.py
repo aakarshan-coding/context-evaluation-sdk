@@ -352,6 +352,7 @@ def explain(d: Diagnosis) -> str:
 class ExperimentRow:
     """One grid row. Always derived from stored traces by Store.experiment_table."""
 
+    run_id: RunId  # the run the row aggregates; a sweep names its recommended row by it
     setting_name: str
     cases: int
     passed: int

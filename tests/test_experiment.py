@@ -148,7 +148,7 @@ def test_missing_case_passes_with_larger_top_k(project: Path, hooks: None, capsy
 
     store = Store.open(project)
     try:
-        (eid, _), *_ = store.experiments()
+        eid = store.experiments()[0].id
         runs = [r for r in reversed(store.runs()) if r.experiment_id == eid]
         traces = {r.run.setting.name: store.traces(r.run.id) for r in runs}
         table = store.experiment_table(eid)

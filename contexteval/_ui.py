@@ -17,7 +17,7 @@ from importlib import resources
 from typing import Any, Callable
 
 from . import _text as text
-from ._store import RunSummary, Store, StoredTrace
+from ._store import ExperimentInfo, RunSummary, Store, StoredTrace
 from .types import (
     Answered,
     Chunk,
@@ -187,8 +187,8 @@ def _row_json(row: ExperimentRow) -> Json:
     }
 
 
-def _experiment_json(store: Store, eid: ExperimentId, created_at: str) -> Json:
-    return {"id": eid, "created_at": created_at, "rows": [_row_json(r) for r in store.experiment_table(eid)]}
+def _experiment_json(store: Store, info: ExperimentInfo) -> Json:
+    return {"id": info.id, "created_at": info.created_at, "rows": [_row_json(r) for r in store.experiment_table(info.id)]}
 
 
 # --- handlers ----------------------------------------------------------------
@@ -214,14 +214,15 @@ def api_trace(store: Store, trace_id: int) -> Json:
 
 
 def api_experiments(store: Store) -> Json:
-    return {"experiments": [_experiment_json(store, eid, created_at) for eid, created_at in store.experiments()]}
+    return {"experiments": [_experiment_json(store, info) for info in store.experiments()]}
 
 
 def api_experiment(store: Store, experiment_id: int) -> Json:
-    for eid, created_at in store.experiments():
-        if eid == experiment_id:
-            return _experiment_json(store, eid, created_at)
-    raise NotFound(f"no experiment {experiment_id}")
+    try:
+        info = store.experiment(ExperimentId(experiment_id))
+    except KeyError:
+        raise NotFound(f"no experiment {experiment_id}") from None
+    return _experiment_json(store, info)
 
 
 # Each pattern's groups are integer ids, passed to the handler in order.

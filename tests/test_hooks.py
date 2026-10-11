@@ -23,7 +23,7 @@ openai = pytest.importorskip("openai")
 from contexteval import _capture as capture  # noqa: E402
 from contexteval import _hooks  # noqa: E402
 from contexteval._intervention import BASELINE, InjectEvidence, Intervention, InterventionNotApplicable, KeepFirst, LexicalRerank  # noqa: E402
-from contexteval._store import Store  # noqa: E402
+from contexteval._store import SCHEMA_VERSION, Store  # noqa: E402
 from contexteval.demo.app import HashEmbedding  # noqa: E402
 from contexteval.types import Answered, Evidence  # noqa: E402
 
@@ -540,10 +540,10 @@ def test_init_reports_a_schema_mismatch_instead_of_raising(tmp_path: Path, clean
 
     (tmp_path / ".contexteval").mkdir()
     conn = sqlite3.connect(str(tmp_path / ".contexteval" / "contexteval.db"))
-    conn.execute("PRAGMA user_version=2")
+    conn.execute(f"PRAGMA user_version={SCHEMA_VERSION + 1}")
     conn.commit()
     conn.close()
-    _assert_init_failed_safely(contexteval.init(tmp_path), "schema version 2")
+    _assert_init_failed_safely(contexteval.init(tmp_path), f"schema version {SCHEMA_VERSION + 1}")
 
 
 def test_init_reports_an_unwritable_project_dir_instead_of_raising(tmp_path: Path, clean_hooks: None) -> None:
