@@ -24,6 +24,7 @@ from contexteval.types import (
     JudgeVerdict,
     LLMCall,
     Metrics,
+    ReplayStep,
     RetrievalEvent,
     TestCase,
     TestOutcome,
@@ -247,3 +248,14 @@ def test_estimate_counts_judge_calls_and_worst_case_grades(store: Store) -> None
     est = _diagnose.estimate_diagnosis(FakeProvider(), todo)
     assert est.calls == 1 + _diagnose.MAX_REPLAYS
     assert est.usd == 0.0
+
+
+def test_locate_gold_names_the_ladder_steps_that_would_change_nothing() -> None:
+    """Review Y3. Defect: the identity check reads something other than the baseline's delivered
+    chunks, so a step is skipped when it would move gold, or run when it is the identity."""
+    first = locate_gold(GOLD, _event_trace(CASE.question, [GOLD.text, OFF_TOPIC], [GOLD.text, OFF_TOPIC], [GOLD.text, OFF_TOPIC]))
+    assert first.unchanged == {ReplayStep.GOLD_TO_TOP}
+    alone = locate_gold(GOLD, _event_trace(CASE.question, [GOLD.text], [GOLD.text], [GOLD.text]))
+    assert alone.unchanged == {ReplayStep.GOLD_TO_TOP, ReplayStep.ONLY_GOLD}
+    second = locate_gold(GOLD, _event_trace(CASE.question, [OFF_TOPIC, GOLD.text], [OFF_TOPIC, GOLD.text], [OFF_TOPIC, GOLD.text]))
+    assert second.unchanged == frozenset()

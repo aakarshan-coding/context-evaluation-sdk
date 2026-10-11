@@ -12,7 +12,7 @@ from enum import Enum
 from typing import Callable, Literal, Mapping, Sequence
 
 from . import _text as text
-from ._intervention import NO_INTERVENTION, GoldToTop, InjectEvidence, Intervention, OnlyGold
+from ._intervention import NO_INTERVENTION, GoldToTop, InjectEvidence, Intervention, OnlyGold, apply
 from ._llm import Estimate, LLMRequest, Provider, Task, estimate
 from ._runner import App, Grader, estimate_grading, run_case
 from ._store import Store, StoredTrace
@@ -53,6 +53,9 @@ class GoldMap:
     location: GoldLocation
     gold: tuple[ChunkRef, ...]  # in-prompt delivered chunks holding the evidence
     other: tuple[ChunkRef, ...]  # in-prompt delivered chunks without it
+    # Ladder steps whose transform leaves every retrieval's delivered chunks as they are. Such a
+    # replay is a second baseline rerun, so a pass would be chance; diagnose_case skips it.
+    unchanged: frozenset[ReplayStep] = frozenset()
 
 
 def _gold_refs(per_retrieval: Sequence[tuple[Chunk, ...]], evidence: Evidence) -> set[ChunkRef]:
@@ -75,7 +78,12 @@ def locate_gold(evidence: Evidence, trace: Trace) -> GoldMap:
     gold = tuple(ref for ref in trace.in_prompt if ref in delivered_gold)
     if gold:
         other = tuple(ref for ref in trace.in_prompt if ref not in delivered_gold)
-        return GoldMap(GoldLocation.IN_PROMPT, gold, other)
+        unchanged = frozenset(
+            step
+            for step, _ in LADDER
+            if all(apply(REPLAY_INTERVENTION[step](evidence), e.delivered, e.query) == e.delivered for e in trace.retrievals)
+        )
+        return GoldMap(GoldLocation.IN_PROMPT, gold, other, unchanged)
     if delivered_gold or _gold_refs([e.retrieved for e in trace.retrievals], evidence):
         return GoldMap(GoldLocation.DROPPED, (), ())
     return GoldMap(GoldLocation.NOT_RETRIEVED, (), ())
@@ -116,7 +124,8 @@ def diagnose_case(gold: GoldMap, replay: Replay) -> Diagnosis:
 
     Order (plan items 3, 4, 5): the flaky rerun first for every case, then the inject
     confirmation for a missing case, then the ladder. Replays are lazy: a case stops at the
-    first deciding step, so cost is 2 to MAX_REPLAYS app calls.
+    first deciding step, so cost is 1 to MAX_REPLAYS app calls. A ladder step in gold.unchanged
+    is not replayed: it would rerun the baseline that just failed.
     """
     outcomes = [replay(ReplayStep.BASELINE_RERUN)]
     if outcomes[0].passed:
@@ -127,6 +136,8 @@ def diagnose_case(gold: GoldMap, replay: Replay) -> Diagnosis:
         outcomes.append(injected)
         return Missing(cause, confirmed=injected.passed, replays=tuple(outcomes))
     for step, build in LADDER:
+        if step in gold.unchanged:
+            continue  # recorded by its absence from the replays; types.explain names it
         outcome = replay(step)
         outcomes.append(outcome)
         if outcome.passed:

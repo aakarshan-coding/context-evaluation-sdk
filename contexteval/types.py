@@ -244,6 +244,32 @@ def _positions(refs: tuple[ChunkRef, ...]) -> str:
     return "; ".join(parts) if parts else "no chunks"
 
 
+LADDER_STEPS = (ReplayStep.GOLD_TO_TOP, ReplayStep.ONLY_GOLD)
+# Ladder step -> (what it does, why the diagnoser skips it when it would change nothing).
+_LADDER_TEXT = {
+    ReplayStep.GOLD_TO_TOP: ("moving gold to the top", "gold was already at the top"),
+    ReplayStep.ONLY_GOLD: ("keeping only gold", "gold was the only context"),
+}
+
+
+def skipped_steps(d: Diagnosis) -> tuple[ReplayStep, ...]:
+    """Ladder steps the diagnoser skipped because they would not change the context. The ladder
+    runs every step before the deciding one, so a missing step means a skip."""
+    match d:
+        case Irrelevant(replays=replays):
+            before = LADDER_STEPS[:1]
+        case NotContext(replays=replays):
+            before = LADDER_STEPS
+        case _:
+            return ()
+    ran = {r.step for r in replays}
+    return tuple(s for s in before if s not in ran)
+
+
+def _skip_clause(steps: tuple[ReplayStep, ...]) -> str:
+    return "; ".join(f"{_LADDER_TEXT[s][0]} was skipped because {_LADDER_TEXT[s][1]}" for s in steps)
+
+
 def explain(d: Diagnosis) -> str:
     """Human evidence line, e.g. "keeping only gold chunks fixed it"."""
     match d:
@@ -254,11 +280,19 @@ def explain(d: Diagnosis) -> str:
             fix = "fixed it" if ok else "did not fix it"
             return f"the gold chunk was retrieved but dropped before the prompt; injecting the evidence {fix}"
         case Irrelevant(removed=removed):
-            return f"keeping only the gold chunks fixed it; removed {_positions(removed)}"
+            skipped = skipped_steps(d)
+            line = f"keeping only the gold chunks fixed it; removed {_positions(removed)}"
+            return f"{line}; {_skip_clause(skipped)}" if skipped else line
         case Ignored(gold_at=at):
             return f"moving the gold chunk to the top fixed it; gold was at {_positions(at)}"
         case NotContext():
-            return "neither moving gold to the top nor keeping only gold fixed it"
+            skipped = skipped_steps(d)
+            tried = [_LADDER_TEXT[s][0] for s in LADDER_STEPS if s not in skipped]
+            if not skipped:
+                return "neither moving gold to the top nor keeping only gold fixed it"
+            if not tried:
+                return "gold was already the only context at the top, so moving it to the top and keeping only gold were skipped"
+            return f"{' and '.join(tried)} did not fix it; {_skip_clause(skipped)}"
         case Flaky():
             return "the unchanged baseline passed on rerun"
         case Judged(verdict=v, rationale=why):
