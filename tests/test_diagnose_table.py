@@ -198,7 +198,7 @@ def test_ladder_skips_a_step_that_would_not_change_the_context(unchanged, passin
         requested.append(step)
         return ReplayOutcome(step, step in passing, "scripted")
 
-    diagnosis = diagnose_case(GoldMap(GoldLocation.IN_PROMPT, GOLD_AT, OTHER, frozenset(unchanged)), replay)
+    diagnosis = diagnose_case(GoldMap(GoldLocation.IN_PROMPT, GOLD_AT, OTHER, frozenset(unchanged)), replay, samples=1)
     assert requested == steps
     assert diagnosis == expected(_replays(steps, passing))
 

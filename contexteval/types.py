@@ -169,7 +169,42 @@ class ReplayOutcome:
     answer: str | None  # None when the replay crashed
 
 
+# Every sample drawn, in the order drawn. A step appears once per sample, so a v1 diagnosis
+# (one sample per step) is a v1.1 diagnosis whose every step was decided by one sample.
 Replays = tuple[ReplayOutcome, ...]
+
+
+@dataclass(frozen=True)
+class StepTally:
+    """How one step's samples went. The step passed when a strict majority of its samples
+    passed. The diagnoser stops sampling once a majority of N is sure, so a 2-of-2 tally is a
+    unanimous step at N=3, not a tie."""
+
+    step: ReplayStep
+    passed: int
+    total: int
+
+    @property
+    def majority(self) -> bool:
+        return self.passed > self.total - self.passed
+
+    @property
+    def count(self) -> str:
+        return f"{self.passed}/{self.total}"
+
+
+def tallies(replays: Replays) -> tuple[StepTally, ...]:
+    """Per-step pass counts, in the order the steps were first sampled."""
+    order: list[ReplayStep] = []
+    passed: dict[ReplayStep, int] = {}
+    total: dict[ReplayStep, int] = {}
+    for r in replays:
+        if r.step not in total:
+            order.append(r.step)
+            passed[r.step] = total[r.step] = 0
+        total[r.step] += 1
+        passed[r.step] += r.passed
+    return tuple(StepTally(s, passed[s], total[s]) for s in order)
 
 
 @dataclass(frozen=True)
@@ -198,7 +233,7 @@ class NotContext:
 
 @dataclass(frozen=True)
 class Flaky:
-    replays: Replays  # exactly the baseline rerun that passed
+    replays: Replays  # only baseline reruns, a majority of which passed
 
 
 @dataclass(frozen=True)
@@ -233,14 +268,15 @@ def source_of(d: Diagnosis) -> Literal["ground_truth", "judge"]:
 
 
 def _positions(refs: tuple[ChunkRef, ...]) -> str:
-    """(0, 2), (0, 3), (1, 0) -> "chunks 2, 3 of retrieval 0; chunk 0 of retrieval 1"."""
+    """Stored refs are 0-based; people count from 1 (the real-bot audit read "chunk 5" as the
+    fifth). (0, 2), (0, 3), (1, 0) -> "chunks 3, 4 of retrieval 1; chunk 1 of retrieval 2"."""
     by_retrieval: dict[int, list[int]] = {}
     for r, c in refs:
         by_retrieval.setdefault(r, []).append(c)
     parts = []
     for r, cs in sorted(by_retrieval.items()):
         noun = "chunk" if len(cs) == 1 else "chunks"
-        parts.append(f"{noun} {', '.join(str(c) for c in sorted(cs))} of retrieval {r}")
+        parts.append(f"{noun} {', '.join(str(c + 1) for c in sorted(cs))} of retrieval {r + 1}")
     return "; ".join(parts) if parts else "no chunks"
 
 
@@ -270,31 +306,39 @@ def _skip_clause(steps: tuple[ReplayStep, ...]) -> str:
     return "; ".join(f"{_LADDER_TEXT[s][0]} was skipped because {_LADDER_TEXT[s][1]}" for s in steps)
 
 
+def _count(d: Diagnosis, step: ReplayStep) -> str:
+    """The step's count in parentheses, as in "(2/3)": samples that passed over samples drawn."""
+    assert not isinstance(d, Judged)
+    (tally,) = [t for t in tallies(d.replays) if t.step is step]
+    return f"({tally.count})"
+
+
 def explain(d: Diagnosis) -> str:
-    """Human evidence line, e.g. "keeping only gold chunks fixed it"."""
+    """Human evidence line, e.g. "keeping only the gold chunks fixed it (2/3)". Each step the
+    diagnoser decided on carries its pass count, so a 2/3 reads as less sure than a 2/2."""
     match d:
         case Missing(cause="not_retrieved", confirmed=ok):
             fix = "fixed it" if ok else "did not fix it"
-            return f"the gold chunk was never retrieved; injecting the evidence {fix}"
+            return f"the gold chunk was never retrieved; injecting the evidence {fix} {_count(d, ReplayStep.INJECT_EVIDENCE)}"
         case Missing(confirmed=ok):
             fix = "fixed it" if ok else "did not fix it"
-            return f"the gold chunk was retrieved but dropped before the prompt; injecting the evidence {fix}"
+            return f"the gold chunk was retrieved but dropped before the prompt; injecting the evidence {fix} {_count(d, ReplayStep.INJECT_EVIDENCE)}"
         case Irrelevant(removed=removed):
             skipped = skipped_steps(d)
-            line = f"keeping only the gold chunks fixed it; removed {_positions(removed)}"
+            line = f"keeping only the gold chunks fixed it {_count(d, ReplayStep.ONLY_GOLD)}; removed {_positions(removed)}"
             return f"{line}; {_skip_clause(skipped)}" if skipped else line
         case Ignored(gold_at=at):
-            return f"moving the gold chunk to the top fixed it; gold was at {_positions(at)}"
+            return f"moving the gold chunk to the top fixed it {_count(d, ReplayStep.GOLD_TO_TOP)}; gold was at {_positions(at)}"
         case NotContext():
             skipped = skipped_steps(d)
-            tried = [_LADDER_TEXT[s][0] for s in LADDER_STEPS if s not in skipped]
+            tried = [f"{_LADDER_TEXT[s][0]} {_count(d, s)}" for s in LADDER_STEPS if s not in skipped]
             if not skipped:
-                return "neither moving gold to the top nor keeping only gold fixed it"
+                return f"neither {tried[0]} nor {tried[1]} fixed it"
             if not tried:
                 return "gold was already the only context at the top, so moving it to the top and keeping only gold were skipped"
             return f"{' and '.join(tried)} did not fix it; {_skip_clause(skipped)}"
         case Flaky():
-            return "the unchanged baseline passed on rerun"
+            return f"the unchanged baseline passed on rerun {_count(d, ReplayStep.BASELINE_RERUN)}"
         case Judged(verdict=v, rationale=why):
             return f"judge: {v.value}; {why}"
         case _:

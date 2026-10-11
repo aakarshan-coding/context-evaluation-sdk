@@ -113,34 +113,56 @@ MISSING_CAUSE: Mapping[GoldLocation, Literal["not_retrieved", "dropped"]] = {
     GoldLocation.DROPPED: "dropped",
 }
 
-MAX_REPLAYS = 1 + len(LADDER)  # the rerun plus the full ladder; a missing case stops at 2
+MAX_STEPS = 1 + len(LADDER)  # the rerun plus the full ladder; a missing case stops at 2
+
+# Samples per step. The real-bot audit (examples/realbot/AUDIT.md) found one replay at app
+# temperature mislabeled 2 of 5 in-prompt failures; 3 is the smallest odd count with a majority.
+DEFAULT_SAMPLES = 3
 
 
 Replay = Callable[[ReplayStep], ReplayOutcome]  # closure: execute + grade under REPLAY_INTERVENTION[step]
 
 
-def diagnose_case(gold: GoldMap, replay: Replay) -> Diagnosis:
-    """Pure given `replay`. Tests pass a scripted replay, so the table is tested without an app.
-
-    Order (plan items 3, 4, 5): the flaky rerun first for every case, then the inject
-    confirmation for a missing case, then the ladder. Replays are lazy: a case stops at the
-    first deciding step, so cost is 1 to MAX_REPLAYS app calls. A ladder step in gold.unchanged
-    is not replayed: it would rerun the baseline that just failed.
-    """
-    outcomes = [replay(ReplayStep.BASELINE_RERUN)]
-    if outcomes[0].passed:
-        return Flaky(tuple(outcomes))
-    cause = MISSING_CAUSE.get(gold.location)
-    if cause is not None:
-        injected = replay(ReplayStep.INJECT_EVIDENCE)
-        outcomes.append(injected)
-        return Missing(cause, confirmed=injected.passed, replays=tuple(outcomes))
-    for step, build in LADDER:
-        if step in gold.unchanged:
-            continue  # recorded by its absence from the replays; types.explain names it
+def _majority(step: ReplayStep, replay: Replay, samples: int) -> tuple[list[ReplayOutcome], bool]:
+    """Sample `step` until a majority of `samples` is decided, at most `samples` times. `samples`
+    is odd (the CLI checks), so a tie cannot happen and the result is the step's verdict."""
+    need = samples // 2 + 1
+    outcomes: list[ReplayOutcome] = []
+    passed = failed = 0
+    while passed < need and failed < need:
         outcome = replay(step)
         outcomes.append(outcome)
         if outcome.passed:
+            passed += 1
+        else:
+            failed += 1
+    return outcomes, passed >= need
+
+
+def diagnose_case(gold: GoldMap, replay: Replay, samples: int = DEFAULT_SAMPLES) -> Diagnosis:
+    """Pure given `replay`. Tests pass a scripted replay, so the table is tested without an app.
+
+    Order (plan items 3, 4, 5): the flaky rerun first for every case, then the inject
+    confirmation for a missing case, then the ladder. Each step draws up to `samples` replays
+    and stops once a majority agrees; a step passes when a majority of its samples pass. Steps
+    are lazy: a case stops at the first deciding step, so cost is 1 to MAX_STEPS * samples app
+    calls. A ladder step in gold.unchanged is not replayed: it would rerun the baseline that
+    just failed.
+    """
+    outcomes, flaky = _majority(ReplayStep.BASELINE_RERUN, replay, samples)
+    if flaky:
+        return Flaky(tuple(outcomes))
+    cause = MISSING_CAUSE.get(gold.location)
+    if cause is not None:
+        injected, confirmed = _majority(ReplayStep.INJECT_EVIDENCE, replay, samples)
+        outcomes += injected
+        return Missing(cause, confirmed=confirmed, replays=tuple(outcomes))
+    for step, build in LADDER:
+        if step in gold.unchanged:
+            continue  # recorded by its absence from the replays; types.explain names it
+        drawn, passed = _majority(step, replay, samples)
+        outcomes += drawn
+        if passed:
             return build(tuple(outcomes), gold)
     return NotContext(tuple(outcomes))
 
@@ -260,13 +282,14 @@ def pending(store: Store, run: RunId, *, force: bool = False) -> list[Pending]:
     return out
 
 
-def estimate_diagnosis(provider: Provider, todo: Sequence[Pending]) -> Estimate:
+def estimate_diagnosis(provider: Provider, todo: Sequence[Pending], samples: int = DEFAULT_SAMPLES) -> Estimate:
     """SDK calls only (the app's own calls are reported separately): one judge call per
-    judge-path trace, and worst case one grade per replay for ground-truth cases."""
+    judge-path trace, and worst case one grade per replay for ground-truth cases, where the
+    worst case is every step drawing all `samples`."""
     judged = [_judge_request(p.stored.trace) for p in todo if p.path == "judge"]
     cases = [p.case for p in todo if p.path == "replay" and p.case is not None]
     total = estimate(provider.model, [r.system + r.user for r in judged], _JUDGE_OUTPUT_TOKENS)
-    return total + estimate_grading(provider, cases * MAX_REPLAYS)
+    return total + estimate_grading(provider, cases * MAX_STEPS * samples)
 
 
 @dataclass(frozen=True)
@@ -289,6 +312,7 @@ def diagnose_run(
     *,
     force: bool = False,
     on_diagnosis: OnDiagnosis = lambda stored, diagnosis: None,
+    samples: int = DEFAULT_SAMPLES,
 ) -> DiagnoseReport:
     """For each failed trace in `run` (all traces for production runs):
     - skip if already diagnosed and not force (idempotent reruns resume where a crash stopped)
@@ -296,7 +320,8 @@ def diagnose_run(
     - no case / no evidence -> judge
     - else locate_gold, build the Replay closure over (app, case, grade), diagnose_case
     - save_diagnosis per trace as it completes
-    `app` is None only for production runs, which are judge-only.
+    `app` is None only for production runs, which are judge-only. `samples` is the replays per
+    step diagnose_case may draw.
     """
     info = store.run(run)
     todo = pending(store, run, force=force)
@@ -315,7 +340,7 @@ def diagnose_run(
                 raise ValueError(f"run {run} has ground-truth cases; diagnosing it needs the app")
             gold = locate_gold(p.case.evidence, p.stored.trace)
             replay = make_replay(app, p.case, p.case.evidence, grade, info.setting.intervention())
-            diagnosis = diagnose_case(gold, replay)
+            diagnosis = diagnose_case(gold, replay, samples)
         store.save_diagnosis(p.stored.id, diagnosis)
         on_diagnosis(p.stored, diagnosis)
         diagnosed += 1
