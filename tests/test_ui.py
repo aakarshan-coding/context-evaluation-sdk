@@ -409,3 +409,31 @@ def test_ui_command_reports_busy_port(served: Served, monkeypatch: pytest.Monkey
     assert not bound_anyway, "contexteval ui started serving on a port another server holds"
     assert ui.result == [1]
     assert f"cannot serve on port {port}" in capsys.readouterr().err
+
+
+def test_gold_marks_follow_the_shared_gold_rule(store: Store) -> None:
+    """Review Y2. The dashboard must mark gold the way the diagnoser decides it. Defects: the two
+    halves of evidence split across adjacent chunks shown as "not gold" while the diagnosis moves
+    them as gold; or a prompt marked "contains gold" because the question repeats the evidence."""
+    evidence = "The refund window closes thirty days after delivery for every online order."
+    halves = ("Refunds. The refund window closes thirty", "days after delivery for every online order. Store credit is issued instead.")
+    case = TestCase(CaseId("c-split"), "Does the refund window close thirty days after delivery for every online order?", "yes", Evidence(evidence), "d.md")
+    store.upsert_cases("synthetic", [case])
+    run = store.new_run("baseline", "app:answer", BASELINE)
+    chunks = (_chunk(OTHER, 0), _chunk(halves[0], 1), _chunk(halves[1], 2))
+    split = Trace(
+        question=case.question,
+        outcome=Answered("no"),
+        retrievals=(RetrievalEvent("chromadb", case.question, {}, chunks, chunks, 1.0),),
+        llm_calls=(
+            LLMCall("openai", "m", f"{OTHER}\n{halves[0]}\n{halves[1]}\nQ: {case.question}", "no", 1, 1, 1.0),
+            LLMCall("openai", "m", f"{OTHER}\nQ: {case.question}", "no", 1, 1, 1.0),
+        ),
+        metrics=Metrics(1, 1, 1.0, None),
+        test=TestOutcome(case.id, False, "llm"),
+        in_prompt=((0, 0), (0, 1), (0, 2)),
+    )
+    detail = _ui.api_trace(store, store.add_trace(run, split))
+    assert [c["gold"] for c in detail["retrievals"][0]["delivered"]] == [False, True, True]
+    assert [c["gold"] for c in detail["retrievals"][0]["retrieved"]] == [False, True, True]
+    assert [c["gold"] for c in detail["llm_calls"]] == [True, False]

@@ -8,8 +8,9 @@ import json
 import pytest
 
 from contexteval import _diagnose
+from contexteval import _text as text
 from contexteval._diagnose import GoldLocation, JudgeReplyError, diagnose_run, judge, locate_gold, parse_verdict
-from contexteval._intervention import BASELINE
+from contexteval._intervention import BASELINE, GoldToTop, OnlyGold, apply_transform
 from contexteval._llm import FakeProvider, LLMRequest, Task
 from contexteval._runner import make_grader
 from contexteval._store import Store
@@ -69,11 +70,70 @@ def test_locate_gold_dropped_versus_not_retrieved() -> None:
     assert locate_gold(GOLD, _trace([OFF_TOPIC], [OFF_TOPIC])).location is GoldLocation.NOT_RETRIEVED
 
 
-def test_locate_gold_prefers_the_prompt_over_the_chunks() -> None:
-    """Defect: gold the app wrote into the prompt itself (not from a chunk) treated as missing."""
-    gold = locate_gold(GOLD, _trace([OFF_TOPIC], [OFF_TOPIC, GOLD.text]))
+def _event_trace(question: str, retrieved: list[str], delivered: list[str], prompt_chunks: list[str]) -> Trace:
+    """A trace whose prompt is the given chunks plus the question, with in_prompt computed by the
+    real capture rule (as finalize_trace does)."""
+    def chunks(texts: list[str]) -> tuple[Chunk, ...]:
+        return tuple(Chunk(t, f"id{i}", None, i) for i, t in enumerate(texts))
+
+    event = RetrievalEvent("chromadb", question, {}, chunks(retrieved), chunks(delivered), 1.0)
+    prompt = "Context:\n" + "\n".join(prompt_chunks) + f"\n\nQuestion: {question}"
+    return Trace(
+        question=question,
+        outcome=Answered("I don't know."),
+        retrievals=(event,),
+        llm_calls=(LLMCall("openai", "gpt-4o-mini", prompt, "I don't know.", 1, 1, 1.0),),
+        metrics=Metrics(1, 1, 1.0, None),
+        test=None,
+        in_prompt=text.in_prompt_pairs((event,), prompt),
+    )
+
+
+def test_locate_gold_never_counts_the_question_as_gold() -> None:
+    """Review Y2a. A generated question repeats most of the evidence words, and no chunk holds the
+    evidence. Defect: gold decided over the whole prompt, which includes the question, reports
+    IN_PROMPT with no gold chunk, so the ladder replays a case whose gold was never retrieved."""
+    question = "According to the document, what completes: Phone support is open from 7 am to 9 pm Mountain Time, every day of ...?"
+    trace = _event_trace(question, [OFF_TOPIC], [OFF_TOPIC], [OFF_TOPIC])
+    gold = locate_gold(GOLD, trace)
+    assert gold.location is GoldLocation.NOT_RETRIEVED
+    assert gold.gold == ()
+
+
+SPLIT_A = "Hours. Phone support is open from 7 am to 9 pm"
+SPLIT_B = "Mountain Time, every day of the year. Email replies take two days."
+
+
+def test_locate_gold_joins_adjacent_chunks_that_split_the_evidence() -> None:
+    """Review Y2b. The user's chunker cut the evidence about in half, so neither chunk alone holds
+    80% of it. Defect: gold=() while the prompt holds the evidence, so GoldToTop is a no-op,
+    OnlyGold drops every chunk, and the case is mislabeled not_context. Both halves are gold, and
+    the replay transforms move and keep exactly those two chunks, in order."""
+    assert not text.contains_evidence(SPLIT_A, GOLD) and not text.contains_evidence(SPLIT_B, GOLD)
+    delivered = [OFF_TOPIC, SPLIT_A, SPLIT_B]
+    gold = locate_gold(GOLD, _event_trace(CASE.question, delivered, delivered, delivered))
     assert gold.location is GoldLocation.IN_PROMPT
-    assert gold.gold == () and gold.other == ((0, 0),)
+    assert gold.gold == ((0, 1), (0, 2))
+    assert gold.other == ((0, 0),)
+
+    chunks = tuple(Chunk(t, str(i), None, i) for i, t in enumerate(delivered))
+    assert [c.text for c in apply_transform(GoldToTop(GOLD), chunks, "q")] == [SPLIT_A, SPLIT_B, OFF_TOPIC]
+    assert [c.text for c in apply_transform(OnlyGold(GOLD), chunks, "q")] == [SPLIT_A, SPLIT_B]
+
+
+def test_locate_gold_does_not_join_chunks_that_are_not_adjacent() -> None:
+    """Defect: halves joined across an unrelated chunk, so two partial matches anywhere in the
+    list count as gold."""
+    delivered = [SPLIT_A, OFF_TOPIC, SPLIT_B]
+    assert locate_gold(GOLD, _event_trace(CASE.question, delivered, delivered, delivered)).location is GoldLocation.NOT_RETRIEVED
+
+
+def test_locate_gold_reports_dropped_when_a_setting_removed_retrieved_gold() -> None:
+    """Review Y2c. On an experiment run (max_chunks=1) the store returned the gold chunk but the
+    setting cut it before user code saw it. Defect: only `delivered` is read, so the case reports
+    not_retrieved and sends the user to raise top_k when their own setting dropped the gold."""
+    trace = _event_trace(CASE.question, [OFF_TOPIC, GOLD.text], [OFF_TOPIC], [OFF_TOPIC])
+    assert locate_gold(GOLD, trace).location is GoldLocation.DROPPED
 
 
 @pytest.mark.parametrize(

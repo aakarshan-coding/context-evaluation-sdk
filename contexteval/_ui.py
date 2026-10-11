@@ -16,8 +16,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib import resources
 from typing import Any, Callable
 
+from . import _text as text
 from ._store import RunSummary, Store, StoredTrace
-from ._text import contains_evidence
 from .types import (
     Answered,
     Chunk,
@@ -30,6 +30,7 @@ from .types import (
     Irrelevant,
     Judged,
     RunId,
+    Trace,
     TraceId,
     explain,
     label_of,
@@ -82,8 +83,8 @@ def _diagnosis_json(d: Diagnosis | None) -> Json | None:
 
 def _outcome_json(st: StoredTrace) -> Json:
     match st.trace.outcome:
-        case Answered(text=text):
-            return {"answer": text, "error": None}
+        case Answered(text=answer):
+            return {"answer": answer, "error": None}
         case Crashed(error=error):
             return {"answer": None, "error": error}
         case other:
@@ -101,13 +102,26 @@ def _trace_summary_json(st: StoredTrace) -> Json:
     }
 
 
-def _gold(text: str, evidence: Evidence | None) -> bool | None:
-    """None, not False, when the case has no evidence: the page then shows no gold mark at all."""
-    return contains_evidence(text, evidence) if evidence else None
+def _gold(chunks: tuple[Chunk, ...], evidence: Evidence | None) -> list[bool | None]:
+    """The diagnoser's gold rule per chunk. None, not False, when the case has no evidence: the
+    page then shows no gold mark at all."""
+    if evidence is None:
+        return [None] * len(chunks)
+    return list(text.gold_flags([c.text for c in chunks], evidence))
 
 
-def _chunk_json(c: Chunk, index: int, evidence: Evidence | None) -> Json:
-    return {"index": index, "text": c.text, "id": c.id, "score": c.score, "gold": _gold(c.text, evidence)}
+def _chunk_json(c: Chunk, index: int, gold: bool | None) -> Json:
+    return {"index": index, "text": c.text, "id": c.id, "score": c.score, "gold": gold}
+
+
+def _prompt_has_gold(prompt: str, trace: Trace, delivered_gold: list[list[bool | None]]) -> bool:
+    """A prompt holds gold when a gold delivered chunk is in it, as locate_gold decides; the
+    question text in the prompt never counts."""
+    return any(
+        bool(is_gold) and text.chunk_in_prompt(chunk.text, prompt)
+        for event, flags in zip(trace.retrievals, delivered_gold)
+        for chunk, is_gold in zip(event.delivered, flags)
+    )
 
 
 def _trace_detail_json(st: StoredTrace, store: Store) -> Json:
@@ -115,6 +129,7 @@ def _trace_detail_json(st: StoredTrace, store: Store) -> Json:
     case = store.case(test.case_id) if test else None
     evidence = case.evidence if case else None
     in_prompt = set(trace.in_prompt)
+    delivered_gold = [_gold(e.delivered, evidence) for e in trace.retrievals]
     return {
         **_trace_summary_json(st),
         "run_id": st.run_id,
@@ -128,10 +143,10 @@ def _trace_detail_json(st: StoredTrace, store: Store) -> Json:
                 "query": e.query,
                 "params": dict(e.params),
                 "latency_ms": e.latency_ms,
-                "retrieved": [_chunk_json(c, i, evidence) for i, c in enumerate(e.retrieved)],
+                "retrieved": [_chunk_json(c, i, g) for i, (c, g) in enumerate(zip(e.retrieved, _gold(e.retrieved, evidence)))],
                 "delivered": [
-                    {**_chunk_json(c, i, evidence), "source_index": c.source_index, "in_prompt": (r, i) in in_prompt}
-                    for i, c in enumerate(e.delivered)
+                    {**_chunk_json(c, i, g), "source_index": c.source_index, "in_prompt": (r, i) in in_prompt}
+                    for i, (c, g) in enumerate(zip(e.delivered, delivered_gold[r]))
                 ],
             }
             for r, e in enumerate(trace.retrievals)
@@ -145,7 +160,7 @@ def _trace_detail_json(st: StoredTrace, store: Store) -> Json:
                 "input_tokens": c.input_tokens,
                 "output_tokens": c.output_tokens,
                 "latency_ms": c.latency_ms,
-                "gold": _gold(c.prompt, evidence),
+                "gold": _prompt_has_gold(c.prompt, trace, delivered_gold) if evidence else None,
             }
             for c in trace.llm_calls
         ],

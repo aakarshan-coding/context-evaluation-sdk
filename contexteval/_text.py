@@ -67,6 +67,21 @@ def contains_evidence(text: str, evidence: Evidence) -> bool:
     return overlap / len(ev) >= EVIDENCE_TOKEN_THRESHOLD
 
 
+def gold_flags(chunks: Sequence[str], evidence: Evidence) -> tuple[bool, ...]:
+    """Which of one retrieval's chunks, in order, hold the evidence. The one gold rule: locate_gold,
+    the GoldToTop and OnlyGold replays, and the dashboard's gold marks all read it.
+
+    A chunk is gold when it holds the evidence alone, or when it and its next neighbour hold it
+    joined and neither does alone (the user's chunker cut the evidence in two); both are then gold.
+    """
+    alone = [contains_evidence(c, evidence) for c in chunks]
+    flags = list(alone)
+    for i in range(len(chunks) - 1):
+        if not alone[i] and not alone[i + 1] and contains_evidence(f"{chunks[i]} {chunks[i + 1]}", evidence):
+            flags[i] = flags[i + 1] = True
+    return tuple(flags)
+
+
 def chunk_in_prompt(chunk_text: str, prompt: str) -> bool:
     return _has_token_run(normalize(prompt), normalize(chunk_text))
 

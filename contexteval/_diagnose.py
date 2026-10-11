@@ -18,6 +18,7 @@ from ._runner import App, Grader, estimate_grading, run_case
 from ._store import Store, StoredTrace
 from .types import (
     Answered,
+    Chunk,
     ChunkRef,
     Crashed,
     Diagnosis,
@@ -39,9 +40,9 @@ from .types import (
 
 
 class GoldLocation(Enum):
-    NOT_RETRIEVED = "not_retrieved"  # no delivered chunk in any retrieval event contains gold
-    DROPPED = "dropped"  # a delivered chunk contains gold, the prompt does not
-    IN_PROMPT = "in_prompt"  # the prompt contains gold
+    NOT_RETRIEVED = "not_retrieved"  # no retrieved or delivered chunk is gold
+    DROPPED = "dropped"  # a gold chunk was retrieved or delivered, but none reached the prompt
+    IN_PROMPT = "in_prompt"  # a gold delivered chunk is in the prompt
 
 
 @dataclass(frozen=True)
@@ -54,17 +55,28 @@ class GoldMap:
     other: tuple[ChunkRef, ...]  # in-prompt delivered chunks without it
 
 
+def _gold_refs(per_retrieval: Sequence[tuple[Chunk, ...]], evidence: Evidence) -> set[ChunkRef]:
+    return {
+        (r, c)
+        for r, chunks in enumerate(per_retrieval)
+        for c, is_gold in enumerate(text.gold_flags([chunk.text for chunk in chunks], evidence))
+        if is_gold
+    }
+
+
 def locate_gold(evidence: Evidence, trace: Trace) -> GoldMap:
-    """Pure. Checks the prompt first: gold in the prompt is IN_PROMPT whatever the chunks say."""
-    gold = []
-    other = []
-    for r, c in trace.in_prompt:
-        chunk = trace.retrievals[r].delivered[c]
-        (gold if text.contains_evidence(chunk.text, evidence) else other).append((r, c))
-    if text.contains_evidence(trace.prompt_text, evidence):
-        return GoldMap(GoldLocation.IN_PROMPT, tuple(gold), tuple(other))
-    delivered = (chunk for event in trace.retrievals for chunk in event.delivered)
-    if any(text.contains_evidence(chunk.text, evidence) for chunk in delivered):
+    """Pure. Gold is decided per chunk by text.gold_flags, the rule the replay transforms use, and
+    never from the prompt text, which also holds the question.
+
+    IN_PROMPT when a gold delivered chunk is in the prompt. DROPPED when gold was delivered but the
+    app left it out, or retrieved but cut by the run's setting before user code saw it.
+    """
+    delivered_gold = _gold_refs([e.delivered for e in trace.retrievals], evidence)
+    gold = tuple(ref for ref in trace.in_prompt if ref in delivered_gold)
+    if gold:
+        other = tuple(ref for ref in trace.in_prompt if ref not in delivered_gold)
+        return GoldMap(GoldLocation.IN_PROMPT, gold, other)
+    if delivered_gold or _gold_refs([e.retrieved for e in trace.retrievals], evidence):
         return GoldMap(GoldLocation.DROPPED, (), ())
     return GoldMap(GoldLocation.NOT_RETRIEVED, (), ())
 

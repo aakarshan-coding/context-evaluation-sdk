@@ -60,12 +60,12 @@ class InjectEvidence:
 
 @dataclass(frozen=True)
 class GoldToTop:
-    evidence: Evidence  # gold chunks first, others kept in order
+    evidence: Evidence  # gold chunks (text.gold_flags) first, others kept in order
 
 
 @dataclass(frozen=True)
 class OnlyGold:
-    evidence: Evidence  # drop every chunk that does not contain the evidence
+    evidence: Evidence  # drop every chunk text.gold_flags does not mark gold
 
 
 Transform = Union[LexicalRerank, Reorder, KeepFirst, Compress, InjectEvidence, GoldToTop, OnlyGold]
@@ -105,11 +105,11 @@ def apply_transform(t: Transform, chunks: tuple[Chunk, ...], query: str | None) 
         case InjectEvidence(evidence=e):
             return (Chunk(text=e.text, id=EVIDENCE_CHUNK_ID, score=None, source_index=None), *chunks)
         case GoldToTop(evidence=e):
-            gold = tuple(c for c in chunks if text.contains_evidence(c.text, e))
-            rest = tuple(c for c in chunks if not text.contains_evidence(c.text, e))
-            return (*gold, *rest)
+            flags = text.gold_flags([c.text for c in chunks], e)
+            return (*(c for c, g in zip(chunks, flags) if g), *(c for c, g in zip(chunks, flags) if not g))
         case OnlyGold(evidence=e):
-            return tuple(c for c in chunks if text.contains_evidence(c.text, e))
+            flags = text.gold_flags([c.text for c in chunks], e)
+            return tuple(c for c, g in zip(chunks, flags) if g)
         case _:
             never(t)
 
