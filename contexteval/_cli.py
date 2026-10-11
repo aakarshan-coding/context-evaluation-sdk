@@ -6,7 +6,7 @@
     contexteval run [module:function] [--test-set NAME] [--yes]
     contexteval diagnose [--run ID] [--force] [--yes]
     contexteval experiment [module:function] KNOB=v1,v2 ... [--yes]
-    contexteval sweep [module:function] [--rounds N] [--max-settings N] [--holdout F] [--seed S] [--yes]
+    contexteval sweep [module:function] [--rounds N] [--max-settings N] [--holdout F] [--seed S] [--tolerance N] [--yes]
     contexteval ui [--port 8765] [--no-open]
 
 Every command finds the project by walking up from cwd to a .contexteval/ directory, except
@@ -381,6 +381,16 @@ def _positive(value: str) -> int:
     return n
 
 
+def _tolerance(value: str) -> int:
+    try:
+        n = int(value)
+    except ValueError:
+        n = -1
+    if n < 0:
+        raise argparse.ArgumentTypeError(f"--tolerance must be a whole number of cases, 0 or more, got {value!r}")
+    return n
+
+
 def _print_plan(plan: _sweep.Plan, spec: str) -> None:
     labeled = ", ".join(f"{kind.value} {n}" for kind, n in plan.counts.items())
     print(f"sweep: run {plan.source_run}, {sum(plan.counts.values())} labeled failures ({labeled}); the baseline retrieved up to {plan.baseline_k} chunks")
@@ -417,7 +427,7 @@ def cmd_sweep(args: argparse.Namespace) -> int:
         if source is None:
             raise UserError("no baseline run yet; run `contexteval run` and `contexteval diagnose` first")
         try:
-            plan, cases = _sweep.plan_sweep(store, source, rounds=args.rounds, max_settings=args.max_settings, holdout=args.holdout, seed=args.seed)
+            plan, cases = _sweep.plan_sweep(store, source, rounds=args.rounds, max_settings=args.max_settings, holdout=args.holdout, seed=args.seed, tolerance=args.tolerance)
         except _sweep.SweepNotPossible as e:
             raise UserError(str(e)) from None
         _print_plan(plan, spec)
@@ -535,6 +545,13 @@ def _args_sweep(p: argparse.ArgumentParser) -> None:
     p.add_argument("--max-settings", type=_positive, default=_sweep.DEFAULT_MAX_SETTINGS, metavar="N", help=f"settings tried per round (default {_sweep.DEFAULT_MAX_SETTINGS})")
     p.add_argument("--holdout", type=_fraction, default=_sweep.DEFAULT_HOLDOUT, metavar="F", help=f"share of cases kept to confirm the winner (default {_sweep.DEFAULT_HOLDOUT}; 0 for a tiny set)")
     p.add_argument("--seed", type=int, default=0, metavar="S", help="seed of the tune/holdout split (default 0)")
+    p.add_argument(
+        "--tolerance",
+        type=_tolerance,
+        default=_sweep.DEFAULT_TOLERANCE,
+        metavar="N",
+        help=f"prefer the cheapest setting within N tune cases of the most accurate (default {_sweep.DEFAULT_TOLERANCE}; 0 for accuracy first)",
+    )
     p.add_argument("--yes", action="store_true")
 
 

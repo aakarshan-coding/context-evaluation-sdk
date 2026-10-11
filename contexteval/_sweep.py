@@ -203,6 +203,7 @@ def split_cases(cases: Sequence[TestCase], failed: Iterable[CaseId], holdout: fl
 DEFAULT_ROUNDS = 2
 DEFAULT_MAX_SETTINGS = 6
 DEFAULT_HOLDOUT = 0.3
+DEFAULT_TOLERANCE = 1
 
 
 @dataclass(frozen=True)
@@ -217,6 +218,7 @@ class Plan:
     split: Split
     rounds: int
     max_settings: int
+    tolerance: int  # tune cases a cheaper setting may trail the most accurate one by
 
     @property
     def unfixable(self) -> list[tuple[FailureKind, int, str]]:
@@ -247,7 +249,7 @@ class SweepNotPossible(Exception):
     """The source run cannot seed a sweep. The CLI prints it as a one-line user error."""
 
 
-def plan_sweep(store: Store, run: RunInfo, *, rounds: int, max_settings: int, holdout: float, seed: int) -> tuple[Plan, dict[CaseId, TestCase]]:
+def plan_sweep(store: Store, run: RunInfo, *, rounds: int, max_settings: int, holdout: float, seed: int, tolerance: int) -> tuple[Plan, dict[CaseId, TestCase]]:
     """Read the source run's labels and retrievals and decide the candidates and the split. The
     cases are the ones the source run ran, so the sweep measures the set it was diagnosed on."""
     traces = store.traces(run.id)
@@ -286,6 +288,7 @@ def plan_sweep(store: Store, run: RunInfo, *, rounds: int, max_settings: int, ho
         split=split_cases(list(cases.values()), failed, holdout, seed),
         rounds=rounds,
         max_settings=max_settings,
+        tolerance=tolerance,
     )
     return plan, cases
 
@@ -293,9 +296,15 @@ def plan_sweep(store: Store, run: RunInfo, *, rounds: int, max_settings: int, ho
 # --- search -----------------------------------------------------------------------
 
 
-def _rank_key(row: ExperimentRow) -> tuple[float, float, float]:
-    """Best first: accuracy, then fewer input tokens, then lower latency."""
-    return (-row.accuracy, row.mean_input_tokens, row.mean_latency_ms)
+def choose(rows: Mapping[Setting, ExperimentRow], baseline_passed: int, tolerance: int) -> Setting:
+    """The best setting on the same cases. Every setting within `tolerance` passes of the most
+    passing one, and passing more than the baseline, is a contender; the cheapest contender wins:
+    fewest input tokens, then lowest latency, then most passes. When nothing passes more than the
+    baseline, only the most passing settings contend. Table order breaks exact ties."""
+    top = max(row.passed for row in rows.values())
+    floor = top if top <= baseline_passed else max(top - tolerance, baseline_passed + 1)
+    contenders = [s for s, row in rows.items() if row.passed >= floor]
+    return min(contenders, key=lambda s: (rows[s].mean_input_tokens, rows[s].mean_latency_ms, -rows[s].passed))
 
 
 def beats(candidate: ExperimentRow, baseline: ExperimentRow) -> bool:
@@ -315,6 +324,7 @@ class SweepReport:
     holdout_runs: tuple[RunId, RunId] | None  # (baseline, winner) on the holdout cases
     recommended: RunId | None  # the winner's tune run, when it is recommended
     reason: str  # why nothing is recommended; empty when something is
+    passed_over: RunId | None = None  # the more accurate, costlier tune run a recommendation passed over
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -332,6 +342,7 @@ class SweepReport:
             "holdout_runs": list(self.holdout_runs) if self.holdout_runs else None,
             "recommended": self.recommended,
             "reason": self.reason,
+            "passed_over": self.passed_over,
         }
 
     @classmethod
@@ -348,6 +359,7 @@ class SweepReport:
             holdout_runs=(RunId(held[0]), RunId(held[1])) if held else None,
             recommended=RunId(data["recommended"]) if data["recommended"] is not None else None,
             reason=data["reason"],
+            passed_over=RunId(data["passed_over"]) if data.get("passed_over") is not None else None,
         )
 
 
@@ -369,8 +381,8 @@ def run_sweep(store: Store, app_spec: str, app: App, cases: Mapping[CaseId, Test
     def rows() -> dict[RunId, ExperimentRow]:
         return {row.run_id: row for row in store.experiment_table(experiment)}
 
-    def best_on_tune(table: Mapping[RunId, ExperimentRow]) -> Setting:
-        return min(runs, key=lambda s: _rank_key(table[runs[s]]))
+    def best_on_tune(table: Mapping[RunId, ExperimentRow], tolerance: int) -> Setting:
+        return choose({s: table[r] for s, r in runs.items()}, table[runs[BASELINE]].passed, tolerance)
 
     runs[BASELINE] = run(BASELINE, tune)
     first_round = [r.setting for r in plan.candidates[: plan.max_settings]]
@@ -380,7 +392,7 @@ def run_sweep(store: Store, app_spec: str, app: App, cases: Mapping[CaseId, Test
             todo = list(first_round)
         else:
             table = rows()
-            best = best_on_tune(table)
+            best = best_on_tune(table, plan.tolerance)
             if best == BASELINE:
                 break
             baseline_passed = table[runs[BASELINE]].passed
@@ -400,13 +412,14 @@ def run_sweep(store: Store, app_spec: str, app: App, cases: Mapping[CaseId, Test
 
     table = rows()
     baseline_row = table[runs[BASELINE]]
-    winner = best_on_tune(table)
+    winner = best_on_tune(table, plan.tolerance)
     holdout_runs = None
     recommended = None
+    passed_over = None
     if winner == BASELINE or not beats(table[runs[winner]], baseline_row):
         contenders = [s for s in runs if s != BASELINE]
         if contenders:
-            runner_up = min(contenders, key=lambda s: _rank_key(table[runs[s]]))
+            runner_up = choose({s: table[runs[s]] for s in contenders}, baseline_row.passed, 0)
             reason = (
                 f"no candidate beat the baseline on the tune cases "
                 f"(the best, {runner_up.name}, passed {table[runs[runner_up]].accuracy:.0%} against {baseline_row.accuracy:.0%})"
@@ -426,6 +439,10 @@ def run_sweep(store: Store, app_spec: str, app: App, cases: Mapping[CaseId, Test
             )
     else:
         recommended, reason = runs[winner], ""
+    if recommended is not None:
+        most_accurate = best_on_tune(table, 0)
+        if most_accurate != winner:
+            passed_over = runs[most_accurate]
     report = SweepReport(
         source_run=plan.source_run,
         baseline_k=plan.baseline_k,
@@ -436,6 +453,7 @@ def run_sweep(store: Store, app_spec: str, app: App, cases: Mapping[CaseId, Test
         holdout_runs=holdout_runs,
         recommended=recommended,
         reason=reason,
+        passed_over=passed_over,
     )
     store.save_experiment_report(experiment, report.to_json())
     return experiment, report
@@ -453,6 +471,18 @@ def _token_clause(before: float, after: float) -> str:
     return f"Uses {abs(change):.0%} {'more' if change > 0 else 'fewer'} input tokens"
 
 
+def _passed_over_clause(chosen: ExperimentRow, other: ExperimentRow) -> str:
+    more = other.passed - chosen.passed
+    cases = "case" if more == 1 else "cases"
+    if other.mean_input_tokens != chosen.mean_input_tokens and chosen.mean_input_tokens > 0:
+        cost = f"uses {(other.mean_input_tokens - chosen.mean_input_tokens) / chosen.mean_input_tokens:.0%} more input tokens"
+    elif other.mean_input_tokens != chosen.mean_input_tokens:
+        cost = "uses more input tokens"
+    else:
+        cost = f"is slower ({other.mean_latency_ms:.0f} ms against {chosen.mean_latency_ms:.0f} ms)"
+    return f" ({other.setting_name} passed {more} more tune {cases} but {cost})"
+
+
 def recommendation_line(report: SweepReport, table: Sequence[ExperimentRow]) -> str:
     """One plain sentence or two: the change to make, the accuracy before and after on tune and
     holdout, and what it costs; or why to keep the current settings."""
@@ -465,8 +495,9 @@ def recommendation_line(report: SweepReport, table: Sequence[ExperimentRow]) -> 
         holdout = f" (holdout {hb.accuracy:.0%} -> {hw.accuracy:.0%})"
     else:
         holdout = " (no holdout cases, so this is unconfirmed)"
+    passed_over = _passed_over_clause(after, rows[report.passed_over]) if report.passed_over is not None else ""
     return (
-        f"Set {after.setting_name}. Accuracy {before.accuracy:.0%} -> {after.accuracy:.0%}{holdout}. "
+        f"Set {after.setting_name}{passed_over}. Accuracy {before.accuracy:.0%} -> {after.accuracy:.0%}{holdout}. "
         f"{_token_clause(before.mean_input_tokens, after.mean_input_tokens)}; "
         f"mean latency {before.mean_latency_ms:.0f} ms -> {after.mean_latency_ms:.0f} ms."
     )

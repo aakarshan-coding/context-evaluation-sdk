@@ -114,7 +114,7 @@ contexteval sweep --holdout 0 --yes
 The sweep says which labels no setting can fix and why, tries the settings the other labels call for, combines the winners, and ends with one recommendation:
 
 ```text
-Set top_k=8 rerank=lexical. Accuracy 38% -> 62% (no holdout cases, so this is unconfirmed). Uses 76% more input tokens; mean latency 21 ms -> 3 ms.
+Set rerank=lexical max_chunks=2 (top_k=8 rerank=lexical passed 1 more tune case but uses 192% more input tokens). Accuracy 38% -> 50% (no holdout cases, so this is unconfirmed). Uses 40% fewer input tokens; mean latency 31 ms -> 4 ms.
 ```
 
 The [Sweep](#sweep) section shows the whole output and explains how the search works.
@@ -216,7 +216,7 @@ Every command except `init` finds the project by walking up from the current dir
 | `contexteval run [module:function] [--test-set NAME] [--yes]` | Runs every case through your function and grades each answer. Remembers the app for later commands. |
 | `contexteval diagnose [--run ID] [--samples N] [--force] [--yes]` | Labels each failure of the latest baseline run, or of run `ID`. Each replay step draws up to `N` samples (default 3, odd) and a majority decides. Skips failures that already have a label unless you pass `--force`. |
 | `contexteval experiment [module:function] KNOB=v1,v2 ... [--yes]` | Runs every case under each combination of settings and prints a comparison table. |
-| `contexteval sweep [module:function] [--rounds N] [--max-settings N] [--holdout F] [--seed S] [--yes]` | Picks settings from the labels of the latest diagnosed baseline run, tries them on a tune split, confirms the winner on a holdout split, and prints one recommendation. |
+| `contexteval sweep [module:function] [--rounds N] [--max-settings N] [--holdout F] [--seed S] [--tolerance N] [--yes]` | Picks settings from the labels of the latest diagnosed baseline run, tries them on a tune split, confirms the winner on a holdout split, and prints one recommendation. |
 | `contexteval ui [--port 8765] [--no-open]` | Serves the dashboard at `http://127.0.0.1:8765/`. |
 
 Grading checks first whether the expected answer appears in the answer, after normalizing case and punctuation. If it does not, the LLM decides whether the two agree, at temperature 0.
@@ -275,6 +275,8 @@ The search runs in rounds. Round 1 runs the baseline and each setting on its own
 
 To keep the sweep from fitting your test set, it splits the cases into a tune set and a holdout set with a fixed seed (`--holdout F`, default 0.3 of the cases, half the failures and half the passes in proportion; `--seed S` changes the split). It chooses on the tune cases, then runs the baseline and the winner on the holdout cases. It recommends the winner only when it beat the baseline on tune and did not lose on holdout. Otherwise it recommends keeping your current settings and says why. `--holdout 0` tunes on every case; use it for a set too small to split, and read the result as unconfirmed.
 
+Among settings that pass about as many tune cases, the sweep prefers the cheaper one. Every setting that beat the baseline and passed within `--tolerance N` cases of the most accurate one (default 1) is a contender. The contender with the fewest mean input tokens wins, then the one with the lowest latency, then the one that passed more. The same rule picks the best setting in every round. When the winner is not the most accurate setting, the recommendation names the one it passed over and what that one costs. `--tolerance 0` picks the most accurate setting, with ties going to the cheaper one. One case is a large share of a small set, so use `--tolerance 0` when every case matters.
+
 Before running, the sweep prints the worst case, every round full plus the two holdout runs, and asks. Every candidate is a plain experiment setting, so the sweep never sees the evidence passages either.
 
 The whole output for the demo (`contexteval sweep --holdout 0 --yes` after `diagnose`):
@@ -292,25 +294,25 @@ estimate: 104 LLM calls, ~5824 input and ~208 output tokens, about $0.0000
 experiment 1 (sweep)
 round 1, 8 tune cases
 setting         accuracy  passed  mean input tokens  mean latency ms  total cost
-baseline        38%       3/8     124                20.8             unknown
-compress=2      38%       3/8     124                2.2              unknown
-top_k=8         50%       4/8     217                2.9              unknown
+baseline        38%       3/8     124                31.1             unknown
+compress=2      38%       3/8     124                2.6              unknown
+top_k=8         50%       4/8     217                3.2              unknown
 top_k=12        50%       4/8     323                2.9              unknown
-rerank=lexical  50%       4/8     124                2.7              unknown
-max_chunks=2    38%       3/8     74                 2.7              unknown
-order=ends      38%       3/8     124                2.8              unknown
+rerank=lexical  50%       4/8     124                3.5              unknown
+max_chunks=2    38%       3/8     74                 3.3              unknown
+order=ends      38%       3/8     124                2.9              unknown
 round 2, 8 tune cases
 setting                      accuracy  passed  mean input tokens  mean latency ms  total cost
-baseline                     38%       3/8     124                20.8             unknown
+baseline                     38%       3/8     124                31.1             unknown
 rerank=lexical compress=2    50%       4/8     124                3.0              unknown
-top_k=8 rerank=lexical       62%       5/8     217                2.8              unknown
-top_k=12 rerank=lexical      62%       5/8     323                2.8              unknown
-rerank=lexical max_chunks=2  50%       4/8     74                 2.8              unknown
-rerank=lexical order=ends    50%       4/8     124                2.7              unknown
-Set top_k=8 rerank=lexical. Accuracy 38% -> 62% (no holdout cases, so this is unconfirmed). Uses 76% more input tokens; mean latency 21 ms -> 3 ms.
+top_k=8 rerank=lexical       62%       5/8     217                3.0              unknown
+top_k=12 rerank=lexical      62%       5/8     323                4.0              unknown
+rerank=lexical max_chunks=2  50%       4/8     74                 4.1              unknown
+rerank=lexical order=ends    50%       4/8     124                4.3              unknown
+Set rerank=lexical max_chunks=2 (top_k=8 rerank=lexical passed 1 more tune case but uses 192% more input tokens). Accuracy 38% -> 50% (no holdout cases, so this is unconfirmed). Uses 40% fewer input tokens; mean latency 31 ms -> 4 ms.
 ```
 
-`top_k=8` retrieves the chunk that ranked 5th, and `rerank=lexical` moves the ignored case's chunk to the top. Between two settings with the same accuracy the sweep prefers the one with fewer input tokens, then the lower latency, which is why `top_k=8` wins over `top_k=12`. The baseline row's latency includes the demo's one-time index warm-up, as the `experiment` table's does.
+`top_k=8` retrieves the chunk that ranked 5th, and `rerank=lexical` moves the ignored case's chunk to the top, so `top_k=8 rerank=lexical` passes the most cases. `rerank=lexical max_chunks=2` passes one case fewer with 74 input tokens instead of 217, so the default tolerance of 1 recommends it and the line names `top_k=8 rerank=lexical` as the setting it passed over. With `--tolerance 0` the sweep recommends `top_k=8 rerank=lexical`, which beats `top_k=12 rerank=lexical` on input tokens. The baseline row's latency includes the demo's one-time index warm-up, as the `experiment` table's does.
 
 The sweep is stored as an experiment. The dashboard lists it with its rows and marks the recommended one.
 

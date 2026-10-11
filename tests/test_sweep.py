@@ -218,11 +218,13 @@ def _sweep_runs(store: Store) -> tuple[_sweep.SweepReport, dict[int, tuple[Setti
     return report, runs
 
 
-def test_demo_sweep_recommends_a_larger_top_k_and_names_the_dropped_case_as_unfixable(project: Path, hooks: None, capsys: pytest.CaptureFixture[str]) -> None:
+def test_demo_sweep_finds_the_larger_top_k_and_names_the_dropped_case_as_unfixable(project: Path, hooks: None, capsys: pytest.CaptureFixture[str]) -> None:
     """Through `_cli.main` on the planted demo. Defects: the planted not_retrieved case does not
-    lead to a top_k candidate, the recommended setting does not carry the larger top_k that fixes
-    it, the dropped case is offered a setting instead of the reason none can help, --holdout 0 is
-    refused or not warned about, or the sweep is stored as a manual experiment."""
+    lead to a top_k candidate, the search never reaches the larger top_k that fixes it, the
+    dropped case is offered a setting instead of the reason none can help, --holdout 0 is refused
+    or not warned about, or the sweep is stored as a manual experiment. On 8 cases the default
+    tolerance prefers rerank=lexical max_chunks=2 at 74 tokens over top_k=8 rerank=lexical, which
+    passes one more case at 217 tokens; the line must name what it passed over."""
     pytest.importorskip("chromadb")
     from contexteval.demo import planted
 
@@ -238,19 +240,21 @@ def test_demo_sweep_recommends_a_larger_top_k_and_names_the_dropped_case_as_unfi
     assert "warning: no holdout cases" in out
     assert "candidates, heaviest first" in out and "top_k=8 (1)" in out and "top_k=12 (1)" in out
     final = out.rstrip().splitlines()[-1]
-    assert final.startswith("Set ") and "top_k=8" in final and "(no holdout cases, so this is unconfirmed)" in final
+    assert final.startswith("Set rerank=lexical max_chunks=2 (top_k=8 rerank=lexical passed 1 more tune case but uses 192% more input tokens). Accuracy 38% -> 50% "), final
+    assert "(no holdout cases, so this is unconfirmed)" in final
 
     store = Store.open(project)
     try:
         report, runs = _sweep_runs(store)
-        assert report.recommended is not None and report.holdout_runs is None and report.split.holdout == ()
-        recommended, traces = runs[report.recommended]
-        assert recommended.top_k == 8 and traces == len(planted.PLANTED)
+        assert report.recommended is not None and report.passed_over is not None
+        assert report.holdout_runs is None and report.split.holdout == ()
+        assert runs[report.recommended] == (Setting(rerank="lexical", max_chunks=2), len(planted.PLANTED))
+        assert runs[report.passed_over] == (Setting(top_k=8, rerank="lexical"), len(planted.PLANTED))
         assert report.counts[FailureKind.NOT_RETRIEVED] == 1 and report.counts[FailureKind.DROPPED] == 1
         for setting, _ in runs.values():
             assert not any(isinstance(t, GOLD_TRANSFORMS) for t in setting.intervention().transforms)
         (not_retrieved,) = [p for p in planted.PLANTED if p.cause == "not_retrieved"]
-        passed = {s.trace.test.case_id: s.trace.test.passed for s in store.traces(report.recommended) if s.trace.test}
+        passed = {s.trace.test.case_id: s.trace.test.passed for s in store.traces(report.passed_over) if s.trace.test}
         baseline = {s.trace.test.case_id: s.trace.test.passed for s in store.traces(report.baseline_run) if s.trace.test}
         assert passed[not_retrieved.case.id] is True and baseline[not_retrieved.case.id] is False
     finally:
@@ -338,7 +342,7 @@ def test_estimate_counts_the_worst_case(project: Path, hooks: None, capsys: pyte
     try:
         source = store.latest_run("baseline")
         assert source is not None
-        plan, _ = _sweep.plan_sweep(store, source, rounds=3, max_settings=5, holdout=0.3, seed=0)
+        plan, _ = _sweep.plan_sweep(store, source, rounds=3, max_settings=5, holdout=0.3, seed=0, tolerance=1)
         assert len(plan.candidates) == 2 and plan.round_size == 2
         assert len(plan.split.tune) == 7 and len(plan.split.holdout) == 3
         assert plan.worst_case_runs == [7] * (1 + 2 * 3) + [3, 3]
@@ -413,6 +417,101 @@ def test_sweep_with_no_failures_or_only_unfixable_ones_runs_nothing(project: Pat
         store.close()
 
 
+PRICED_APP_SOURCE = '''
+"""Scripted app whose input tokens grow with the chunks it retrieves: each answer sends the
+chunks to the demo's fake LLM, so the capture hooks count the prompt. passing.json maps a chunk
+count to the questions answered right at that count; any other count passes the easy ones."""
+import json
+from pathlib import Path
+
+import contexteval
+from contexteval.demo.app import FAKE_MODEL, _client
+
+HARD = %r
+
+
+@contexteval.retriever(top_k="limit")
+def search(query: str, limit: int = 4) -> list[str]:
+    return [f"chunk {i} " + "padding words that cost input tokens " * 20 for i in range(limit)]
+
+
+def answer(question: str) -> str:
+    hits = search(question)
+    _client().chat.completions.create(model=FAKE_MODEL, messages=[{"role": "user", "content": "\\n".join(hits) + question}])
+    allowed = json.loads(Path("passing.json").read_text(encoding="utf-8")).get(str(len(hits)))
+    if allowed is None:
+        return "wrong" if question in HARD else "right"
+    return "right" if question in allowed else "wrong"
+'''
+
+
+def _priced_sweep(
+    project: Path, capsys: pytest.CaptureFixture[str], module: str, passing: dict[int, list[str]], *flags: str
+) -> tuple[str, _sweep.SweepReport, dict[int, tuple[Setting, int]]]:
+    """A sweep over the priced app with --holdout 0, so every case is a tune case. The baseline
+    retrieves 4 chunks and fails the 6 hard cases, so the candidates are top_k=8 and top_k=12.
+    Returns the printed final line, the report, and the runs."""
+    (project / f"{module}.py").write_text(PRICED_APP_SOURCE % HARD, encoding="utf-8")
+    (project / "passing.json").write_text(json.dumps({str(k): v for k, v in passing.items()}), encoding="utf-8")
+    _write_cases(project, ALL)
+    assert _cli.main(["init", "--provider", "fake"]) == 0
+    assert _cli.main(["build-tests", "--import", "cases.jsonl"]) == 0
+    assert _cli.main(["run", f"{module}:answer", "--yes"]) == 0
+    assert _cli.main(["diagnose", "--yes"]) == 0
+    capsys.readouterr()
+    assert _cli.main(["sweep", "--holdout", "0", *flags, "--yes"]) == 0
+    final = capsys.readouterr().out.rstrip().splitlines()[-1]
+    store = Store.open(project)
+    try:
+        report, runs = _sweep_runs(store)
+    finally:
+        store.close()
+    assert [runs[r][0] for r in report.rounds[0]] == [Setting(top_k=8), Setting(top_k=12)]
+    return final, report, runs
+
+
+TOP8_PASSES_7_TOP12_PASSES_8 = {8: EASY + HARD[:3], 12: EASY + HARD[:4]}
+
+
+def test_a_cheaper_setting_one_case_behind_is_chosen_and_the_line_names_the_one_passed_over(project: Path, hooks: None, capsys: pytest.CaptureFixture[str]) -> None:
+    """Defect: accuracy-first ranking that recommends top_k=12 for one more passing case at half
+    again the input tokens, or a recommendation that hides the setting it passed over, so the
+    user cannot see the accuracy traded for the cheaper prompt."""
+    final, report, runs = _priced_sweep(project, capsys, "sweep_app_near_tie", TOP8_PASSES_7_TOP12_PASSES_8)
+    assert report.recommended is not None and runs[report.recommended][0] == Setting(top_k=8)
+    assert report.passed_over is not None and runs[report.passed_over][0] == Setting(top_k=12)
+    assert final.startswith("Set top_k=8 (top_k=12 passed 1 more tune case but uses 50% more input tokens). Accuracy 40% -> 70% "), final
+
+
+def test_tolerance_zero_recommends_the_most_accurate_setting(project: Path, hooks: None, capsys: pytest.CaptureFixture[str]) -> None:
+    """Defect: --tolerance ignored, so a user who asks for accuracy first still gets the cheaper
+    setting that passes fewer cases."""
+    final, report, runs = _priced_sweep(project, capsys, "sweep_app_tolerance_zero", TOP8_PASSES_7_TOP12_PASSES_8, "--tolerance", "0")
+    assert report.recommended is not None and runs[report.recommended][0] == Setting(top_k=12)
+    assert report.passed_over is None
+    assert final.startswith("Set top_k=12. Accuracy 40% -> 80% "), final
+
+
+def test_a_near_tie_that_does_not_beat_the_baseline_is_never_chosen(project: Path, hooks: None, capsys: pytest.CaptureFixture[str]) -> None:
+    """Defect: the tolerance window reaching down to the baseline's pass count, so top_k=8, which
+    passes no more cases than the baseline, wins on tokens over top_k=12, which passes one more.
+    The sweep then recommends a setting that fixes nothing, or keeps the current settings while
+    a real improvement sits in the table."""
+    final, report, runs = _priced_sweep(project, capsys, "sweep_app_no_beat", {8: EASY, 12: EASY + HARD[:1]}, "--tolerance", "3")
+    assert report.recommended is not None and runs[report.recommended][0] == Setting(top_k=12)
+    assert report.passed_over is None
+    assert final.startswith("Set top_k=12. Accuracy 40% -> 50% "), final
+
+
+def test_sweep_rejects_a_negative_tolerance(project: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """Boundary. Defect: --tolerance -1, which leaves no setting a contender, reaches the search
+    instead of failing as a usage error before any app call."""
+    assert _cli.main(["init", "--provider", "fake"]) == 0
+    with pytest.raises(SystemExit):
+        _cli.main(["sweep", "app:answer", "--tolerance", "-1", "--yes"])
+    assert "--tolerance must be a whole number of cases, 0 or more" in capsys.readouterr().err
+
+
 def test_sweep_report_round_trips_through_json() -> None:
     """Defect: a stored report that loses the holdout runs, the recommendation, or the split, so
     the dashboard cannot mark the recommended row of an older sweep."""
@@ -426,7 +525,10 @@ def test_sweep_report_round_trips_through_json() -> None:
         holdout_runs=(RunId(6), RunId(7)),
         recommended=RunId(5),
         reason="",
+        passed_over=RunId(4),
     )
     assert _sweep.SweepReport.from_json(json.loads(json.dumps(report.to_json()))) == report
+    older = {k: v for k, v in report.to_json().items() if k != "passed_over"}
+    assert _sweep.SweepReport.from_json(older).passed_over is None
     kept = _sweep.SweepReport(report.source_run, 4, {}, report.split, report.baseline_run, (), None, None, "nothing beat the baseline")
     assert _sweep.SweepReport.from_json(kept.to_json()) == kept
