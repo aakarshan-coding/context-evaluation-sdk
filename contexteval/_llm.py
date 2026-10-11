@@ -105,7 +105,10 @@ PRICES: Mapping[str, Price] = {
 
 
 def cost_usd(model: str, input_tokens: int, output_tokens: int) -> float | None:
-    raise NotImplementedError  # None when model not in PRICES
+    price = PRICES.get(model)
+    if price is None:
+        return None
+    return (input_tokens * price.input_per_mtok + output_tokens * price.output_per_mtok) / 1_000_000
 
 
 @dataclass(frozen=True)

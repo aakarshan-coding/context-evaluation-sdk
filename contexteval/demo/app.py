@@ -15,7 +15,12 @@ Planted mechanics (see planted.py for which case uses which):
 
 from __future__ import annotations
 
+import zlib
 from typing import Any
+
+from chromadb.api.types import EmbeddingFunction
+
+from .. import _text as text
 
 TOP_K = 3
 ARCHIVED_MARKER = "[ARCHIVED]"
@@ -24,11 +29,38 @@ CHUNK_OPEN = "<chunk>"
 CHUNK_CLOSE = "</chunk>"
 
 
-class HashEmbedding:
-    """chromadb EmbeddingFunction. Deterministic, offline: no ONNX model download."""
+class HashEmbedding(EmbeddingFunction):  # type: ignore[type-arg]
+    """chromadb EmbeddingFunction. Deterministic, offline: no ONNX model download.
+
+    Bag of words hashed with crc32 into DIM buckets, L2-normalized, so cosine distance is a
+    pure function of shared tokens and the same across processes (hash() is salted per run).
+    """
+
+    DIM = 64
+
+    def __init__(self) -> None:  # chromadb warns when an embedding function has no __init__
+        pass
 
     def __call__(self, input: list[str]) -> list[list[float]]:
-        raise NotImplementedError
+        vectors = []
+        for doc in input:
+            v = [0.0] * self.DIM
+            for tok in text.tokens(doc):
+                v[zlib.crc32(tok.encode("utf-8")) % self.DIM] += 1.0
+            norm = sum(x * x for x in v) ** 0.5 or 1.0
+            vectors.append([x / norm for x in v])
+        return vectors
+
+    @staticmethod
+    def name() -> str:
+        return "contexteval_hash"
+
+    def get_config(self) -> dict[str, Any]:
+        return {}
+
+    @staticmethod
+    def build_from_config(config: dict[str, Any]) -> "HashEmbedding":
+        return HashEmbedding()
 
 
 def collection() -> Any:

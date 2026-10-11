@@ -12,6 +12,8 @@ Everything else is driven by the `contexteval` CLI. Modules other than this one 
 `contexteval.types` are internal; their names may change without notice.
 """
 
-from ._capture import InstallReport, init, retriever
+from ._capture import InstallReport, retriever
+from ._hooks import init
+from ._intervention import InterventionNotApplicable
 
-__all__ = ["init", "retriever", "InstallReport"]
+__all__ = ["init", "retriever", "InstallReport", "InterventionNotApplicable"]
