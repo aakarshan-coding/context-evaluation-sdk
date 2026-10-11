@@ -4,13 +4,35 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "contexteval"
-version = "0.1.0"
-description = "Find out why your RAG agent's context failed."
+version = "0.2.0"
+description = "Find out why your RAG app's answer failed: label each failure as missing, irrelevant, or ignored context, then test the fix."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
 license-files = ["LICENSE"]
+authors = [{ name = "aakarshan-coding" }]
+keywords = ["rag", "llm", "evaluation", "retrieval", "context", "diagnosis", "openai", "anthropic", "chromadb", "pinecone"]
+# No "License ::" classifier: PEP 639 metadata carries the license in `license` above, and setuptools rejects both.
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Testing",
+]
 dependencies = []  # core is stdlib only
+
+[project.urls]
+Homepage = "https://github.com/aakarshan-coding/context-evaluation-sdk"
+Source = "https://github.com/aakarshan-coding/context-evaluation-sdk"
+Issues = "https://github.com/aakarshan-coding/context-evaluation-sdk/issues"
+Changelog = "https://github.com/aakarshan-coding/context-evaluation-sdk/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 openai = ["openai>=1.40"]
