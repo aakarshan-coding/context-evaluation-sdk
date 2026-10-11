@@ -12,7 +12,7 @@ top before only gold):
     NeedsEvidenceFirst evidence in the FIRST chunk    gold 2nd to 4th         fail   -       pass    -          ignored
     NeedsNoDistractor  evidence present, no marker    gold + marker chunk     fail   -       fail    pass       irrelevant
     AlwaysWrong        never                          gold present            fail   -       fail    fail       not_context
-    FlipFlop           even-numbered calls            gold present, call 1    pass   -       -       -          flaky
+    FailsFirstCall     every call after the first     gold present, call 1    pass   -       -       -          flaky
     NeedsEvidence      evidence in any chunk          gold present            (passes at baseline: healthy)
 
 Unscripted questions (synthetic cases from build-tests) echo the whole context back, so the
@@ -29,6 +29,7 @@ from typing import Any, Union
 
 from .. import _text as text
 from ..types import Evidence, never
+from ._lock import file_lock
 
 STATE_FILE_NAME = "demo_fake_state.json"
 
@@ -58,26 +59,30 @@ class AlwaysWrong:
 
 
 @dataclass(frozen=True)
-class FlipFlop:
+class FailsFirstCall:
     answer: str
 
 
-Rule = Union[NeedsEvidence, NeedsEvidenceFirst, NeedsNoDistractor, AlwaysWrong, FlipFlop]
+Rule = Union[NeedsEvidence, NeedsEvidenceFirst, NeedsNoDistractor, AlwaysWrong, FailsFirstCall]
 
 WRONG = "I don't know."
 
 
 def _bump(state_file: Path, question: str) -> int:
-    """Increment and persist the per-question call counter; returns the new count."""
-    try:
-        counts = json.loads(state_file.read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError):
-        counts = {}
-    counts[question] = counts.get(question, 0) + 1
-    state_file.parent.mkdir(parents=True, exist_ok=True)
-    tmp = state_file.with_suffix(".tmp")
-    tmp.write_text(json.dumps(counts, indent=2), encoding="utf-8")
-    os.replace(tmp, state_file)
+    """Increment and persist the per-question call counter; returns the new count.
+
+    The lock makes the read-modify-write one step across concurrent CLI processes. Without it,
+    updates are lost and os.replace fails on Windows while another process has the file open.
+    """
+    with file_lock(state_file.with_suffix(".lock")):
+        try:
+            counts = json.loads(state_file.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError):
+            counts = {}
+        counts[question] = counts.get(question, 0) + 1
+        tmp = state_file.with_suffix(".tmp")
+        tmp.write_text(json.dumps(counts, indent=2), encoding="utf-8")
+        os.replace(tmp, state_file)
     return counts[question]
 
 
@@ -95,8 +100,8 @@ def evaluate(rule: Rule, question: str, chunks: list[str], state_file: Path) -> 
             return a if ok else WRONG
         case AlwaysWrong():
             return WRONG
-        case FlipFlop(answer=a):
-            return a if _bump(state_file, question) % 2 == 0 else WRONG
+        case FailsFirstCall(answer=a):
+            return a if _bump(state_file, question) > 1 else WRONG
         case _:
             never(rule)
 
@@ -104,9 +109,10 @@ def evaluate(rule: Rule, question: str, chunks: list[str], state_file: Path) -> 
 def respond(prompt: str, state_file: Path) -> str:
     """parse_prompt -> look up planted.script()[question] -> evaluate the rule.
 
-    FlipFlop increments a per-question counter in `state_file` (JSON). The counter must persist
-    because `run` and `diagnose` are separate processes: run is call 1 (fail), the diagnoser's
-    baseline rerun is call 2 (pass). Re-running the workflow keeps the odd/even alternation.
+    FailsFirstCall increments a per-question counter in `state_file` (JSON). The counter must
+    persist because `run` and `diagnose` are separate processes: run is call 1 (fail), the
+    diagnoser's baseline rerun is call 2 (pass). Every later call passes, so experiment rows
+    after the first run are stable.
     """
     from .app import parse_prompt
     from .planted import script

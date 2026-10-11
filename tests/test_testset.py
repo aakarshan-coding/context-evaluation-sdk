@@ -120,3 +120,12 @@ def test_fake_provider_generate_reads_inputs_not_prompt() -> None:
     req = LLMRequest(Task.GENERATE_CASES, system="", user="unrelated", inputs={"passage": "Alpha beta gamma delta epsilon zeta.", "count": "1"})
     items = json.loads(FakeProvider().complete(req).text)
     assert items == [{"question": "According to the document, what completes: Alpha beta gamma ...?", "answer": "delta epsilon zeta", "evidence": "Alpha beta gamma delta epsilon zeta."}]
+
+
+def test_import_csv_with_a_byte_order_mark(tmp_path: Path) -> None:
+    """Review Y9. Excel saves "CSV UTF-8" with a byte order mark. Defect: the first header reads
+    "\ufeffquestion", so every row fails with "missing field 'question'"."""
+    path = tmp_path / "tests.csv"
+    path.write_bytes("question,expected_answer\nHow heavy is the tent?,1.8 kilograms\n".encode("utf-8-sig"))
+    (case,) = import_tests(path)
+    assert (case.question, case.expected_answer) == ("How heavy is the tent?", "1.8 kilograms")

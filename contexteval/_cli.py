@@ -29,7 +29,7 @@ from . import _diagnose, _runner, _testset
 from ._intervention import InterventionNotApplicable, Setting
 from ._llm import Estimate, Provider, ProviderError, make_provider
 from ._store import PROJECT_DIR_NAME, Store, StoredTrace, find_project
-from .types import Diagnosis, ExperimentRow, RunId, explain, label_of
+from .types import Diagnosis, ExperimentRow, RunId, TestCase, explain, label_of
 
 CONFIG_FILE = "config.json"
 PROVIDERS = ("openai", "anthropic", "fake")
@@ -42,6 +42,7 @@ class Config:
     provider: str = "openai"
     model: str | None = None
     app: str | None = None  # default for run / experiment when no positional is given
+    pinecone_text_key: str | None = None  # metadata key holding chunk text in pinecone matches
 
 
 class UserError(Exception):
@@ -209,11 +210,18 @@ def cmd_build_tests(args: argparse.Namespace) -> int:
             raise UserError(f"no .md or .txt files under {root}")
         provider = _provider(config)
         confirm(_testset.estimate_build(docs, provider, args.per_passage), args.yes)
+        saved = new = 0
+
+        def save(cases: tuple[TestCase, ...]) -> None:
+            nonlocal saved, new
+            new += store.upsert_cases(_testset.SYNTHETIC_TEST_SET, cases)
+            saved += len(cases)
+
         try:
-            report = _testset.build_tests(docs, provider, args.per_passage)
+            report = _testset.build_tests(docs, provider, args.per_passage, on_cases=save)
         except ProviderError as e:
-            raise UserError(str(e)) from None
-        new = store.upsert_cases(_testset.SYNTHETIC_TEST_SET, report.cases)
+            what = "1 case from earlier passages is" if saved == 1 else f"{saved} cases from earlier passages are"
+            raise UserError(f"{e} ({what} saved)") from None
         print(f"built {len(report.cases)} cases ({new} new) from {len(docs)} documents; rejected {len(report.rejected)}")
         for reason in sorted({r.reason for r in report.rejected}):
             count = sum(r.reason == reason for r in report.rejected)
@@ -229,8 +237,6 @@ def cmd_run(args: argparse.Namespace) -> int:
     spec = args.app or config.app
     if spec is None:
         raise UserError("no app given; pass MODULE:FUNCTION once and it is remembered")
-    if spec != config.app:
-        save_config(project, replace(config, app=spec))
     store = Store.open(project)
     try:
         cases = store.cases(args.test_set)
@@ -238,7 +244,9 @@ def cmd_run(args: argparse.Namespace) -> int:
             where = f"test set {args.test_set!r}" if args.test_set else "this project"
             raise UserError(f"no test cases in {where}; run `contexteval build-tests` first")
         provider = _provider(config)
-        app = _runner.load_app(spec)
+        app = _runner.load_app(spec, pinecone_text_key=config.pinecone_text_key)
+        if spec != config.app:
+            save_config(project, replace(config, app=spec))
         app_tokens = store.mean_app_tokens()
         if app_tokens is not None:
             print(f"app: {len(cases)} calls to {spec}, ~{app_tokens[0]} input tokens each in the last run")
@@ -284,8 +292,8 @@ def cmd_diagnose(args: argparse.Namespace) -> int:
             spec = run.app or config.app
             if spec is None:
                 raise UserError(f"run {run.id} has no app recorded; pass one with `contexteval init --app`")
-            app = _runner.load_app(spec)
-            ground_truth = sum(p.evidence is not None and not p.crashed for p in todo)
+            app = _runner.load_app(spec, pinecone_text_key=config.pinecone_text_key)
+            ground_truth = sum(p.path == "replay" for p in todo)
             print(f"app: up to {ground_truth * _diagnose.MAX_REPLAYS} replay calls to {spec} ({ground_truth} failures with evidence)")
         confirm(_diagnose.estimate_diagnosis(provider, todo), args.yes)
         print(f"run {run.id}:")
@@ -297,7 +305,7 @@ def cmd_diagnose(args: argparse.Namespace) -> int:
             raise UserError(f"{e} (diagnoses so far are saved; rerun to resume)") from None
         print(
             f"diagnosed {report.diagnosed}, skipped {report.skipped_existing} already labeled, "
-            f"skipped {report.skipped_crashed} crashed"
+            f"skipped {report.skipped_crashed} crashed, skipped {report.skipped_no_answer} with no answer text"
         )
         return 0
     finally:
@@ -322,7 +330,7 @@ def cmd_experiment(args: argparse.Namespace) -> int:
             raise UserError("no test cases in this project; run `contexteval build-tests` first")
         settings = _runner.experiment_settings(grid)
         provider = _provider(config)
-        app = _runner.load_app(spec)
+        app = _runner.load_app(spec, pinecone_text_key=config.pinecone_text_key)
         print(f"experiment: {len(cases)} cases x {len(settings)} settings ({', '.join(s.name for s in settings)})")
         app_tokens = store.mean_app_tokens()
         if app_tokens is not None:

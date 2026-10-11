@@ -10,7 +10,7 @@ from __future__ import annotations
 import pytest
 
 from contexteval._diagnose import LADDER, MAX_REPLAYS, GoldLocation, GoldMap, diagnose_case
-from contexteval.types import Flaky, Ignored, Irrelevant, Missing, NotContext, ReplayOutcome, ReplayStep
+from contexteval.types import Flaky, Ignored, Irrelevant, Missing, NotContext, LADDER_STEPS, ReplayOutcome, ReplayStep, explain
 
 GOLD_AT = ((0, 2),)
 OTHER = ((0, 0), (0, 1), (0, 3))
@@ -59,5 +59,50 @@ def test_decision_table(location, passing, steps, expected) -> None:
 def test_ladder_prefers_the_least_invasive_fix() -> None:
     """Defect: the ladder rows swapped, so a case fixed by both reordering and pruning is
     labeled irrelevant (prune) instead of ignored (reorder, plan item 5's first row)."""
-    assert [step for step, _ in LADDER] == [TO_TOP, ONLY]
+    assert [step for step, _ in LADDER] == [TO_TOP, ONLY] == list(LADDER_STEPS)  # explain() reads LADDER_STEPS
     assert MAX_REPLAYS == 3
+
+
+@pytest.mark.parametrize(
+    "unchanged,passing,steps,expected",
+    [
+        ({TO_TOP}, {TO_TOP, ONLY}, [RERUN, ONLY], lambda r: Irrelevant(r, removed=OTHER)),
+        ({TO_TOP}, {TO_TOP}, [RERUN, ONLY], lambda r: NotContext(r)),
+        ({TO_TOP, ONLY}, {TO_TOP, ONLY}, [RERUN], lambda r: NotContext(r)),
+    ],
+    ids=["gold-already-first", "gold-already-first-chance-pass", "gold-is-the-only-chunk"],
+)
+def test_ladder_skips_a_step_that_would_not_change_the_context(unchanged, passing, steps, expected) -> None:
+    """Review Y3. When gold already sits first, GoldToTop replays the baseline unchanged, so a pass
+    is chance (the flaky rerun just failed), not proof the order mattered. Defect: the step runs
+    anyway and a chance pass becomes `ignored` (or, with gold the only chunk, OnlyGold's chance
+    pass becomes `irrelevant`). The step must not be requested, and its absence from the stored
+    replays is the record of the skip."""
+    requested: list[ReplayStep] = []
+
+    def replay(step: ReplayStep) -> ReplayOutcome:
+        requested.append(step)
+        return ReplayOutcome(step, step in passing, "scripted")
+
+    diagnosis = diagnose_case(GoldMap(GoldLocation.IN_PROMPT, GOLD_AT, OTHER, frozenset(unchanged)), replay)
+    assert requested == steps
+    assert diagnosis == expected(_replays(steps, passing))
+
+
+def test_skipped_steps_are_named_in_the_explain_line() -> None:
+    """Review Y3. Defect: a diagnosis whose ladder skipped a step still says "neither moving gold to
+    the top nor keeping only gold fixed it", claiming a replay that never ran."""
+    rerun = (ReplayOutcome(RERUN, False, "x"),)
+    only = (ReplayOutcome(ONLY, False, "x"),)
+    assert explain(NotContext(rerun)) == (
+        "gold was already the only context at the top, so moving it to the top and keeping only gold were skipped"
+    )
+    assert explain(NotContext(rerun + only)) == (
+        "keeping only gold did not fix it; moving gold to the top was skipped because gold was already at the top"
+    )
+    assert explain(Irrelevant(rerun + (ReplayOutcome(ONLY, True, "x"),), removed=OTHER)) == (
+        "keeping only the gold chunks fixed it; removed chunks 0, 1, 3 of retrieval 0; "
+        "moving gold to the top was skipped because gold was already at the top"
+    )
+    full = rerun + (ReplayOutcome(TO_TOP, False, "x"), ReplayOutcome(ONLY, False, "x"))
+    assert explain(NotContext(full)) == "neither moving gold to the top nor keeping only gold fixed it"

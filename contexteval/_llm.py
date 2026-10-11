@@ -50,6 +50,11 @@ class ProviderError(Exception):
     pass
 
 
+# Reasoning models (gpt-5 family, o1/o3/o4) reject `temperature` and `max_tokens` with a 400 and
+# take `max_completion_tokens`. They run at their fixed default sampling.
+_OPENAI_REASONING = re.compile(r"(gpt-5|o\d)")
+
+
 @dataclass
 class OpenAIProvider:
     model: str = "gpt-4.1-mini"
@@ -64,15 +69,19 @@ class OpenAIProvider:
             import openai
         except ImportError:
             raise ProviderError("the openai provider needs `pip install contexteval[openai]`") from None
+        sampling: dict[str, Any] = (
+            {"max_completion_tokens": req.max_tokens}
+            if _OPENAI_REASONING.match(self.model)
+            else {"temperature": 0, "max_tokens": req.max_tokens}
+        )
         try:
             if self.client is None:
                 self.client = openai.OpenAI()
             with _capture.suppressed():
                 resp = self.client.chat.completions.create(
                     model=self.model,
-                    temperature=0,
-                    max_tokens=req.max_tokens,
                     messages=[{"role": "system", "content": req.system}, {"role": "user", "content": req.user}],
+                    **sampling,
                 )
         except openai.OpenAIError as e:
             raise ProviderError(f"openai: {type(e).__name__}: {e}") from e

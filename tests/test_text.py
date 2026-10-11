@@ -101,3 +101,31 @@ def test_estimate_tokens_is_chars_over_four_with_floor_one() -> None:
     """Plan item 14. Defect: an empty prompt estimated at zero tokens divides later cost math by zero."""
     assert text.estimate_tokens("") == 1
     assert text.estimate_tokens("x" * 400) == 100
+
+
+def test_answer_matches_needs_whole_tokens() -> None:
+    """Review Y1. Defect: the fast path matches inside words, so a short expected answer passes
+    on an unrelated reply ("4" in "14 days", "No" in "I do not know") and the LLM grader never
+    runs."""
+    assert not text.answer_matches("4", "It takes 14 days.")
+    assert not text.answer_matches("No", "I do not know.")
+    assert not text.answer_matches("yes", "Your eyes see it.")
+    assert text.answer_matches("14 days", "It takes 14 days.")
+    assert text.answer_matches("No", "No, it cannot.")
+
+
+def test_exact_evidence_needs_whole_tokens() -> None:
+    """Review Y1. Defect: the exact branch of contains_evidence matches across word boundaries,
+    so "the cat" is found in "bathe catalog" and a chunk without the evidence counts as gold."""
+    assert not text.contains_evidence("bathe catalog", Evidence("the cat"))
+    assert not text.contains_evidence("we concatenate strings", Evidence("cat"))
+    assert not text.contains_evidence("this is greenhouse", Evidence("is green"))
+    assert text.contains_evidence("feed the cat daily", Evidence("the cat"))
+
+
+def test_in_prompt_needs_whole_tokens() -> None:
+    """Review Y1. Defect: a chunk "Yes" is reported in a prompt that only says "Yesterday", so
+    in_prompt marks chunks the app never sent."""
+    assert text.in_prompt_pairs((_event("Yes", "is sunny"),), "Yesterday is sunny") == ((0, 1),)
+    assert text.chunk_in_prompt("Yes", "Yesterday is sunny") is False
+    assert text.chunk_in_prompt("Yes", "Yes. Yesterday is sunny") is True

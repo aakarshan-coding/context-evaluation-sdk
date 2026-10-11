@@ -280,7 +280,7 @@ function renderFailures() {
       "data-trace": t.id,
       onclick: () => selectTrace(t.id, true),
     },
-      el("span", {}, t.passed === false ? badge(t.diagnosis) : passBadge(t.passed),
+      el("span", {}, t.passed === false || t.diagnosis ? badge(t.diagnosis) : passBadge(t.passed),
         el("span", { className: "q", text: t.question })),
       t.diagnosis ? el("span", { className: "why", text: t.diagnosis.explain }) : null,
       t.error ? el("span", { className: "why error", text: t.error }) : null);

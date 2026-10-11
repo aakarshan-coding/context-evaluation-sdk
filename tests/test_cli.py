@@ -51,7 +51,7 @@ def test_init_creates_config_and_db(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     assert _cli.main(["init", "--provider", "anthropic", "--app", "my_app:answer"]) == 0
     project = tmp_path / PROJECT_DIR_NAME
     assert (project / "contexteval.db").is_file()
-    assert json.loads((project / "config.json").read_text()) == {"provider": "anthropic", "model": None, "app": "my_app:answer"}
+    assert json.loads((project / "config.json").read_text()) == {"provider": "anthropic", "model": None, "app": "my_app:answer", "pinecone_text_key": None}
     assert _cli.load_config(tmp_path) == _cli.Config(provider="anthropic", model=None, app="my_app:answer")
     assert _cli.main(["init"]) == 0
     assert _cli.load_config(tmp_path) == _cli.Config()
@@ -156,3 +156,65 @@ def test_cli_run_and_build_tests_user_errors(project: Path, capsys: pytest.Captu
     assert _cli.main(["build-tests", "--import", str(project / "missing.jsonl")]) == 1
     err = capsys.readouterr().err
     assert "no app given" in err and "no test cases" in err and "exactly one of" in err and "missing.jsonl" in err
+
+
+def test_run_remembers_the_app_only_after_it_loads(project: Path) -> None:
+    """Review Y5. Defect: `run` writes the app spec to config.json before importing it, so one typo
+    replaces the remembered app and every later `run` and `experiment` without a spec fails."""
+    assert _cli.main(["init", "--provider", "fake", "--app", "contexteval.demo.app:answer"]) == 0
+    tests = project / "t.jsonl"
+    tests.write_text(json.dumps({"question": "q?", "expected_answer": "a"}) + "\n", encoding="utf-8")
+    assert _cli.main(["build-tests", "--import", str(tests)]) == 0
+    try:
+        code = _cli.main(["run", "no_such_module_for_contexteval:answer", "--yes"])
+    except SystemExit as e:
+        code = e.code
+    assert code not in (0, None)
+    assert _cli.load_config(project).app == "contexteval.demo.app:answer"
+
+
+def test_run_passes_the_configured_pinecone_text_key_to_load_app(project: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Review X7. Defect: config.json has no pinecone_text_key, so under `run` every pinecone
+    chunk is decoded from the default "text" key and comes back empty."""
+    assert _cli.main(["init", "--provider", "fake"]) == 0
+    _cli.save_config(project, _cli.Config(provider="fake", pinecone_text_key="body"))
+    tests = project / "t.jsonl"
+    tests.write_text(json.dumps({"question": "q?", "expected_answer": "a"}) + "\n", encoding="utf-8")
+    assert _cli.main(["build-tests", "--import", str(tests)]) == 0
+    seen = {}
+
+    def fake_load_app(spec, pinecone_text_key=None):  # type: ignore[no-untyped-def]
+        seen["key"] = pinecone_text_key
+        return lambda question: "a"
+
+    monkeypatch.setattr(_cli._runner, "load_app", fake_load_app)
+    assert _cli.main(["run", "my_app:answer", "--yes"]) == 0
+    assert seen == {"key": "body"}
+
+
+def test_build_tests_keeps_cases_from_passages_before_a_provider_error(project: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    """Review Y9. Defect: build-tests stores cases only after every passage succeeds, so a provider
+    error on the last document throws away the cases the user already paid for."""
+    from contexteval._llm import FakeProvider, ProviderError, Task, _fake_generate
+
+    calls = []
+
+    def generate(req):  # type: ignore[no-untyped-def]
+        calls.append(req)
+        if len(calls) == 2:
+            raise ProviderError("openai: RateLimitError: slow down")
+        return _fake_generate(req)
+
+    monkeypatch.setattr(_cli, "make_provider", lambda name, model: FakeProvider(handlers={Task.GENERATE_CASES: generate}))
+    assert _cli.main(["init", "--provider", "fake"]) == 0
+    docs = project / "docs"
+    docs.mkdir()
+    (docs / "a.md").write_text("The Ridge 2 tent weighs 1.8 kilograms in total.\n", encoding="utf-8")
+    (docs / "b.md").write_text("Its poles are aluminum and the fly is silnylon.\n", encoding="utf-8")
+    assert _cli.main(["build-tests", str(docs), "--per-passage", "1", "--yes"]) == 1
+    assert "1 case from earlier passages is saved" in capsys.readouterr().err
+    store = Store.open(project)
+    try:
+        assert [c.source for c in store.cases()] == [(docs / "a.md").as_posix()]
+    finally:
+        store.close()

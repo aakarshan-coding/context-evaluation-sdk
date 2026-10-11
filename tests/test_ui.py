@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
+import subprocess
 import threading
 import urllib.error
 import urllib.request
@@ -409,3 +411,100 @@ def test_ui_command_reports_busy_port(served: Served, monkeypatch: pytest.Monkey
     assert not bound_anyway, "contexteval ui started serving on a port another server holds"
     assert ui.result == [1]
     assert f"cannot serve on port {port}" in capsys.readouterr().err
+
+
+def test_gold_marks_follow_the_shared_gold_rule(store: Store) -> None:
+    """Review Y2. The dashboard must mark gold the way the diagnoser decides it. Defects: the two
+    halves of evidence split across adjacent chunks shown as "not gold" while the diagnosis moves
+    them as gold; or a prompt marked "contains gold" because the question repeats the evidence."""
+    evidence = "The refund window closes thirty days after delivery for every online order."
+    halves = ("Refunds. The refund window closes thirty", "days after delivery for every online order. Store credit is issued instead.")
+    case = TestCase(CaseId("c-split"), "Does the refund window close thirty days after delivery for every online order?", "yes", Evidence(evidence), "d.md")
+    store.upsert_cases("synthetic", [case])
+    run = store.new_run("baseline", "app:answer", BASELINE)
+    chunks = (_chunk(OTHER, 0), _chunk(halves[0], 1), _chunk(halves[1], 2))
+    split = Trace(
+        question=case.question,
+        outcome=Answered("no"),
+        retrievals=(RetrievalEvent("chromadb", case.question, {}, chunks, chunks, 1.0),),
+        llm_calls=(
+            LLMCall("openai", "m", f"{OTHER}\n{halves[0]}\n{halves[1]}\nQ: {case.question}", "no", 1, 1, 1.0),
+            LLMCall("openai", "m", f"{OTHER}\nQ: {case.question}", "no", 1, 1, 1.0),
+        ),
+        metrics=Metrics(1, 1, 1.0, None),
+        test=TestOutcome(case.id, False, "llm"),
+        in_prompt=((0, 0), (0, 1), (0, 2)),
+    )
+    detail = _ui.api_trace(store, store.add_trace(run, split))
+    assert [c["gold"] for c in detail["retrievals"][0]["delivered"]] == [False, True, True]
+    assert [c["gold"] for c in detail["retrievals"][0]["retrieved"]] == [False, True, True]
+    assert [c["gold"] for c in detail["llm_calls"]] == [True, False]
+
+
+def test_handler_error_is_a_json_500(served: Served, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Review Y6. Defect: an exception inside a handler (a locked or corrupt database) escapes
+    do_GET, the server drops the connection, and the page shows a network error with no reason."""
+
+    def broken(self: Store) -> None:
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(Store, "runs", broken)
+    status, content_type, body = _get(served.url + "/api/runs")
+    assert (status, content_type) == (500, "application/json")
+    assert "database is locked" in json.loads(body)["error"]
+    assert _json(served.url + "/api/experiments")["experiments"]
+
+
+# Runs the page's own script in node against the live server, with just enough DOM to build
+# elements, then prints the badge text of each row in the failure list.
+_PAGE_HARNESS = r"""
+const fs = require("fs");
+const [htmlPath, base, runId] = process.argv.slice(2);
+const script = fs.readFileSync(htmlPath, "utf8").match(/<script>([\s\S]*)<\/script>/)[1];
+class Node {}
+class El extends Node {
+  constructor(tag) { super(); this.tag = tag; this.children = []; this.dataset = {}; this.textContent = ""; this.checked = true; this.value = ""; }
+  append(...c) { this.children.push(...c); }
+  replaceChildren() { this.children = []; }
+  setAttribute(k, v) { if (k.startsWith("data-")) this.dataset[k.slice(5)] = v; }
+  addEventListener() {}
+  scrollIntoView() {}
+  get parentElement() { return new El("div"); }
+}
+class Text extends Node { constructor(t) { super(); this.textContent = t; this.children = []; } }
+const ids = {};
+globalThis.Node = Node;
+globalThis.document = {
+  createElement: (t) => new El(t), createTextNode: (t) => new Text(t),
+  getElementById: (id) => (ids[id] ??= new El(id)), querySelectorAll: () => [],
+};
+globalThis.location = { hash: "#run=" + runId };
+globalThis.history = { replaceState() {} };
+globalThis.matchMedia = () => ({ matches: false });
+const realFetch = fetch;
+globalThis.fetch = (path, opts) => realFetch(base + path, opts);
+(0, eval)(script);
+const started = Date.now();
+const timer = setInterval(() => {
+  const rows = (ids.failures || { children: [] }).children;
+  if (!rows.length && Date.now() - started < 5000) return;
+  clearInterval(timer);
+  console.log(JSON.stringify(rows.map((li) => li.children[0].children[0].children[0].textContent)));
+}, 50);
+"""
+
+
+def test_list_shows_the_judge_label_for_judged_production_traces(served: Served, tmp_path: Path) -> None:
+    """Review Y6. Defect: the failure list shows "ungraded" for a production trace the judge has
+    labeled, because the list only shows a diagnosis badge for graded failures."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is not installed")
+    harness = tmp_path / "harness.js"
+    harness.write_text(_PAGE_HARNESS, encoding="utf-8")
+    page = resources.files("contexteval").joinpath("ui.html")
+    out = subprocess.run(
+        [node, str(harness), str(page), served.url, str(served.seed.production)],
+        stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60, check=True,
+    )
+    assert json.loads(out.stdout) == ["judge: no failure"]

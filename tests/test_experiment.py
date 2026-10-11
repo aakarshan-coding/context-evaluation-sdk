@@ -129,8 +129,8 @@ def test_missing_case_passes_with_larger_top_k(project: Path, hooks: None, capsy
     Defects caught: the top_k override not reaching the store call (the not_retrieved case would
     still fail at top_k=10); a table missing the baseline or a setting row; accuracy, token, or
     latency columns that disagree with the stored traces; the experiment reading gold (the
-    dropped case would then pass too). The flaky planted case alternates answers, so it is left
-    out of the per-case expectations.
+    dropped case would then pass too). The flaky planted case failed only its first call (the
+    `run`), so it passes in every experiment row.
     """
     pytest.importorskip("chromadb")
     from contexteval.demo import app as demo_app
@@ -171,12 +171,10 @@ def test_missing_case_passes_with_larger_top_k(project: Path, hooks: None, capsy
     def outcomes(name: str) -> dict[CaseId, bool]:
         return {s.trace.test.case_id: s.trace.test.passed for s in traces[name] if s.trace.test}
 
-    steady = [p for p in planted.PLANTED if p.expected is not Label.FLAKY]
-    assert {p.case.id: outcomes("baseline")[p.case.id] for p in steady} == {p.case.id: p.passes_baseline for p in steady}
-    assert {p.case.id: outcomes("top_k=4")[p.case.id] for p in steady} == {p.case.id: p.passes_baseline for p in steady}
-    assert {p.case.id: outcomes("top_k=10")[p.case.id] for p in steady} == {
-        p.case.id: p.passes_baseline or p.cause == "not_retrieved" for p in steady
-    }
+    after_first_call = {p.case.id: p.passes_baseline or p.expected is Label.FLAKY for p in planted.PLANTED}
+    assert outcomes("baseline") == outcomes("top_k=4") == after_first_call
+    assert outcomes("top_k=10") == {p.case.id: after_first_call[p.case.id] or p.cause == "not_retrieved" for p in planted.PLANTED}
+    assert by_name["top_k=10"].passed == by_name["baseline"].passed + 1
 
     (missing,) = [p for p in planted.PLANTED if p.cause == "not_retrieved"]
     evidence = missing.case.evidence
