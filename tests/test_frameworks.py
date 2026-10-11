@@ -7,6 +7,8 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import os
+import subprocess
 import sys
 import uuid
 from pathlib import Path
@@ -474,6 +476,42 @@ def test_framework_hooks_install_once_and_uninstall_restores() -> None:
         capture.reset_process()
     for (owner, name), original in originals.items():
         assert owner.__dict__[name] is original
+
+
+_INIT_PROBE = """
+import json, sys
+import contexteval
+from contexteval import _hooks
+mode, project, preload = sys.argv[1], sys.argv[2], sys.argv[3]
+if preload:
+    __import__(preload)
+report = _hooks.install("cli") if mode == "cli" else contexteval.init(project)
+frameworks = sorted(m for m in ("langchain_core", "llama_index") if m in sys.modules)
+print(json.dumps({"statuses": report.statuses, "error": report.error, "imported": frameworks}))
+"""
+
+
+def _install_in_a_fresh_process(mode: str, project: Path, preload: str = "") -> dict[str, Any]:
+    env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parent.parent)}
+    run = subprocess.run([sys.executable, "-c", _INIT_PROBE, mode, str(project), preload], capture_output=True, text=True, timeout=120, cwd=project, env=env)
+    assert run.returncode == 0, run.stderr
+    return json.loads(run.stdout.strip().splitlines()[-1])
+
+
+def test_production_init_hooks_a_framework_only_when_the_app_imported_it(tmp_path: Path) -> None:
+    """Review P6. Defect: init() imported LangChain and LlamaIndex on every call (0.7 s and 1.2 s
+    here, 7.7 s and 2.8 s on the reviewer's machine), paid by every app that uses neither. In
+    production a framework is hooked only when the app has imported it by init() time; the
+    CLI installs before the app module loads, so it still hooks everything it can import."""
+    cold = _install_in_a_fresh_process("production", tmp_path)
+    assert cold["error"] is None and cold["statuses"]["chromadb"] == "installed"
+    assert (cold["statuses"]["langchain_core"], cold["statuses"]["llama_index"]) == ("not_imported", "not_imported")
+    assert cold["imported"] == []
+    warm = _install_in_a_fresh_process("production", tmp_path, preload="langchain_core.retrievers")
+    assert (warm["statuses"]["langchain_core"], warm["statuses"]["llama_index"]) == ("installed", "not_imported")
+    cli = _install_in_a_fresh_process("cli", tmp_path)
+    assert (cli["statuses"]["langchain_core"], cli["statuses"]["llama_index"]) == ("installed", "installed")
+    assert cli["imported"] == ["langchain_core", "llama_index"]
 
 
 def test_not_installed_when_a_framework_is_absent(monkeypatch: pytest.MonkeyPatch) -> None:
