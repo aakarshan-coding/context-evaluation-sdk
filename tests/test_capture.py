@@ -3,6 +3,7 @@ Driven through the public hook surface (intercept_*, @retriever, execute), not i
 
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -16,10 +17,10 @@ import pytest
 from contexteval import _capture as capture
 from contexteval import _hooks, retriever
 from contexteval._intervention import NO_INTERVENTION, InjectEvidence, Intervention, InterventionNotApplicable
-from contexteval._llm import cost_usd
-from contexteval._runner import execute
+from contexteval._llm import FakeProvider, cost_usd
+from contexteval._runner import execute, make_grader, run_suite
 from contexteval._store import Store
-from contexteval.types import Answered, Evidence, LLMCall, Trace
+from contexteval.types import Answered, CaseId, Evidence, LLMCall, TestCase, Trace
 
 
 @dataclass
@@ -36,8 +37,22 @@ class FakeLLM:
         return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="ans"))], usage=None)
 
 
+class AsyncFakeLLM:
+    """Stand-in for openai AsyncCompletions, hooked with the real OpenAIChatAdapter."""
+
+    async def create(self, *, messages: list[dict[str, str]], model: str = "gpt-4.1-mini") -> Any:
+        await asyncio.sleep(0)
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="ans"))], usage=None)
+
+
 @retriever
 def search(query: str, top_k: int = 3) -> list[dict[str, str]]:
+    return [{"text": f"doc {i} for {query}"} for i in range(top_k)]
+
+
+@retriever
+async def async_search(query: str, top_k: int = 3) -> list[dict[str, str]]:
+    await asyncio.sleep(0)
     return [{"text": f"doc {i} for {query}"} for i in range(top_k)]
 
 
@@ -46,6 +61,16 @@ def llm() -> Iterator[FakeLLM]:
     assert _hooks.patch_method(FakeLLM, "create", _hooks.OpenAIChatAdapter()) == "installed"
     try:
         yield FakeLLM()
+    finally:
+        _hooks.uninstall_all()
+        capture.reset_process()
+
+
+@pytest.fixture
+def async_llm() -> Iterator[AsyncFakeLLM]:
+    assert _hooks.patch_method(AsyncFakeLLM, "create", _hooks.OpenAIChatAdapter()) == "installed"
+    try:
+        yield AsyncFakeLLM()
     finally:
         _hooks.uninstall_all()
         capture.reset_process()
@@ -243,6 +268,74 @@ def test_worker_thread_retrievals_join_the_active_run(hooks: None) -> None:
     assert len(trace.retrievals) == 1 and trace.retrievals[0].params["top_k"] == 1
     assert execute(app, "q2").outcome == Answered("3 rows")
     assert search("outside any run") == [{"text": f"doc {i} for outside any run"} for i in range(3)]
+
+
+def test_concurrent_asyncio_tasks_get_separate_production_traces(async_llm: AsyncFakeLLM, flushed: list[capture.ActiveRun]) -> None:
+    """v1.1 B. Defect: the production buffer is shared by every task on the thread, so task A's
+    LLM call closes a buffer holding B's retrieval too, and B's own trace then has no
+    retrieval. Each asyncio task must get its own buffer."""
+
+    async def request(name: str) -> None:
+        hits = await async_search(name)
+        await asyncio.sleep(0)  # let the other task retrieve before this one reaches the LLM
+        context = "\n".join(h["text"] for h in hits)
+        await async_llm.create(messages=[{"role": "user", "content": f"{context}\n\nQ: {name}"}])
+
+    async def main() -> None:
+        await asyncio.gather(request("request A"), request("request B"))
+
+    asyncio.run(main())
+    assert sorted(r.question for r in flushed) == ["request A", "request B"]
+    for run in flushed:
+        assert [e.query for e in run.retrievals] == [run.question]
+        assert len(run.llm_calls) == 1 and f"doc 0 for {run.question}" in run.llm_calls[0].prompt
+
+
+def test_intervention_not_applicable_survives_an_async_apps_own_except(hooks: None) -> None:
+    """v1.1 B, review X5 for async apps. Defect: the refusal raised inside the awaited retriever
+    is swallowed by the app's `except Exception`, and execute returns a Trace for an experiment
+    row that silently ran the baseline."""
+
+    @retriever(top_k=None)
+    async def fixed_search(query: str) -> list[str]:
+        return ["a"]
+
+    async def app(question: str) -> str:
+        try:
+            hits = await fixed_search(question)
+        except Exception:
+            hits = ["fallback"]
+        return " ".join(hits)
+
+    with pytest.raises(InterventionNotApplicable, match="no top_k parameter"):
+        execute(app, "q", Intervention(top_k=10))
+    assert execute(app, "q").outcome == Answered("a")
+
+
+def test_async_answer_runs_through_the_suite_with_in_prompt(store: Store, hooks: None, async_llm: AsyncFakeLLM) -> None:
+    """v1.1 B. Defect: execute stores str(coroutine) as the answer, grades it, and the trace has
+    no retrieval and no LLM call. The second case pins one event loop per run: the app's
+    loop-bound clients (an AsyncOpenAI connection pool) must stay valid from one question to
+    the next, which a fresh asyncio.run per question breaks."""
+    loops: list[asyncio.AbstractEventLoop] = []
+
+    async def app(question: str) -> str:
+        loops.append(asyncio.get_running_loop())
+        hits = await async_search(question)
+        r = await async_llm.create(messages=[{"role": "user", "content": f"{hits[0]['text']}\n\nQ: {question}"}])
+        return r.choices[0].message.content
+
+    cases = [TestCase(CaseId(f"c{i}"), f"question {i}", "ans", None, "tests.jsonl") for i in (1, 2)]
+    store.upsert_cases("tests", cases)
+    summary = run_suite(store, "tests:app", app, cases, make_grader(FakeProvider()))
+    assert (summary.cases, summary.passed, summary.crashed) == (2, 2, 0)
+    traces = [s.trace for s in store.traces(summary.run)]
+    assert [t.question for t in traces] == ["question 1", "question 2"]
+    for t in traces:
+        assert t.outcome == Answered("ans") and t.test is not None and t.test.passed
+        assert [e.query for e in t.retrievals] == [t.question] and len(t.llm_calls) == 1
+        assert t.in_prompt == ((0, 0),)
+    assert len(loops) == 2 and loops[0] is loops[1]
 
 
 def test_cost_prices_the_same_tokens_the_metrics_report() -> None:

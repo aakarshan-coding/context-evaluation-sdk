@@ -1,17 +1,24 @@
 """Execute the user's answer(question) in-process, one question at a time (plan item 7).
 
-`execute` is the single path for baseline runs, diagnosis replays, and experiments.
+`execute` is the single path for baseline runs, diagnosis replays, and experiments. An
+`async def answer` runs to completion on one event loop that lives for the process (one run),
+not a fresh loop per question: the app's loop-bound clients (an AsyncOpenAI connection pool,
+an async database pool) stay valid from one question to the next, as they do in production,
+and no caller of execute needs to carry a loop.
 """
 
 from __future__ import annotations
 
+import asyncio
+import atexit
 import dataclasses
 import importlib
+import inspect
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
-from typing import Callable, Sequence
+from typing import Any, Awaitable, Callable, Sequence, Union
 
 from . import _capture as capture
 from . import _hooks
@@ -21,8 +28,19 @@ from ._llm import Estimate, LLMRequest, Provider, Task, estimate
 from ._store import Store
 from .types import Answered, Crashed, ExperimentId, Outcome, RunId, TestCase, TestOutcome, Trace
 
-App = Callable[[str], str]
+App = Callable[[str], Union[str, Awaitable[str]]]
 Grader = Callable[[TestCase, Trace], TestOutcome]
+
+_loop: asyncio.AbstractEventLoop | None = None
+
+
+def _await(result: Awaitable[Any]) -> Any:
+    """Run an async answer() on the process's one loop, created on first use."""
+    global _loop
+    if _loop is None or _loop.is_closed():
+        _loop = asyncio.new_event_loop()
+        atexit.register(_loop.close)
+    return _loop.run_until_complete(result)
 
 
 class AppLoadError(Exception):
@@ -61,13 +79,17 @@ def load_app(spec: str, *, pinecone_text_key: str | None = None) -> App:
 def execute(app: App, question: str, intervention: Intervention = NO_INTERVENTION) -> Trace:
     """Run one question with `intervention` active. Never raises for app errors: an exception
     becomes Crashed. InterventionNotApplicable propagates, even when the app's own except
-    swallowed it on the way out of the hook. The returned Trace is ungraded.
+    swallowed it on the way out of the hook. The returned Trace is ungraded. An awaitable
+    result (an `async def answer`) is run to completion first.
     """
     with capture.active_run(question, intervention) as run:
         t0 = perf_counter()
         outcome: Outcome
         try:
-            outcome = Answered(str(app(question)))
+            result = app(question)
+            if inspect.isawaitable(result):
+                result = _await(result)
+            outcome = Answered(str(result))
         except InterventionNotApplicable:
             raise  # an experiment that cannot apply must not pass as a crashed baseline
         except Exception as e:
