@@ -368,6 +368,37 @@ def test_init_after_cli_install_keeps_cli_mode(hooks: None, project: Path, chrom
         store.close()
 
 
+class _BodyIndex:
+    """Pinecone stand-in whose chunk text lives under metadata["body"], not "text"."""
+
+    def query(self, vector: list[float] | None = None, top_k: int = 3, include_metadata: bool = True) -> dict[str, Any]:
+        return {"matches": [{"id": "1", "score": 0.9, "metadata": {"body": "the gold text"}}]}
+
+
+def test_pinecone_text_key_from_a_later_init_applies_under_the_cli(hooks: None, project: Path) -> None:
+    """Review X7. Defect: the CLI installs first with the default key, and the user's
+    init(pinecone_text_key="body") inside the app module is discarded as "already", so every
+    pinecone chunk is recorded with empty text. The codec must read the key at call time."""
+    import contexteval
+
+    assert _hooks.patch_method(_BodyIndex, "query", _hooks.PineconeCodec()) == "installed"
+    contexteval.init(project, pinecone_text_key="body")
+    assert capture._process.mode is capture.Mode.CLI
+    with capture.active_run("q") as run:
+        _BodyIndex().query(vector=[0.1])
+    assert [c.text for c in run.retrievals[0].retrieved] == ["the gold text"]
+
+
+def test_plain_init_keeps_a_text_key_the_cli_already_set(hooks: None, project: Path) -> None:
+    """Review X7. Defect: a user's plain init() in the app module resets the key the CLI took
+    from its configuration back to the default."""
+    import contexteval
+
+    _hooks.install("cli", pinecone_text_key="body")
+    contexteval.init(project)
+    assert _hooks.PineconeCodec().text_key == "body"
+
+
 # --- init() never raises (review X1) -----------------------------------------------------
 
 

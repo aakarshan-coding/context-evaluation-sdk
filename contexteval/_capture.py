@@ -206,6 +206,7 @@ class _Process:
     mode: Mode = Mode.OFF
     sink: Sink | None = None  # the ProductionWriter in production mode; tests inject lists
     current: ActiveRun | None = None  # the one runner.execute in progress, visible to every thread
+    pinecone_text_key: str = "text"  # read by the pinecone codec at call time, so a later init() applies
     logged: set[str] = field(default_factory=set)  # keys of warnings already emitted
 
 
@@ -226,6 +227,17 @@ def mode() -> Mode:
     return _process.mode
 
 
+def pinecone_text_key() -> str:
+    return _process.pinecone_text_key
+
+
+def set_pinecone_text_key(key: str | None) -> None:
+    """Unlike the mode, the key is set by whoever names it last: the CLI's install runs before
+    the app module imports, so a user init(pinecone_text_key=) there wins. None leaves it."""
+    if key is not None:
+        _process.pinecone_text_key = key
+
+
 def set_mode(mode: Mode, make_sink: Callable[[], Sink] | None = None) -> None:
     """Mode only ever escalates OFF -> CLI or OFF -> PRODUCTION. If the CLI installed first, a
     later init() inside the user's module keeps CLI mode, so `contexteval run` never writes
@@ -243,6 +255,7 @@ def reset_process() -> None:
     _process.mode = Mode.OFF
     _process.sink = None
     _process.current = None
+    _process.pinecone_text_key = "text"
     _process.logged.clear()
     _ambient.set(None)
 

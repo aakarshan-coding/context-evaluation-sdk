@@ -174,6 +174,19 @@ def test_load_app_installs_hooks_before_import(tmp_path: Path, monkeypatch: pyte
             load_app(bad)
 
 
+def test_load_app_passes_the_pinecone_text_key_to_install(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, hooks: None) -> None:
+    """Review X7. Defect: the CLI has no way to hand the project's pinecone text key to the hooks
+    it installs before importing the app."""
+    from contexteval._hooks import PineconeCodec
+
+    (tmp_path / "my_rag_app.py").write_text("def answer(q):\n    return q\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    monkeypatch.delitem(sys.modules, "my_rag_app", raising=False)
+    load_app("my_rag_app:answer", pinecone_text_key="body")
+    assert PineconeCodec().text_key == "body"
+
+
 def test_cli_reports_a_bad_app_spec_as_a_user_error(project: Path, store: Store, hooks: None, capsys: pytest.CaptureFixture[str]) -> None:
     """Review X10. Defect: `contexteval run bad` escapes main() as SystemExit instead of exit
     code 1 with a one-line error on stderr."""

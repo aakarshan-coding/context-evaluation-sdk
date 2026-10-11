@@ -128,12 +128,16 @@ class PineconeCodec:
     """pinecone Index.query(vector=..., top_k=k, include_metadata=True) -> matches.
 
     Queries are vectors, so query_text is None and transforms fall back to the run question.
-    Chunk text comes from match.metadata[text_key].
+    Chunk text comes from match.metadata[text_key], where the key is process state read at
+    call time (review X7): the CLI installs this codec before the app module can name the key.
     """
 
-    text_key: str = "text"
     source: str = "pinecone"
     top_k_param: str | None = "top_k"
+
+    @property
+    def text_key(self) -> str:
+        return capture.pinecone_text_key()
 
     def query_text(self, args: inspect.BoundArguments) -> str | None:
         return None
@@ -413,14 +417,12 @@ def _wrap(original: Callable[..., Any], handler: Handler) -> Callable[..., Any]:
 # --- entry points -----------------------------------------------------------
 
 
-def install(mode: Literal["cli", "production"], project_dir: Path | None = None, pinecone_text_key: str = "text") -> InstallReport:
+def install(mode: Literal["cli", "production"], project_dir: Path | None = None, pinecone_text_key: str | None = None) -> InstallReport:
     """Idempotent. Patches every library in HOOKS that is importable, then sets the process mode
-    (which only escalates from OFF, see capture.set_mode)."""
-    specs = tuple(
-        HookSpec(s.library, s.targets, PineconeCodec(text_key=pinecone_text_key)) if s.library == "pinecone" else s
-        for s in HOOKS
-    )
-    report = install_all(specs)
+    (which only escalates from OFF, see capture.set_mode). A pinecone text key given here
+    applies to calls from now on, whether or not the hooks were already in place."""
+    report = install_all(HOOKS)
+    capture.set_pinecone_text_key(pinecone_text_key)
     if mode == "production":
         root = project_dir or Path.cwd()
         capture.set_mode(Mode.PRODUCTION, lambda: capture.ProductionWriter(root))
@@ -429,10 +431,10 @@ def install(mode: Literal["cli", "production"], project_dir: Path | None = None,
     return report
 
 
-def init(project_dir: str | Path | None = None, *, pinecone_text_key: str = "text") -> InstallReport:
+def init(project_dir: str | Path | None = None, *, pinecone_text_key: str | None = None) -> InstallReport:
     """Public one-liner. Finds or creates .contexteval/ (walking up from cwd) and installs hooks
     in production mode. `pinecone_text_key` names the metadata field holding chunk text
-    (architecture graft 7).
+    (architecture graft 7); the default "text" stands until some caller names another.
 
     Never raises into the app. A project that cannot hold the database (unwritable path, a
     schema from another build) is logged once and reported in InstallReport.error; nothing is

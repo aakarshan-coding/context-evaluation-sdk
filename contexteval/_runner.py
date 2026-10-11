@@ -29,17 +29,18 @@ class AppLoadError(Exception):
     """The app spec did not resolve to a callable. The CLI prints it as a one-line user error."""
 
 
-def load_app(spec: str) -> App:
+def load_app(spec: str, *, pinecone_text_key: str | None = None) -> App:
     """Boundary: "module:function" -> callable. Prepends cwd to sys.path.
 
     Installs hooks in CLI mode *before* importing, so module-level clients are patched
-    and a user init() call in the module stays a no-op.
+    and a user init() call in the module stays a no-op. `pinecone_text_key` is the project's
+    configured key for pinecone chunk text; an init(pinecone_text_key=) in the module overrides it.
     Raises AppLoadError with a readable message on a bad spec, import error, or non-callable.
     """
     module_name, sep, attr = spec.partition(":")
     if not sep or not module_name or not attr:
         raise AppLoadError(f"app must look like module:function, got {spec!r}")
-    _hooks.install("cli")
+    _hooks.install("cli", pinecone_text_key=pinecone_text_key)
     cwd = str(Path.cwd())
     if cwd not in sys.path:
         sys.path.insert(0, cwd)
