@@ -218,13 +218,14 @@ def _sweep_runs(store: Store) -> tuple[_sweep.SweepReport, dict[int, tuple[Setti
     return report, runs
 
 
-def test_demo_sweep_finds_the_larger_top_k_and_names_the_dropped_case_as_unfixable(project: Path, hooks: None, capsys: pytest.CaptureFixture[str]) -> None:
+def test_demo_sweep_recommends_a_larger_top_k_and_names_the_dropped_case_as_unfixable(project: Path, hooks: None, capsys: pytest.CaptureFixture[str]) -> None:
     """Through `_cli.main` on the planted demo. Defects: the planted not_retrieved case does not
-    lead to a top_k candidate, the search never reaches the larger top_k that fixes it, the
-    dropped case is offered a setting instead of the reason none can help, --holdout 0 is refused
-    or not warned about, or the sweep is stored as a manual experiment. On 8 cases the default
-    tolerance prefers rerank=lexical max_chunks=2 at 74 tokens over top_k=8 rerank=lexical, which
-    passes one more case at 217 tokens; the line must name what it passed over."""
+    lead to a top_k candidate, the recommended setting does not carry the larger top_k that fixes
+    it, the dropped case is offered a setting instead of the reason none can help, --holdout 0 is
+    refused or not warned about, or the sweep is stored as a manual experiment. Also a near-tie
+    window that does not scale with the case count: one case is 12.5 points of 8, and a window of
+    one trades top_k=8 rerank=lexical for rerank=lexical max_chunks=2, which leaves the planted
+    not_retrieved case failing. On 8 tune cases the default window is 0."""
     pytest.importorskip("chromadb")
     from contexteval.demo import planted
 
@@ -239,22 +240,21 @@ def test_demo_sweep_finds_the_larger_top_k_and_names_the_dropped_case_as_unfixab
     assert "no setting can fix 1 not_context failure" in out and "no setting can fix 1 flaky failure" in out
     assert "warning: no holdout cases" in out
     assert "candidates, heaviest first" in out and "top_k=8 (1)" in out and "top_k=12 (1)" in out
+    assert "near-tie window" not in out
     final = out.rstrip().splitlines()[-1]
-    assert final.startswith("Set rerank=lexical max_chunks=2 (top_k=8 rerank=lexical passed 1 more tune case but uses 192% more input tokens). Accuracy 38% -> 50% "), final
-    assert "(no holdout cases, so this is unconfirmed)" in final
+    assert final.startswith("Set ") and "top_k=8" in final and "(no holdout cases, so this is unconfirmed)" in final
 
     store = Store.open(project)
     try:
         report, runs = _sweep_runs(store)
-        assert report.recommended is not None and report.passed_over is not None
-        assert report.holdout_runs is None and report.split.holdout == ()
-        assert runs[report.recommended] == (Setting(rerank="lexical", max_chunks=2), len(planted.PLANTED))
-        assert runs[report.passed_over] == (Setting(top_k=8, rerank="lexical"), len(planted.PLANTED))
+        assert report.recommended is not None and report.holdout_runs is None and report.split.holdout == ()
+        recommended, traces = runs[report.recommended]
+        assert recommended.top_k == 8 and traces == len(planted.PLANTED)
         assert report.counts[FailureKind.NOT_RETRIEVED] == 1 and report.counts[FailureKind.DROPPED] == 1
         for setting, _ in runs.values():
             assert not any(isinstance(t, GOLD_TRANSFORMS) for t in setting.intervention().transforms)
         (not_retrieved,) = [p for p in planted.PLANTED if p.cause == "not_retrieved"]
-        passed = {s.trace.test.case_id: s.trace.test.passed for s in store.traces(report.passed_over) if s.trace.test}
+        passed = {s.trace.test.case_id: s.trace.test.passed for s in store.traces(report.recommended) if s.trace.test}
         baseline = {s.trace.test.case_id: s.trace.test.passed for s in store.traces(report.baseline_run) if s.trace.test}
         assert passed[not_retrieved.case.id] is True and baseline[not_retrieved.case.id] is False
     finally:
@@ -446,50 +446,79 @@ def answer(question: str) -> str:
 
 
 def _priced_sweep(
-    project: Path, capsys: pytest.CaptureFixture[str], module: str, passing: dict[int, list[str]], *flags: str
+    project: Path, capsys: pytest.CaptureFixture[str], module: str, passing: dict[int, list[str]], *flags: str, questions: list[str] = ALL
 ) -> tuple[str, _sweep.SweepReport, dict[int, tuple[Setting, int]]]:
     """A sweep over the priced app with --holdout 0, so every case is a tune case. The baseline
     retrieves 4 chunks and fails the 6 hard cases, so the candidates are top_k=8 and top_k=12.
-    Returns the printed final line, the report, and the runs."""
+    Returns the printed output, the report, and the runs."""
     (project / f"{module}.py").write_text(PRICED_APP_SOURCE % HARD, encoding="utf-8")
     (project / "passing.json").write_text(json.dumps({str(k): v for k, v in passing.items()}), encoding="utf-8")
-    _write_cases(project, ALL)
+    _write_cases(project, questions)
     assert _cli.main(["init", "--provider", "fake"]) == 0
     assert _cli.main(["build-tests", "--import", "cases.jsonl"]) == 0
     assert _cli.main(["run", f"{module}:answer", "--yes"]) == 0
     assert _cli.main(["diagnose", "--yes"]) == 0
     capsys.readouterr()
     assert _cli.main(["sweep", "--holdout", "0", *flags, "--yes"]) == 0
-    final = capsys.readouterr().out.rstrip().splitlines()[-1]
+    out = capsys.readouterr().out
     store = Store.open(project)
     try:
         report, runs = _sweep_runs(store)
     finally:
         store.close()
     assert [runs[r][0] for r in report.rounds[0]] == [Setting(top_k=8), Setting(top_k=12)]
-    return final, report, runs
+    return out, report, runs
 
 
-TOP8_PASSES_7_TOP12_PASSES_8 = {8: EASY + HARD[:3], 12: EASY + HARD[:4]}
+def _final(out: str) -> str:
+    return out.rstrip().splitlines()[-1]
 
 
-def test_a_cheaper_setting_one_case_behind_is_chosen_and_the_line_names_the_one_passed_over(project: Path, hooks: None, capsys: pytest.CaptureFixture[str]) -> None:
-    """Defect: accuracy-first ranking that recommends top_k=12 for one more passing case at half
-    again the input tokens, or a recommendation that hides the setting it passed over, so the
-    user cannot see the accuracy traded for the cheaper prompt."""
-    final, report, runs = _priced_sweep(project, capsys, "sweep_app_near_tie", TOP8_PASSES_7_TOP12_PASSES_8)
+EASY_29 = EASY + [f"easy question {i}?" for i in range(4, 29)]
+ALL_35 = EASY_29 + HARD
+TOP8_ONE_BEHIND = {8: EASY + HARD[:3], 12: EASY + HARD[:4]}
+TOP8_ONE_BEHIND_OF_35 = {8: EASY_29 + HARD[:3], 12: EASY_29 + HARD[:4]}
+
+
+def test_default_window_on_35_cases_picks_the_cheaper_setting_one_case_behind(project: Path, hooks: None, capsys: pytest.CaptureFixture[str]) -> None:
+    """Defect: a default window that stays 0 on a larger set, so the sweep recommends top_k=12 for
+    one more passing case of 35 at half again the input tokens; or a recommendation that hides
+    the setting it passed over or the window that allowed it. 5% of 35 is one case."""
+    out, report, runs = _priced_sweep(project, capsys, "sweep_app_near_tie", TOP8_ONE_BEHIND_OF_35, questions=ALL_35)
+    assert "near-tie window: 1 case (5% of 35)" in out
     assert report.recommended is not None and runs[report.recommended][0] == Setting(top_k=8)
     assert report.passed_over is not None and runs[report.passed_over][0] == Setting(top_k=12)
-    assert final.startswith("Set top_k=8 (top_k=12 passed 1 more tune case but uses 50% more input tokens). Accuracy 40% -> 70% "), final
+    assert _final(out).startswith("Set top_k=8 (top_k=12 passed 1 more tune case but uses 50% more input tokens). Accuracy 83% -> 91% "), _final(out)
 
 
-def test_tolerance_zero_recommends_the_most_accurate_setting(project: Path, hooks: None, capsys: pytest.CaptureFixture[str]) -> None:
-    """Defect: --tolerance ignored, so a user who asks for accuracy first still gets the cheaper
-    setting that passes fewer cases."""
-    final, report, runs = _priced_sweep(project, capsys, "sweep_app_tolerance_zero", TOP8_PASSES_7_TOP12_PASSES_8, "--tolerance", "0")
+def test_default_window_on_10_cases_is_accuracy_first(project: Path, hooks: None, capsys: pytest.CaptureFixture[str]) -> None:
+    """Defect: a fixed window of one case, 10 points of 10, so the sweep trades a real accuracy
+    gain for tokens on a small set. 5% of 10 rounds down to 0."""
+    out, report, runs = _priced_sweep(project, capsys, "sweep_app_small_default", TOP8_ONE_BEHIND)
+    assert "near-tie window" not in out
     assert report.recommended is not None and runs[report.recommended][0] == Setting(top_k=12)
     assert report.passed_over is None
-    assert final.startswith("Set top_k=12. Accuracy 40% -> 80% "), final
+    assert _final(out).startswith("Set top_k=12. Accuracy 40% -> 80% "), _final(out)
+
+
+def test_tolerance_zero_overrides_the_default_window(project: Path, hooks: None, capsys: pytest.CaptureFixture[str]) -> None:
+    """Defect: --tolerance ignored on a set large enough for a default window, so a user who asks
+    for accuracy first still gets the cheaper setting that passes fewer cases."""
+    out, report, runs = _priced_sweep(project, capsys, "sweep_app_tolerance_zero", TOP8_ONE_BEHIND_OF_35, "--tolerance", "0", questions=ALL_35)
+    assert "near-tie window" not in out
+    assert report.recommended is not None and runs[report.recommended][0] == Setting(top_k=12)
+    assert report.passed_over is None
+    assert _final(out).startswith("Set top_k=12. Accuracy 83% -> 94% "), _final(out)
+
+
+def test_explicit_tolerance_widens_the_window_on_a_small_set(project: Path, hooks: None, capsys: pytest.CaptureFixture[str]) -> None:
+    """Defect: --tolerance 1 replaced by the 0 default on 10 cases, so a user who accepts one case
+    of noise still pays for top_k=12; or the window note credits the percentage."""
+    out, report, runs = _priced_sweep(project, capsys, "sweep_app_tolerance_one", TOP8_ONE_BEHIND, "--tolerance", "1")
+    assert "near-tie window: 1 case (--tolerance)" in out
+    assert report.recommended is not None and runs[report.recommended][0] == Setting(top_k=8)
+    assert report.passed_over is not None and runs[report.passed_over][0] == Setting(top_k=12)
+    assert _final(out).startswith("Set top_k=8 (top_k=12 passed 1 more tune case but uses 50% more input tokens). Accuracy 40% -> 70% "), _final(out)
 
 
 def test_a_near_tie_that_does_not_beat_the_baseline_is_never_chosen(project: Path, hooks: None, capsys: pytest.CaptureFixture[str]) -> None:
@@ -497,10 +526,10 @@ def test_a_near_tie_that_does_not_beat_the_baseline_is_never_chosen(project: Pat
     passes no more cases than the baseline, wins on tokens over top_k=12, which passes one more.
     The sweep then recommends a setting that fixes nothing, or keeps the current settings while
     a real improvement sits in the table."""
-    final, report, runs = _priced_sweep(project, capsys, "sweep_app_no_beat", {8: EASY, 12: EASY + HARD[:1]}, "--tolerance", "3")
+    out, report, runs = _priced_sweep(project, capsys, "sweep_app_no_beat", {8: EASY, 12: EASY + HARD[:1]}, "--tolerance", "3")
     assert report.recommended is not None and runs[report.recommended][0] == Setting(top_k=12)
     assert report.passed_over is None
-    assert final.startswith("Set top_k=12. Accuracy 40% -> 50% "), final
+    assert _final(out).startswith("Set top_k=12. Accuracy 40% -> 50% "), _final(out)
 
 
 def test_sweep_rejects_a_negative_tolerance(project: Path, capsys: pytest.CaptureFixture[str]) -> None:

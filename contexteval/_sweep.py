@@ -203,7 +203,7 @@ def split_cases(cases: Sequence[TestCase], failed: Iterable[CaseId], holdout: fl
 DEFAULT_ROUNDS = 2
 DEFAULT_MAX_SETTINGS = 6
 DEFAULT_HOLDOUT = 0.3
-DEFAULT_TOLERANCE = 1
+NEAR_TIE_PERCENT = 5  # the default near-tie window, as a share of the tune cases
 
 
 @dataclass(frozen=True)
@@ -218,7 +218,22 @@ class Plan:
     split: Split
     rounds: int
     max_settings: int
-    tolerance: int  # tune cases a cheaper setting may trail the most accurate one by
+    tolerance: int | None  # tune cases a cheaper setting may trail the most accurate one by; None for NEAR_TIE_PERCENT of them
+
+    @property
+    def window(self) -> int:
+        if self.tolerance is not None:
+            return self.tolerance
+        return len(self.split.tune) * NEAR_TIE_PERCENT // 100
+
+    @property
+    def window_note(self) -> str | None:
+        """The near-tie window in words, or None when it is 0 and accuracy alone decides."""
+        if not self.window:
+            return None
+        cases = "case" if self.window == 1 else "cases"
+        source = "--tolerance" if self.tolerance is not None else f"{NEAR_TIE_PERCENT}% of {len(self.split.tune)}"
+        return f"near-tie window: {self.window} {cases} ({source})"
 
     @property
     def unfixable(self) -> list[tuple[FailureKind, int, str]]:
@@ -249,7 +264,7 @@ class SweepNotPossible(Exception):
     """The source run cannot seed a sweep. The CLI prints it as a one-line user error."""
 
 
-def plan_sweep(store: Store, run: RunInfo, *, rounds: int, max_settings: int, holdout: float, seed: int, tolerance: int) -> tuple[Plan, dict[CaseId, TestCase]]:
+def plan_sweep(store: Store, run: RunInfo, *, rounds: int, max_settings: int, holdout: float, seed: int, tolerance: int | None) -> tuple[Plan, dict[CaseId, TestCase]]:
     """Read the source run's labels and retrievals and decide the candidates and the split. The
     cases are the ones the source run ran, so the sweep measures the set it was diagnosed on."""
     traces = store.traces(run.id)
@@ -392,7 +407,7 @@ def run_sweep(store: Store, app_spec: str, app: App, cases: Mapping[CaseId, Test
             todo = list(first_round)
         else:
             table = rows()
-            best = best_on_tune(table, plan.tolerance)
+            best = best_on_tune(table, plan.window)
             if best == BASELINE:
                 break
             baseline_passed = table[runs[BASELINE]].passed
@@ -412,7 +427,7 @@ def run_sweep(store: Store, app_spec: str, app: App, cases: Mapping[CaseId, Test
 
     table = rows()
     baseline_row = table[runs[BASELINE]]
-    winner = best_on_tune(table, plan.tolerance)
+    winner = best_on_tune(table, plan.window)
     holdout_runs = None
     recommended = None
     passed_over = None

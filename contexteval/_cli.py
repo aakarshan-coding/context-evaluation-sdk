@@ -408,6 +408,8 @@ def _print_plan(plan: _sweep.Plan, spec: str) -> None:
     print(f"split: {len(split.tune)} tune cases, {len(split.holdout)} holdout cases (seed {split.seed})")
     if not split.holdout:
         print("warning: no holdout cases, so the recommendation is not confirmed on cases the search did not see")
+    if plan.window_note:
+        print(plan.window_note)
     tune, held = len(split.tune), len(split.holdout)
     print(
         f"app: up to {plan.worst_case_app_calls} calls to {spec} "
@@ -548,9 +550,9 @@ def _args_sweep(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--tolerance",
         type=_tolerance,
-        default=_sweep.DEFAULT_TOLERANCE,
+        default=None,
         metavar="N",
-        help=f"prefer the cheapest setting within N tune cases of the most accurate (default {_sweep.DEFAULT_TOLERANCE}; 0 for accuracy first)",
+        help=f"prefer the cheapest setting within N tune cases of the most accurate (default {_sweep.NEAR_TIE_PERCENT}%% of the tune cases, rounded down; 0 for accuracy first)",
     )
     p.add_argument("--yes", action="store_true")
 
