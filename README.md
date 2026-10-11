@@ -219,7 +219,7 @@ For example, `contexteval experiment top_k=3,10 rerank=none,lexical` runs five s
 
 Everything stays on your machine. contexteval stores test cases, traces (prompts, answers, and chunks), and labels in `.contexteval/contexteval.db`, a local SQLite file. There is no hosted service and no telemetry.
 
-LLM calls go to your provider with your own key, read from `OPENAI_API_KEY` or `ANTHROPIC_API_KEY`. The default models are `gpt-4.1-mini` for OpenAI and `claude-haiku-4-5` for Anthropic. Change them with `contexteval init --model`. contexteval's own calls run at temperature 0 and are never recorded as traces.
+LLM calls go to your provider with your own key, read from `OPENAI_API_KEY` or `ANTHROPIC_API_KEY`. The default models are `gpt-4.1-mini` for OpenAI and `claude-haiku-4-5` for Anthropic. Change them with `contexteval init --model`. contexteval's own calls are never recorded as traces. They run at temperature 0 on every model that accepts it (see Limits).
 
 The estimate counts characters divided by 4 as tokens, priced from a built-in table. It assumes every answer needs an LLM grade, so the real cost is usually lower. contexteval does not report actual spend after a command. Your provider's usage page has the exact figure.
 
@@ -233,6 +233,7 @@ The estimate counts characters divided by 4 as tokens, priced from a built-in ta
 - An experiment setting applies to every retrieval call in a run.
 - A chromadb call with several query texts is recorded but never changed by an experiment.
 - Replay runs are not stored as traces. Their outcomes are stored inside the label.
+- Current Claude models such as `claude-haiku-5-5` and `claude-sonnet-5-5` reject non-default sampling parameters. On those models contexteval omits `temperature`, so grading and judging do not run at temperature 0 and can vary between runs. The Anthropic default stays `claude-haiku-4-5` for that reason.
 
 ## Roadmap
 
