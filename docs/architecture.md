@@ -176,6 +176,14 @@ P4 (branch `p4-experiment`).
 - The DoD item 3 test lives in `tests/test_experiment.py`, not `tests/test_acceptance.py`, so the P3 and P4 owners never edit one file at once. The skipped DoD item 3 placeholder in `test_acceptance.py` is left for that file's owner to delete.
 - The transform tests asked for in P4 (lexical rerank, ends order, compress, max_chunks) already existed in `tests/test_intervention.py` from P1. No new ones were added.
 
+P6 (branch `p6-real`).
+
+- The demo app's model is `gpt-4.1-mini`, the same as the SDK provider default, so the real-API run prices every call from one table row.
+- The planned lint against importing `contexteval._*` from outside the package is dropped. Nothing outside the package imports it except the tests, which use internals on purpose, so the lint would check no code.
+- `build-tests` already had `--per-passage`, and the demo corpus is four one-passage documents, so no case cap was added.
+- The CLI prints estimates only. Neither the SDK's own calls nor replay calls record their actual spend, so the real-API run measured cost with a scratch wrapper around `Completions.create`. The README tells users to read their provider's usage page.
+- `pyproject.toml` uses an SPDX `license = "MIT"` with `license-files`, which needs setuptools 77 or later.
+
 ## Open questions and risks
 
 - Should the flaky rerun also run before the missing confirmation? The sketch runs it first for every ground-truth case, reading plan item 3's "before replay" literally. The other reading skips it for missing, which saves one call per missing case.
