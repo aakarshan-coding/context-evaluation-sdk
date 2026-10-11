@@ -180,6 +180,65 @@ def test_no_intervention_returns_the_functions_own_list_and_tuples_keep_type() -
         assert search_tuple("q") == ("a", "b")
 
 
+def test_generator_result_reaches_the_user_unconsumed(caplog: pytest.LogCaptureFixture) -> None:
+    """Review X4. Defect: decode iterates a generator result, so user code receives an exhausted
+    iterator and an empty context, with no intervention and in production too. A one-shot result
+    is refused (logged once, passed through untouched); under an intervention it is loud."""
+
+    @retriever
+    def search(query: str, top_k: int = 3):  # type: ignore[no-untyped-def]
+        for i in range(top_k):
+            yield f"doc{i}"
+
+    with capture.active_run("q") as run:
+        assert list(search("q")) == ["doc0", "doc1", "doc2"]
+        assert list(search("q")) == ["doc0", "doc1", "doc2"]
+    assert run.retrievals == []
+    assert caplog.text.count("could not read retriever:search result") == 1
+    with capture.active_run("q", Intervention(transforms=(KeepFirst(1),))):
+        with pytest.raises(InterventionNotApplicable):
+            search("q")
+
+
+def test_str_and_mapping_results_are_not_decoded_as_chunks() -> None:
+    """Review X4. Defect: a str result is recorded as one chunk per character and a dict result
+    as one chunk per key. Neither is a sequence of items, so neither is recorded."""
+
+    @retriever
+    def as_text(query: str, top_k: int = 3) -> str:
+        return "one answer"
+
+    @retriever
+    def as_mapping(query: str, top_k: int = 3) -> dict:
+        return {"text": "one answer", "ids": [1, 2]}
+
+    with capture.active_run("q") as run:
+        assert as_text("q") == "one answer"
+        assert as_mapping("q") == {"text": "one answer", "ids": [1, 2]}
+    assert run.retrievals == []
+
+
+def test_method_retriever_skips_self_for_the_query() -> None:
+    """Review X9. Defect: `query` defaults to the first parameter, which is `self` on a method,
+    so the event's query is "<Searcher>" and transforms that need the query see None."""
+
+    class Searcher:
+        @retriever
+        def search(self, question: str, top_k: int = 2) -> list[str]:
+            return ["a", "b"]
+
+        @classmethod
+        @retriever
+        def search_cls(cls, question: str, top_k: int = 2) -> list[str]:
+            return ["c"]
+
+    with capture.active_run("q") as run:
+        Searcher().search("where is my order")
+        Searcher.search_cls("second question")
+    assert [e.query for e in run.retrievals] == ["where is my order", "second question"]
+    assert "self" not in run.retrievals[0].params and "cls" not in run.retrievals[1].params
+
+
 def test_outside_any_run_in_off_mode_is_passthrough() -> None:
     """Defect: the decorator records into a buffer nobody flushes when the CLI is not running."""
 

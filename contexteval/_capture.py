@@ -31,7 +31,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from time import perf_counter
-from typing import Any, Callable, Iterator, Literal, Mapping, Protocol, TypeVar, overload, runtime_checkable
+from typing import Any, Callable, Iterator, Literal, Mapping, Protocol, Sequence, TypeVar, overload, runtime_checkable
 
 from . import _text as text
 from ._intervention import BASELINE, NO_INTERVENTION, Intervention, InterventionNotApplicable
@@ -250,7 +250,7 @@ def _json_safe(value: Any, depth: int = 0) -> Any:
 
 
 def _snapshot(args: inspect.BoundArguments) -> dict[str, Any]:
-    return {name: _json_safe(value) for name, value in args.arguments.items() if name != "self"}
+    return {name: _json_safe(value) for name, value in args.arguments.items() if name not in ("self", "cls")}
 
 
 def intercept_retrieval(codec: RetrievalCodec[R], call: Callable[[inspect.BoundArguments], R], args: inspect.BoundArguments) -> R:
@@ -408,6 +408,10 @@ class _DecoratorCodec:
         return value if isinstance(value, str) else None
 
     def decode(self, result: Any) -> tuple[Chunk, ...]:
+        # A generator would be exhausted here and reach the user empty; a str or Mapping would
+        # decode as characters or keys. Refusing keeps the user's result untouched.
+        if isinstance(result, (str, bytes, Mapping)) or not isinstance(result, Sequence):
+            raise TypeError(f"{self.source} returned {type(result).__name__}; @retriever expects a list or tuple of items")
         chunks = []
         for index, item in enumerate(result):
             cid = self._field(item, self.id_field)
@@ -485,12 +489,12 @@ def retriever(
 
     Validated at decoration time (the boundary): an explicitly named top_k or query that is
     not in the signature raises TypeError at import. The default "top_k" silently becomes
-    None when absent. `query` defaults to the first parameter.
+    None when absent. `query` defaults to the first parameter other than `self` or `cls`.
     """
 
     def decorate(func: F) -> F:
         sig = inspect.signature(func)
-        names = list(sig.parameters)
+        names = [n for n in sig.parameters if n not in ("self", "cls")]
         top_k_param = top_k
         if top_k is not None and top_k not in sig.parameters:
             if top_k != "top_k":
