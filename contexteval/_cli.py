@@ -436,6 +436,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         return COMMANDS[args.command].run(args)
-    except UserError as e:
+    except (UserError, _runner.AppLoadError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1

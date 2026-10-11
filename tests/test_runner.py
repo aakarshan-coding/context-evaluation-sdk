@@ -16,7 +16,7 @@ openai = pytest.importorskip("openai")
 from contexteval import _capture as capture  # noqa: E402
 from contexteval._intervention import Intervention, InterventionNotApplicable  # noqa: E402
 from contexteval._llm import AnthropicProvider, FakeProvider, LLMRequest, OpenAIProvider, Task  # noqa: E402
-from contexteval._runner import execute, load_app, make_grader, run_suite  # noqa: E402
+from contexteval._runner import AppLoadError, execute, load_app, make_grader, run_suite  # noqa: E402
 from contexteval._store import Store  # noqa: E402
 from contexteval.demo import app as demo_app  # noqa: E402
 from contexteval.demo import planted  # noqa: E402
@@ -161,14 +161,26 @@ def test_openai_provider_sends_temperature_zero() -> None:
 
 
 def test_load_app_installs_hooks_before_import(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, hooks: None) -> None:
-    """Defect: the user module is imported from the wrong directory, or a bad spec raises a
-    traceback instead of a one-line exit."""
+    """Defect: the user module is imported from the wrong directory, or a bad spec raises
+    SystemExit from library code (review X10) instead of an error the CLI reports as one line."""
     (tmp_path / "my_rag_app.py").write_text("def answer(q):\n    return q.upper()\n", encoding="utf-8")
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(sys, "path", list(sys.path))
     monkeypatch.delitem(sys.modules, "my_rag_app", raising=False)
     assert load_app("my_rag_app:answer")("hi") == "HI"
     assert capture._process.mode is capture.Mode.CLI
-    for bad in ("my_rag_app", "no_such_module_xyz:answer", "my_rag_app:missing"):
-        with pytest.raises(SystemExit, match="error:"):
+    for bad in ("my_rag_app", "no_such_module_xyz:answer", "my_rag_app:missing", "my_rag_app:__doc__"):
+        with pytest.raises(AppLoadError):
             load_app(bad)
+
+
+def test_cli_reports_a_bad_app_spec_as_a_user_error(project: Path, store: Store, hooks: None, capsys: pytest.CaptureFixture[str]) -> None:
+    """Review X10. Defect: `contexteval run bad` escapes main() as SystemExit instead of exit
+    code 1 with a one-line error on stderr."""
+    from contexteval._cli import Config, main, save_config
+
+    save_config(project, Config(provider="fake"))
+    store.upsert_cases("planted", [CASE])
+    assert main(["run", "no_such_module_xyz:answer", "--yes"]) == 1
+    err = capsys.readouterr().err
+    assert err.startswith("error:") and "no_such_module_xyz" in err

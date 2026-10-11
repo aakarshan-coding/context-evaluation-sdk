@@ -25,16 +25,20 @@ App = Callable[[str], str]
 Grader = Callable[[TestCase, Trace], TestOutcome]
 
 
+class AppLoadError(Exception):
+    """The app spec did not resolve to a callable. The CLI prints it as a one-line user error."""
+
+
 def load_app(spec: str) -> App:
     """Boundary: "module:function" -> callable. Prepends cwd to sys.path.
 
     Installs hooks in CLI mode *before* importing, so module-level clients are patched
     and a user init() call in the module stays a no-op.
-    Raises SystemExit with a readable message on a bad spec, import error, or non-callable.
+    Raises AppLoadError with a readable message on a bad spec, import error, or non-callable.
     """
     module_name, sep, attr = spec.partition(":")
     if not sep or not module_name or not attr:
-        raise SystemExit(f"error: app must look like module:function, got {spec!r}")
+        raise AppLoadError(f"app must look like module:function, got {spec!r}")
     _hooks.install("cli")
     cwd = str(Path.cwd())
     if cwd not in sys.path:
@@ -42,14 +46,14 @@ def load_app(spec: str) -> App:
     try:
         module = importlib.import_module(module_name)
     except ImportError as e:
-        raise SystemExit(f"error: cannot import {module_name!r}: {e}") from None
+        raise AppLoadError(f"cannot import {module_name!r}: {e}") from None
     fn = module
     for part in attr.split("."):
         fn = getattr(fn, part, None)
         if fn is None:
-            raise SystemExit(f"error: {module_name!r} has no attribute {attr!r}")
+            raise AppLoadError(f"{module_name!r} has no attribute {attr!r}")
     if not callable(fn):
-        raise SystemExit(f"error: {spec} is not callable")
+        raise AppLoadError(f"{spec} is not callable")
     return fn  # type: ignore[return-value]
 
 
