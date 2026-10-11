@@ -85,7 +85,8 @@ class OpenAIProvider:
 
 
 # Current-generation Claude models reject non-default sampling parameters with a 400, so
-# temperature 0 goes only to models that accept it.
+# temperature 0 goes only to models that accept it. anthropic 1.x dropped `temperature` from
+# messages.create's signature, so it travels in extra_body.
 _ANTHROPIC_NO_TEMPERATURE = ("claude-haiku-5", "claude-sonnet-5", "claude-opus-5", "claude-opus-4-7", "claude-opus-4-8", "claude-fable")
 
 
@@ -102,7 +103,7 @@ class AnthropicProvider:
             import anthropic
         except ImportError:
             raise ProviderError("the anthropic provider needs `pip install contexteval[anthropic]`") from None
-        sampling: dict[str, Any] = {} if self.model.startswith(_ANTHROPIC_NO_TEMPERATURE) else {"temperature": 0}
+        sampling: dict[str, Any] = {} if self.model.startswith(_ANTHROPIC_NO_TEMPERATURE) else {"extra_body": {"temperature": 0}}
         try:
             if self.client is None:
                 self.client = anthropic.Anthropic()
