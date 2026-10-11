@@ -82,7 +82,7 @@ Test a fix. The "never retrieved" case ranks 5th, and the demo retrieves 4 chunk
 contexteval experiment top_k=10 --yes
 ```
 
-The table compares the baseline with the new setting. The missing case passes under `top_k=10`. The cost column prices the demo app's calls at `gpt-4.1-mini` rates even though the fake answered them.
+The table compares the baseline with the new setting. The missing case passes under `top_k=10`. The cost column reads `unknown` because the fake model has no price. The flaky case alternates between runs, so it can move a row's accuracy up or down by one case.
 
 Open the dashboard:
 
