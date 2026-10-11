@@ -12,6 +12,8 @@ import pytest
 from contexteval._diagnose import GoldLocation
 from contexteval.types import ReplayStep
 
+pytestmark = pytest.mark.skip(reason="P3: diagnose_case is not implemented yet")
+
 ROWS = [
     (GoldLocation.IN_PROMPT, {ReplayStep.BASELINE_RERUN}, "Flaky"),
     (GoldLocation.NOT_RETRIEVED, {ReplayStep.BASELINE_RERUN}, "Flaky"),

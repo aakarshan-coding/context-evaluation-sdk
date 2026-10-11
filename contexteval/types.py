@@ -18,6 +18,9 @@ TraceId = NewType("TraceId", int)
 RunId = NewType("RunId", int)
 ExperimentId = NewType("ExperimentId", int)
 
+# (retrieval index, delivered chunk index) inside one Trace.
+ChunkRef = tuple[int, int]
+
 
 def never(value: NoReturn) -> NoReturn:
     """Exhaustiveness guard for match statements (typing.assert_never is 3.11+)."""
@@ -123,19 +126,14 @@ class Trace:
     llm_calls: tuple[LLMCall, ...]
     metrics: Metrics
     test: TestOutcome | None  # None for production traces and ungraded replays
+    # Delivered chunks whose text appears in prompt_text. Computed once by the capture layer
+    # when the trace is finalized (_capture.finalize_trace), so this module never imports _text.
+    in_prompt: tuple[ChunkRef, ...]
 
     @property
     def prompt_text(self) -> str:
         """All prompts sent to an LLM during this run, joined. Gold checks read this."""
         return "\n".join(c.prompt for c in self.llm_calls)
-
-    @property
-    def in_prompt(self) -> tuple[tuple[int, int], ...]:
-        """(retrieval index, delivered chunk index) pairs whose text appears in the prompt.
-
-        Derived, never stored as truth. The store writes it denormalized for the UI only.
-        """
-        raise NotImplementedError  # text.chunk_in_prompt over every delivered chunk
 
 
 # --- diagnosis --------------------------------------------------------------
@@ -184,11 +182,13 @@ class Missing:
 @dataclass(frozen=True)
 class Irrelevant:
     replays: Replays
+    removed: tuple[ChunkRef, ...]  # the non-gold chunks whose removal made it pass
 
 
 @dataclass(frozen=True)
 class Ignored:
     replays: Replays
+    gold_at: tuple[ChunkRef, ...]  # where the gold sat before it was moved to the top
 
 
 @dataclass(frozen=True)
@@ -232,9 +232,39 @@ def source_of(d: Diagnosis) -> Literal["ground_truth", "judge"]:
     return "judge" if isinstance(d, Judged) else "ground_truth"
 
 
+def _positions(refs: tuple[ChunkRef, ...]) -> str:
+    """(0, 2), (0, 3), (1, 0) -> "chunks 2, 3 of retrieval 0; chunk 0 of retrieval 1"."""
+    by_retrieval: dict[int, list[int]] = {}
+    for r, c in refs:
+        by_retrieval.setdefault(r, []).append(c)
+    parts = []
+    for r, cs in sorted(by_retrieval.items()):
+        noun = "chunk" if len(cs) == 1 else "chunks"
+        parts.append(f"{noun} {', '.join(str(c) for c in sorted(cs))} of retrieval {r}")
+    return "; ".join(parts) if parts else "no chunks"
+
+
 def explain(d: Diagnosis) -> str:
     """Human evidence line, e.g. "keeping only gold chunks fixed it"."""
-    raise NotImplementedError  # match on variant, render from replays
+    match d:
+        case Missing(cause="not_retrieved", confirmed=ok):
+            fix = "fixed it" if ok else "did not fix it"
+            return f"the gold chunk was never retrieved; injecting the evidence {fix}"
+        case Missing(confirmed=ok):
+            fix = "fixed it" if ok else "did not fix it"
+            return f"the gold chunk was retrieved but dropped before the prompt; injecting the evidence {fix}"
+        case Irrelevant(removed=removed):
+            return f"keeping only the gold chunks fixed it; removed {_positions(removed)}"
+        case Ignored(gold_at=at):
+            return f"moving the gold chunk to the top fixed it; gold was at {_positions(at)}"
+        case NotContext():
+            return "neither moving gold to the top nor keeping only gold fixed it"
+        case Flaky():
+            return "the unchanged baseline passed on rerun"
+        case Judged(verdict=v, rationale=why):
+            return f"judge: {v.value}; {why}"
+        case _:
+            never(d)
 
 
 # --- experiments ------------------------------------------------------------

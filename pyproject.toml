@@ -1,6 +1,11 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "contexteval"
 version = "0.1.0"
+description = "Find out why your RAG agent's context failed."
 requires-python = ">=3.10"
 license = { text = "MIT" }
 dependencies = []  # core is stdlib only
@@ -16,8 +21,15 @@ dev = ["pytest>=8", "chromadb>=0.5", "openai>=1.40", "anthropic>=0.34", "httpx"]
 [project.scripts]
 contexteval = "contexteval._cli:main"
 
+[tool.setuptools.packages.find]
+include = ["contexteval*"]
+
 [tool.setuptools.package-data]
 contexteval = ["ui.html", "demo/corpus/*.md"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
 
 # TODO(P0): enable a lint that fails on imports of contexteval._* from outside the package
 # (ruff's private-import rule; confirm the rule code and preview status before relying on it).

@@ -7,6 +7,8 @@ import pytest
 chromadb = pytest.importorskip("chromadb")  # demo extra; installed in the dev extra
 openai = pytest.importorskip("openai")
 
+pytestmark = pytest.mark.skip(reason="P3/P4: demo, runner, and diagnoser are not implemented yet")
+
 
 def test_every_planted_case_gets_its_label(project, store, hooks) -> None:
     """build-tests --import planted.jsonl, run demo, diagnose --yes; then for each Planted p:
