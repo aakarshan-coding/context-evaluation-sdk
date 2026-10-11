@@ -57,6 +57,14 @@ class ActiveRun:
     intervention: Intervention
     retrievals: list[RetrievalEvent] = field(default_factory=list)
     llm_calls: list[LLMCall] = field(default_factory=list)
+    # Set when a hook refused the intervention. The app's own `except Exception` may swallow the
+    # raised error, so runner.execute re-raises this after answer() returns (graft 3).
+    not_applicable: InterventionNotApplicable | None = None
+
+
+def _refuse(run: ActiveRun, error: InterventionNotApplicable) -> InterventionNotApplicable:
+    run.not_applicable = error
+    return error
 
 
 _active: ContextVar[ActiveRun | None] = ContextVar("contexteval_active", default=None)
@@ -270,7 +278,7 @@ def intercept_retrieval(codec: RetrievalCodec[R], call: Callable[[inspect.BoundA
 
     if iv.top_k is not None:
         if codec.top_k_param is None:
-            raise InterventionNotApplicable(f"{codec.source}: top_k={iv.top_k} requested but this site has no top_k parameter")
+            raise _refuse(run, InterventionNotApplicable(f"{codec.source}: top_k={iv.top_k} requested but this site has no top_k parameter"))
         args.arguments[codec.top_k_param] = iv.top_k
 
     t0 = perf_counter()
@@ -283,7 +291,7 @@ def intercept_retrieval(codec: RetrievalCodec[R], call: Callable[[inspect.BoundA
         if iv.is_noop:
             _log_once(f"decode:{codec.source}", f"contexteval could not read {codec.source} result; not recorded", e)
             return raw
-        raise InterventionNotApplicable(f"{codec.source}: cannot decode result to apply the intervention") from e
+        raise _refuse(run, InterventionNotApplicable(f"{codec.source}: cannot decode result to apply the intervention")) from e
 
     try:
         query = codec.query_text(args)
@@ -297,10 +305,10 @@ def intercept_retrieval(codec: RetrievalCodec[R], call: Callable[[inspect.BoundA
         try:
             delivered = apply_intervention(iv, retrieved, query if query is not None else run.question)
             out = codec.encode(raw, delivered)
-        except InterventionNotApplicable:
-            raise
+        except InterventionNotApplicable as e:
+            raise _refuse(run, e)
         except Exception as e:
-            raise InterventionNotApplicable(f"{codec.source}: cannot rebuild the result after the intervention") from e
+            raise _refuse(run, InterventionNotApplicable(f"{codec.source}: cannot rebuild the result after the intervention")) from e
 
     try:
         run.retrievals.append(

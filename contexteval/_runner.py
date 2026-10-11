@@ -59,7 +59,8 @@ def load_app(spec: str) -> App:
 
 def execute(app: App, question: str, intervention: Intervention = NO_INTERVENTION) -> Trace:
     """Run one question with `intervention` active. Never raises for app errors: an exception
-    becomes Crashed. InterventionNotApplicable propagates. The returned Trace is ungraded.
+    becomes Crashed. InterventionNotApplicable propagates, even when the app's own except
+    swallowed it on the way out of the hook. The returned Trace is ungraded.
     """
     with capture.active_run(question, intervention) as run:
         t0 = perf_counter()
@@ -70,6 +71,8 @@ def execute(app: App, question: str, intervention: Intervention = NO_INTERVENTIO
             raise  # an experiment that cannot apply must not pass as a crashed baseline
         except Exception as e:
             outcome = Crashed(f"{type(e).__name__}: {e}")
+        if run.not_applicable is not None:
+            raise run.not_applicable
         latency_ms = (perf_counter() - t0) * 1000
     return capture.finalize_trace(run, outcome, latency_ms)
 

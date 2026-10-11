@@ -3,12 +3,54 @@ Driven through the public hook surface (intercept_*, @retriever, execute), not i
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import pytest
 
 from contexteval import _capture as capture
-from contexteval._intervention import NO_INTERVENTION
+from contexteval import retriever
+from contexteval._intervention import NO_INTERVENTION, InjectEvidence, Intervention, InterventionNotApplicable
 from contexteval._llm import cost_usd
-from contexteval.types import Answered, LLMCall
+from contexteval._runner import execute
+from contexteval.types import Answered, Evidence, LLMCall
+
+
+@dataclass
+class Doc:
+    text: str
+
+
+def test_intervention_not_applicable_survives_the_apps_own_except(hooks: None) -> None:
+    """Review X5. Defect: the app's `except Exception` fallback swallows InterventionNotApplicable,
+    execute returns a Trace, and the experiment row silently reports baseline behavior (graft 3
+    forbids this). The error must reach execute's caller however the exception travelled."""
+
+    @retriever(top_k=None)
+    def fixed_search(query: str) -> list[str]:
+        return ["a"]
+
+    @retriever
+    def broken_encode(query: str, top_k: int = 3) -> list[Doc]:
+        return [Doc("alpha")]
+
+    def app(question: str) -> str:
+        try:
+            hits = fixed_search(question)
+        except Exception:
+            hits = ["fallback"]
+        return " ".join(hits)
+
+    def app_rebuild(question: str) -> str:
+        try:
+            return str(broken_encode(question))
+        except Exception:
+            return "fallback"
+
+    with pytest.raises(InterventionNotApplicable, match="no top_k parameter"):
+        execute(app, "q", Intervention(top_k=10))
+    with pytest.raises(InterventionNotApplicable, match="rebuild="):
+        execute(app_rebuild, "q", Intervention(transforms=(InjectEvidence(Evidence("gold")),)))
+    assert isinstance(execute(app, "q").outcome, Answered)
 
 
 def test_cost_prices_the_same_tokens_the_metrics_report() -> None:
