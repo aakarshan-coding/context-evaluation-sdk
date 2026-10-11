@@ -661,6 +661,55 @@ def test_sweep_user_errors_and_nothing_to_do(project: Path, hooks: None, capsys:
         store.close()
 
 
+def test_a_holdout_that_rounds_to_zero_cases_is_refused_before_any_app_call(project: Path, hooks: None, capsys: pytest.CaptureFixture[str]) -> None:
+    """Review Q5. Defect: on a set so small that the requested holdout rounds to zero cases, the
+    sweep runs anyway and recommends a winner marked "unconfirmed" as if the user had opted out
+    with --holdout 0. A requested holdout that holds no case is a user error before any app call,
+    and the message names --holdout 0 as the opt-in."""
+    _scripted_project(project, "sweep_app_tiny", ALL, questions=EASY[:1] + HARD[:1])
+    capsys.readouterr()
+    assert _cli.main(["sweep", "--yes"]) == 1
+    out, err = capsys.readouterr()
+    assert err == "error: --holdout 0.3 rounds to 0 of the 2 cases, so no winner could be confirmed; raise it, or pass --holdout 0 to tune on every case and read the result as unconfirmed\n"
+    assert "experiment" not in out
+    store = Store.open(project)
+    try:
+        assert store.experiments() == []
+    finally:
+        store.close()
+    assert _cli.main(["sweep", "--holdout", "0", "--yes"]) == 0
+    assert "(no holdout cases, so this is unconfirmed)" in _final(capsys.readouterr().out)
+
+
+def test_sweep_reads_the_newest_diagnosed_baseline_and_names_it(project: Path, hooks: None, capsys: pytest.CaptureFixture[str]) -> None:
+    """Review Q6. Defect: the sweep reads the newest baseline run, so a `contexteval run` made
+    after `diagnose` hides every label behind "none is labeled". The source is the newest baseline
+    run with a diagnosis, named in the output with the newer undiagnosed run, and --run ID picks
+    a baseline run by hand; a run of another kind or an unknown id is a one-line error."""
+    _scripted_project(project, "sweep_app_source", ALL)
+    assert _cli.main(["run", "sweep_app_source:answer", "--yes"]) == 0
+    assert _cli.main(["experiment", "top_k=4", "--yes"]) == 0
+    capsys.readouterr()
+    assert _cli.main(["sweep", "--holdout", "0", "--yes"]) == 0
+    out = capsys.readouterr().out
+    assert "source: run 1 (the newest baseline run with diagnoses; run 2 is newer but has no diagnosis)" in out
+    store = Store.open(project)
+    try:
+        report, _ = _sweep_runs(store)
+        assert report.source_run == 1
+        experiment_run = next(r.run.id for r in store.runs() if r.run.kind == "experiment")
+    finally:
+        store.close()
+    assert _cli.main(["sweep", "--run", "1", "--holdout", "0", "--yes"]) == 0
+    assert "source: run 1 (--run)\n" in capsys.readouterr().out
+    assert _cli.main(["sweep", "--run", "2", "--holdout", "0", "--yes"]) == 1
+    assert "run 2 has 6 failures among the tune cases and none is labeled" in capsys.readouterr().err
+    assert _cli.main(["sweep", "--run", str(experiment_run), "--yes"]) == 1
+    assert f"run {experiment_run} is an experiment run; the sweep starts from a baseline run" in capsys.readouterr().err
+    assert _cli.main(["sweep", "--run", "99", "--yes"]) == 1
+    assert "no run 99" in capsys.readouterr().err
+
+
 def test_sweep_with_no_failures_or_only_unfixable_ones_runs_nothing(project: Path, hooks: None, capsys: pytest.CaptureFixture[str]) -> None:
     """Defect: a sweep that starts an experiment and calls the app when the baseline passed every
     case, or when every label is one no setting can fix."""
