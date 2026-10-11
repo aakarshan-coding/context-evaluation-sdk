@@ -60,21 +60,24 @@ contexteval diagnose --yes
 Each failure gets a label and a line of evidence:
 
 ```text
+app: up to 54 replay calls to contexteval.demo.app:answer (6 failures with evidence, 3 steps x 3 samples each, worst case)
 run 1:
   not_context  When is phone support open?
-               neither moving gold to the top nor keeping only gold fixed it
+               keeping only gold (0/2) did not fix it; moving gold to the top was skipped because gold was already at the top
   flaky        Where is Trailhead Gear headquartered?
-               the unchanged baseline passed on rerun
+               the unchanged baseline passed on rerun (2/2)
   irrelevant   Can fuel canisters be shipped by air?
-               keeping only the gold chunks fixed it; removed chunks 1, 2, 3 of retrieval 0
+               keeping only the gold chunks fixed it (2/2); removed chunks 2, 3, 4 of retrieval 1; moving gold to the top was skipped because gold was already at the top
   ignored      How long do warranty repairs take?
-               moving the gold chunk to the top fixed it; gold was at chunk 2 of retrieval 0
+               moving the gold chunk to the top fixed it (2/2); gold was at chunk 3 of retrieval 1
   missing      How long is the warranty on a sleeping bag?
-               the gold chunk was never retrieved; injecting the evidence fixed it
+               the gold chunk was never retrieved; injecting the evidence fixed it (2/2)
   missing      What is store credit for a returned tent worth?
-               the gold chunk was retrieved but dropped before the prompt; injecting the evidence fixed it
-diagnosed 6, skipped 0 already labeled, skipped 0 crashed
+               the gold chunk was retrieved but dropped before the prompt; injecting the evidence fixed it (2/2)
+diagnosed 6, skipped 0 already labeled, skipped 0 crashed, skipped 0 with no answer text
 ```
+
+The count after each step is samples that passed over samples drawn. The demo's fake model is deterministic, so every step settles at 2 of 2. A real model at a non-zero temperature shows splits like `(2/3)`.
 
 Test a fix. The "never retrieved" case ranks 5th, and the demo retrieves 4 chunks:
 
@@ -176,7 +179,7 @@ Every command except `init` finds the project by walking up from the current dir
 | `contexteval build-tests DOCS_DIR [--per-passage N] [--yes]` | Reads every `.md` and `.txt` file, asks the LLM for question, answer, and evidence, and keeps only cases whose evidence appears word for word in the document. |
 | `contexteval build-tests --import FILE` | Imports your own JSONL or CSV cases. Makes no LLM calls. |
 | `contexteval run [module:function] [--test-set NAME] [--yes]` | Runs every case through your function and grades each answer. Remembers the app for later commands. |
-| `contexteval diagnose [--run ID] [--force] [--yes]` | Labels each failure of the latest baseline run, or of run `ID`. Skips failures that already have a label unless you pass `--force`. |
+| `contexteval diagnose [--run ID] [--samples N] [--force] [--yes]` | Labels each failure of the latest baseline run, or of run `ID`. Each replay step draws up to `N` samples (default 3, odd) and a majority decides. Skips failures that already have a label unless you pass `--force`. |
 | `contexteval experiment [module:function] KNOB=v1,v2 ... [--yes]` | Runs every case under each combination of settings and prints a comparison table. |
 | `contexteval ui [--port 8765] [--no-open]` | Serves the dashboard at `http://127.0.0.1:8765/`. |
 
@@ -193,7 +196,11 @@ contexteval works through these steps for each failed case and stops at the firs
 5. Otherwise it reruns with only the chunks that contain the evidence. If the answer is now right, the label is `irrelevant`.
 6. Otherwise the label is `not_context`. The context held the answer and the model still got it wrong. Look at the prompt, the model, or the expected answer.
 
-The order matters. Moving one chunk is a smaller change than removing chunks, so `ignored` wins when both would work. A case costs 2 or 3 extra runs of your app. Replays never change your app's LLM settings.
+The order matters. Moving one chunk is a smaller change than removing chunks, so `ignored` wins when both would work. Replays never change your app's LLM settings.
+
+Each step is sampled, because an app that calls its model at a non-zero temperature can pass a replay by luck. A step draws up to `--samples N` replays (default 3; `N` must be odd) and stops as soon as a majority of `N` agree, so a step that passes twice in a row costs 2 calls, and a split step costs 3. A step passes when a majority of its samples pass. `flaky` means a majority of the unchanged reruns passed. Every label line shows the count for the step that decided it, as in `(2/3)`, and the dashboard shows every sample's answer under its step. A case costs between 2 and 3 times `N` runs of your app; the cost prompt states the worst case. `--samples 1` decides from one replay per step, as versions before 0.2 did. Labels stored by those versions still load and show as `(1/1)`.
+
+Chunk and retrieval positions in label lines and in the dashboard count from 1.
 
 A passage counts as present when the chunk or prompt contains the evidence text after normalization. It also counts when 80% of the evidence words appear inside a window about 1.5 times the evidence length. The second rule catches evidence that your chunker split in two.
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
 
@@ -27,10 +28,13 @@ from contexteval.types import (
     ReplayOutcome,
     ReplayStep,
     RetrievalEvent,
+    StepTally,
     TestCase,
     TestOutcome,
     Trace,
+    explain,
     label_of,
+    tallies,
 )
 
 CASE = TestCase(CaseId("abc123"), "When does the refund window close?", "thirty days", Evidence("closes thirty days after"), "docs/policy.md")
@@ -212,3 +216,30 @@ def test_runs_lists_every_kind_newest_first_with_counts(store: Store) -> None:
         ("baseline", None, 3, 1, 2),
     ]
     assert summaries[1].run.setting == Setting(top_k=10)
+
+
+def test_v1_single_sample_diagnoses_still_load_and_read_as_one_of_one(store: Store) -> None:
+    """v1.1 A. v1 stored one replay per step, in the same JSON shape v1.1 writes for a sample.
+    Defect: the loader expects a per-step count field or a nested samples list and rejects or
+    misreads a v1 row. A v1 row loads unchanged and tallies as 1 of 1 per step."""
+    rid = store.new_run("baseline", "app:answer", BASELINE)
+    tid = store.add_trace(rid, _trace())
+    v1_body = json.dumps(
+        {
+            "kind": "ignored",
+            "replays": [
+                {"step": "baseline_rerun", "passed": False, "answer": "wrong"},
+                {"step": "gold_to_top", "passed": True, "answer": "right"},
+            ],
+            "gold_at": [[0, 2]],
+        }
+    )
+    store._conn.execute(
+        "INSERT INTO diagnoses (trace_id, label, source, body, created_at) VALUES (?, ?, ?, ?, ?)",
+        (tid, "ignored", "ground_truth", v1_body, "2026-01-01T00:00:00"),
+    )
+    store._conn.commit()
+    loaded = store.trace(tid)
+    assert loaded is not None and loaded.diagnosis == Ignored(REPLAYS, gold_at=((0, 2),))
+    assert tallies(loaded.diagnosis.replays) == (StepTally(ReplayStep.BASELINE_RERUN, 0, 1), StepTally(ReplayStep.GOLD_TO_TOP, 1, 1))
+    assert explain(loaded.diagnosis) == "moving the gold chunk to the top fixed it (1/1); gold was at chunk 3 of retrieval 1"

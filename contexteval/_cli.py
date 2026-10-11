@@ -294,12 +294,22 @@ def cmd_diagnose(args: argparse.Namespace) -> int:
                 raise UserError(f"run {run.id} has no app recorded; pass one with `contexteval init --app`")
             app = _runner.load_app(spec, pinecone_text_key=config.pinecone_text_key)
             ground_truth = sum(p.path == "replay" for p in todo)
-            print(f"app: up to {ground_truth * _diagnose.MAX_REPLAYS} replay calls to {spec} ({ground_truth} failures with evidence)")
-        confirm(_diagnose.estimate_diagnosis(provider, todo), args.yes)
+            print(
+                f"app: up to {ground_truth * _diagnose.MAX_STEPS * args.samples} replay calls to {spec} "
+                f"({ground_truth} failures with evidence, {_diagnose.MAX_STEPS} steps x {args.samples} samples each, worst case)"
+            )
+        confirm(_diagnose.estimate_diagnosis(provider, todo, args.samples), args.yes)
         print(f"run {run.id}:")
         try:
             report = _diagnose.diagnose_run(
-                store, run.id, app, _runner.make_grader(provider), provider, force=args.force, on_diagnosis=_print_diagnosis
+                store,
+                run.id,
+                app,
+                _runner.make_grader(provider),
+                provider,
+                force=args.force,
+                on_diagnosis=_print_diagnosis,
+                samples=args.samples,
             )
         except (ProviderError, _diagnose.JudgeReplyError) as e:
             raise UserError(f"{e} (diagnoses so far are saved; rerun to resume)") from None
@@ -398,10 +408,28 @@ def _args_run(p: argparse.ArgumentParser) -> None:
     p.add_argument("--yes", action="store_true")
 
 
+def _odd_samples(value: str) -> int:
+    """Boundary check for --samples: a majority needs an odd count, and at least one sample."""
+    try:
+        n = int(value)
+    except ValueError:
+        n = 0
+    if n < 1 or n % 2 == 0:
+        raise argparse.ArgumentTypeError(f"--samples must be a positive odd integer, got {value!r}")
+    return n
+
+
 def _args_diagnose(p: argparse.ArgumentParser) -> None:
     p.add_argument("--run", type=int, default=None, metavar="ID")
     p.add_argument("--force", action="store_true")
     p.add_argument("--yes", action="store_true")
+    p.add_argument(
+        "--samples",
+        type=_odd_samples,
+        default=_diagnose.DEFAULT_SAMPLES,
+        metavar="N",
+        help=f"replays per step, odd; a step passes when a majority pass (default {_diagnose.DEFAULT_SAMPLES}, 1 decides from one replay)",
+    )
 
 
 def _args_experiment(p: argparse.ArgumentParser) -> None:
