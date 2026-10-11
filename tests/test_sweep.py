@@ -616,7 +616,8 @@ def test_estimate_counts_the_worst_case(project: Path, hooks: None, capsys: pyte
         plan, _ = _sweep.plan_sweep(store, source, rounds=3, max_settings=5, holdout=0.3, seed=0, tolerance=1)
         assert len(plan.candidates) == 2 and plan.round_size == 2
         assert len(plan.split.tune) == 7 and len(plan.split.holdout) == 3
-        assert plan.worst_case_runs == [7] * (1 + 2 * 3) + [3, 3]
+        assert [len(run) for run in plan.worst_case_cases] == [7] * (1 + 2 * 3) + [3, 3]
+        assert plan.worst_case_cases[0] == plan.split.tune and plan.worst_case_cases[-1] == plan.split.holdout
         assert plan.worst_case_app_calls == 55
         capsys.readouterr()
         assert _cli.main(["sweep", "--rounds", "3", "--max-settings", "5", "--yes"]) == 0

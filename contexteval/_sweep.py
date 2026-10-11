@@ -258,19 +258,46 @@ class Plan:
         return min(len(self.candidates), self.max_settings)
 
     @property
-    def worst_case_runs(self) -> list[int]:
-        """Case count of every run the sweep may make: the baseline on tune, every round full on
-        tune, and the baseline plus the winner on holdout."""
-        tune, held = len(self.split.tune), len(self.split.holdout)
+    def worst_case_cases(self) -> list[tuple[CaseId, ...]]:
+        """The cases of every run the sweep may make: the baseline on tune, every round full on
+        tune, and the baseline plus the winner on holdout. The cost estimate grades this list and
+        the app line counts it, so the two cannot disagree."""
+        tune, held = self.split.tune, self.split.holdout
         return [tune] * (1 + self.round_size * self.rounds) + ([held, held] if held and self.candidates else [])
 
     @property
     def worst_case_app_calls(self) -> int:
-        return sum(self.worst_case_runs)
+        return sum(len(run) for run in self.worst_case_cases)
 
 
 class SweepNotPossible(Exception):
-    """The source run cannot seed a sweep. The CLI prints it as a one-line user error."""
+    """No run can seed a sweep, or the chosen one cannot. The CLI prints it as a one-line user error."""
+
+
+def source_run(store: Store, run: RunId | None) -> RunInfo:
+    """The run the sweep reads its labels from: `run` when given, which must be a baseline run;
+    else the newest baseline run with a diagnosis, so a `contexteval run` made after `diagnose`
+    does not hide the labels; else the newest baseline run, whose failures plan_sweep reports as
+    unlabeled."""
+    if run is not None:
+        try:
+            info = store.run(run)
+        except KeyError:
+            raise SweepNotPossible(f"no run {run}; `contexteval ui` lists runs") from None
+        if info.kind != "baseline":
+            raise SweepNotPossible(f"run {run} is {'an' if info.kind == 'experiment' else 'a'} {info.kind} run; the sweep starts from a baseline run")
+        return info
+    newest: RunInfo | None = None
+    for summary in store.runs():  # newest first
+        if summary.run.kind != "baseline":
+            continue
+        if newest is None:
+            newest = summary.run
+        if any(stored.diagnosis is not None for stored in store.traces(summary.run.id)):
+            return summary.run
+    if newest is None:
+        raise SweepNotPossible("no baseline run yet; run `contexteval run` and `contexteval diagnose` first")
+    return newest
 
 
 def plan_sweep(store: Store, run: RunInfo, *, rounds: int, max_settings: int, holdout: float, seed: int, tolerance: int | None) -> tuple[Plan, dict[CaseId, TestCase]]:

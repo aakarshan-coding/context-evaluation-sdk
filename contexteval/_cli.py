@@ -6,7 +6,7 @@
     contexteval run [module:function] [--test-set NAME] [--yes]
     contexteval diagnose [--run ID] [--force] [--yes]
     contexteval experiment [module:function] KNOB=v1,v2 ... [--yes]
-    contexteval sweep [module:function] [--rounds N] [--max-settings N] [--holdout F] [--seed S] [--tolerance N] [--yes]
+    contexteval sweep [module:function] [--run ID] [--rounds N] [--max-settings N] [--holdout F] [--seed S] [--tolerance N] [--yes]
     contexteval ui [--port 8765] [--no-open]
 
 Every command finds the project by walking up from cwd to a .contexteval/ directory, except
@@ -425,13 +425,19 @@ def cmd_sweep(args: argparse.Namespace) -> int:
         raise UserError("no app given; pass MODULE:FUNCTION or run `contexteval run MODULE:FUNCTION` first")
     store = Store.open(project)
     try:
-        source = store.latest_run("baseline")
-        if source is None:
-            raise UserError("no baseline run yet; run `contexteval run` and `contexteval diagnose` first")
         try:
+            source = _sweep.source_run(store, RunId(args.run) if args.run is not None else None)
             plan, cases = _sweep.plan_sweep(store, source, rounds=args.rounds, max_settings=args.max_settings, holdout=args.holdout, seed=args.seed, tolerance=args.tolerance)
         except _sweep.SweepNotPossible as e:
             raise UserError(str(e)) from None
+        if args.run is not None:
+            chosen = "--run"
+        else:
+            chosen = "the newest baseline run with diagnoses"
+            newest = store.latest_run("baseline")
+            if newest is not None and newest.id != source.id:
+                chosen += f"; run {newest.id} is newer but has no diagnosis"
+        print(f"source: run {source.id} ({chosen})")
         _print_plan(plan, spec)
         if not plan.counts:
             print(f"run {source.id}: the tune cases hold no labeled failure to fix; nothing to sweep")
@@ -439,9 +445,14 @@ def cmd_sweep(args: argparse.Namespace) -> int:
         if not plan.candidates:
             print("Keep the current settings. No setting addresses the labels seen, for the reasons above.")
             return 0
+        if plan.split.holdout_fraction and not plan.split.holdout:
+            raise UserError(
+                f"--holdout {plan.split.holdout_fraction:g} rounds to 0 of the {len(cases)} cases, so no winner could be confirmed; "
+                "raise it, or pass --holdout 0 to tune on every case and read the result as unconfirmed"
+            )
         provider = _provider(config)
         app = _runner.load_app(spec, pinecone_text_key=config.pinecone_text_key)
-        graded = [cases[c] for c in plan.split.tune] * (1 + plan.round_size * plan.rounds) + [cases[c] for c in plan.split.holdout] * 2
+        graded = [cases[c] for run_cases in plan.worst_case_cases for c in run_cases]
         confirm(_runner.estimate_grading(provider, graded), args.yes)
         grade = _runner.make_grader(provider)
 
@@ -550,6 +561,7 @@ def _args_experiment(p: argparse.ArgumentParser) -> None:
 
 def _args_sweep(p: argparse.ArgumentParser) -> None:
     p.add_argument("app", nargs="?", metavar="MODULE:FUNCTION")
+    p.add_argument("--run", type=int, default=None, metavar="ID", help="baseline run to read the labels from (default: the newest baseline run with diagnoses)")
     p.add_argument("--rounds", type=_positive, default=_sweep.DEFAULT_ROUNDS, metavar="N", help=f"search rounds; later rounds combine winners (default {_sweep.DEFAULT_ROUNDS})")
     p.add_argument("--max-settings", type=_positive, default=_sweep.DEFAULT_MAX_SETTINGS, metavar="N", help=f"settings tried per round (default {_sweep.DEFAULT_MAX_SETTINGS})")
     p.add_argument("--holdout", type=_fraction, default=_sweep.DEFAULT_HOLDOUT, metavar="F", help=f"share of cases kept to confirm the winner (default {_sweep.DEFAULT_HOLDOUT}; 0 for a tiny set)")
