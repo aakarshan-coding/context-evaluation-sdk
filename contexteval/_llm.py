@@ -208,8 +208,12 @@ PRICES: Mapping[str, Price] = {
 }
 
 
+# Providers pin snapshots with a date suffix: gpt-4.1-mini-2025-04-14, claude-haiku-4-5-20251001.
+_DATE_SUFFIX = re.compile(r"-(\d{4}-\d{2}-\d{2}|\d{8})$")
+
+
 def cost_usd(model: str, input_tokens: int, output_tokens: int) -> float | None:
-    price = PRICES.get(model)
+    price = PRICES.get(model) or PRICES.get(_DATE_SUFFIX.sub("", model))
     if price is None:
         return None
     return (input_tokens * price.input_per_mtok + output_tokens * price.output_per_mtok) / 1_000_000

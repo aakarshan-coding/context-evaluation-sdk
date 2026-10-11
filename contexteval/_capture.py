@@ -87,12 +87,18 @@ def suppressed() -> Iterator[None]:
 
 def finalize_trace(run: ActiveRun, outcome: Outcome, latency_ms: float, test: TestOutcome | None = None) -> Trace:
     """Freeze a run into a Trace. Token counts come from provider usage when the response had
-    it, else from the chars/4 estimate; cost is None unless every call's model is priced."""
-    input_tokens = sum(c.input_tokens if c.input_tokens is not None else text.estimate_tokens(c.prompt) for c in run.llm_calls)
-    output_tokens = sum(
-        c.output_tokens if c.output_tokens is not None else text.estimate_tokens(c.answer or "") for c in run.llm_calls
-    )
-    costs = [cost_usd(c.model, c.input_tokens or 0, c.output_tokens or 0) for c in run.llm_calls]
+    it, else from the chars/4 estimate; cost prices those same counts and is None unless every
+    call's model is priced."""
+    counts = [
+        (
+            c.input_tokens if c.input_tokens is not None else text.estimate_tokens(c.prompt),
+            c.output_tokens if c.output_tokens is not None else text.estimate_tokens(c.answer or ""),
+        )
+        for c in run.llm_calls
+    ]
+    input_tokens = sum(i for i, _ in counts)
+    output_tokens = sum(o for _, o in counts)
+    costs = [cost_usd(c.model, i, o) for c, (i, o) in zip(run.llm_calls, counts)]
     priced = [c for c in costs if c is not None]
     cost = sum(priced) if priced and len(priced) == len(costs) else None
     retrievals = tuple(run.retrievals)
