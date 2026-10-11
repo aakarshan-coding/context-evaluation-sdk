@@ -74,12 +74,18 @@ _suppressed: ContextVar[bool] = ContextVar("contexteval_suppressed", default=Fal
 
 @contextmanager
 def active_run(question: str, intervention: Intervention = NO_INTERVENTION) -> Iterator[ActiveRun]:
-    """Set the run for the duration of one answer() call; reset on exit even on error."""
+    """Set the run for the duration of one answer() call; reset on exit even on error.
+
+    The run is also held in a process-wide slot, because a ContextVar does not reach
+    ThreadPoolExecutor workers the app may retrieve on. One run at a time is the runner's
+    invariant (plan item 7), so the slot never holds a second run."""
     run = ActiveRun(question=question, intervention=intervention)
     token = _active.set(run)
+    _process.current = run
     try:
         yield run
     finally:
+        _process.current = None
         _active.reset(token)
 
 
@@ -139,6 +145,7 @@ Sink = Callable[[ActiveRun], None]
 class _Process:
     mode: Mode = Mode.OFF
     sink: Sink | None = None  # writes an ambient buffer as a Trace
+    current: ActiveRun | None = None  # the one runner.execute in progress, visible to every thread
     logged: set[str] = field(default_factory=set)  # keys of warnings already emitted
 
 
@@ -166,6 +173,7 @@ def reset_process() -> None:
     """Test seam: back to OFF with no buffered events and no sink."""
     _process.mode = Mode.OFF
     _process.sink = None
+    _process.current = None
     _process.logged.clear()
     _ambient.set(None)
 
@@ -204,7 +212,7 @@ def _log_once(key: str, message: str, error: BaseException) -> None:
 
 def _current_run() -> tuple[ActiveRun | None, bool]:
     """(run to record into, whether it is the production buffer). None means pass through."""
-    run = _active.get()
+    run = _active.get() or _process.current
     if run is not None:
         return run, False
     if _process.mode is not Mode.PRODUCTION:

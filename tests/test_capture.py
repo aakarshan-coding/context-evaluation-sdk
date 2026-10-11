@@ -3,6 +3,7 @@ Driven through the public hook surface (intercept_*, @retriever, execute), not i
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 import pytest
@@ -51,6 +52,27 @@ def test_intervention_not_applicable_survives_the_apps_own_except(hooks: None) -
     with pytest.raises(InterventionNotApplicable, match="rebuild="):
         execute(app_rebuild, "q", Intervention(transforms=(InjectEvidence(Evidence("gold")),)))
     assert isinstance(execute(app, "q").outcome, Answered)
+
+
+def test_worker_thread_retrievals_join_the_active_run(hooks: None) -> None:
+    """Review X8. Defect: ContextVar does not reach ThreadPoolExecutor workers, so an app that
+    retrieves on a worker thread records nothing and a top_k experiment leaves its retrieval
+    untouched. The CLI runs one question at a time, so the run is also held process-wide."""
+
+    @retriever
+    def search(query: str, top_k: int = 3) -> list[dict[str, str]]:
+        return [{"text": f"doc {i} for {query}"} for i in range(top_k)]
+
+    def app(question: str) -> str:
+        with ThreadPoolExecutor(1) as pool:
+            rows = pool.submit(search, question).result()
+        return f"{len(rows)} rows"
+
+    trace = execute(app, "q1", Intervention(top_k=1))
+    assert trace.outcome == Answered("1 rows")
+    assert len(trace.retrievals) == 1 and trace.retrievals[0].params["top_k"] == 1
+    assert execute(app, "q2").outcome == Answered("3 rows")
+    assert search("outside any run") == [{"text": f"doc {i} for outside any run"} for i in range(3)]
 
 
 def test_cost_prices_the_same_tokens_the_metrics_report() -> None:
