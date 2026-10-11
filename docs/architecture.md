@@ -166,6 +166,16 @@ P3 (branch `p3-diagnose`).
 - `FakeProvider` already answered `Task.JUDGE` with `no_failure`; nothing was added there. Tests that need another verdict pass a handler.
 - The P4 acceptance test keeps its own skip marker; the module-level skip is gone.
 
+P4 (branch `p4-experiment`).
+
+- `parse_grid` derives each knob's parser from `typing.get_type_hints(Setting)`. An Enum field parses by value, a `Literal` field by membership, and an `int | None` field with `int`. A field of any other type raises `TypeError` at parse time, so a new kind of knob fails loudly instead of being skipped. A knob given twice is an error, not a merge.
+- `_runner.experiment_settings(grid)` is new. It returns BASELINE first and then the grid with duplicates and BASELINE removed. `run_experiment` runs that list and the CLI cost estimate counts it, so the two cannot disagree. Each setting is one `run_suite` call with the experiment id, so experiments use the same path as `contexteval run`.
+- The experiment command takes the app as an optional leading positional (`contexteval experiment [module:function] knob=v1,v2 ...`), the same as `run`. The sketch's `--app` flag is gone. A first token with `:` and no `=` is the app. Without one, the app comes from `config.app`, which `run` remembers. Experiments run every stored case. There is no `--test-set` flag yet.
+- Setting names keep the space-separated form from P1 (`top_k=10 order=ends`), not a comma-separated one. A comma already separates alternative values in the grid syntax, so `top_k=10,order=ends` would read as one knob with two values.
+- `InterventionNotApplicable` during an experiment becomes a one-line `UserError`. The runs finished before it stay stored under the experiment.
+- The DoD item 3 test lives in `tests/test_experiment.py`, not `tests/test_acceptance.py`, so the P3 and P4 owners never edit one file at once. The skipped DoD item 3 placeholder in `test_acceptance.py` is left for that file's owner to delete.
+- The transform tests asked for in P4 (lexical rerank, ends order, compress, max_chunks) already existed in `tests/test_intervention.py` from P1. No new ones were added.
+
 ## Open questions and risks
 
 - Should the flaky rerun also run before the missing confirmation? The sketch runs it first for every ground-truth case, reading plan item 3's "before replay" literally. The other reading skips it for missing, which saves one call per missing case.

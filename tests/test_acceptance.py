@@ -64,11 +64,3 @@ def test_every_planted_case_gets_its_label(project: Path, hooks: None, capsys: p
     assert "nothing to diagnose" in capsys.readouterr().out
     assert _latest_diagnoses(project) == diagnoses
     assert state_file.read_text(encoding="utf-8") == counters_before
-
-
-@pytest.mark.skip(reason="P4: experiments are not implemented yet")
-def test_missing_case_passes_with_larger_top_k(project, store, hooks) -> None:
-    """experiment top_k=3,10 --yes; the not_retrieved planted case fails in the top_k=3 run and
-    passes in the top_k=10 run; table rows have accuracy, mean tokens, mean latency.
-    """
-    raise NotImplementedError
