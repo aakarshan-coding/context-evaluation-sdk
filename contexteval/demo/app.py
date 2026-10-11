@@ -30,7 +30,7 @@ from .._store import PROJECT_DIR_NAME, find_project
 
 TOP_K = 4
 ARCHIVED_MARKER = "[ARCHIVED]"
-MODEL = "gpt-4o-mini"
+MODEL = "gpt-4.1-mini"
 CHUNK_OPEN = "<chunk>"
 CHUNK_CLOSE = "</chunk>"
 CORPUS_DIR = Path(__file__).parent / "corpus"
