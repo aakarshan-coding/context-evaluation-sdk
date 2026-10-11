@@ -182,3 +182,26 @@ def test_mean_app_tokens_reads_latest_baseline(store: Store) -> None:
     assert store.mean_app_tokens() == (20, 4)
     store.new_run("baseline", "app:answer", BASELINE)
     assert store.mean_app_tokens() is None
+
+
+def test_runs_lists_every_kind_newest_first_with_counts(store: Store) -> None:
+    """Defect: the dashboard's run picker omits experiment or production runs, or miscounts
+    ungraded production traces as failures."""
+    store.upsert_cases("synthetic", [CASE])
+    base = store.new_run("baseline", "app:answer", BASELINE)
+    store.add_trace(base, _trace(test=TestOutcome(CASE.id, True, "substring")))
+    store.add_trace(base, _trace(test=TestOutcome(CASE.id, False, "llm")))
+    store.add_trace(base, _trace(crashed=True, test=TestOutcome(CASE.id, False, "crash")))
+    eid = store.new_experiment()
+    exp = store.new_run("experiment", "app:answer", Setting(top_k=10), experiment=eid)
+    prod = store.new_run("production", None, BASELINE)
+    store.add_trace(prod, _trace())
+
+    summaries = store.runs()
+    assert [s.run.id for s in summaries] == [prod, exp, base]
+    assert [(s.run.kind, s.experiment_id, s.traces, s.passed, s.failed) for s in summaries] == [
+        ("production", None, 1, 0, 0),
+        ("experiment", eid, 0, 0, 0),
+        ("baseline", None, 3, 1, 2),
+    ]
+    assert summaries[1].run.setting == Setting(top_k=10)

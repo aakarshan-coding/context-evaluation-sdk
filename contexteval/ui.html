@@ -1,0 +1,430 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>contexteval</title>
+<style>
+:root {
+  color-scheme: light dark;
+  --bg: #f7f7f5;
+  --panel: #ffffff;
+  --text: #1d1d1b;
+  --muted: #6b6b66;
+  --border: #e2e1dc;
+  --accent: #2f5bd3;
+  --select: #eef2fd;
+  --pass: #1f7a3a;
+  --fail: #b3261e;
+  --missing: #b3261e;
+  --irrelevant: #9a5b00;
+  --ignored: #7a3fb0;
+  --not_context: #45576b;
+  --flaky: #0b7285;
+  --judge: #5c5c57;
+  --gold-bg: #fff4c2;
+  --gold-text: #6b5300;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #161615;
+    --panel: #1f1f1d;
+    --text: #ecebe6;
+    --muted: #a09f98;
+    --border: #34332f;
+    --accent: #8aa8ff;
+    --select: #26304a;
+    --pass: #6fcf8a;
+    --fail: #ff8a80;
+    --missing: #ff8a80;
+    --irrelevant: #f0b25a;
+    --ignored: #c99bf2;
+    --not_context: #a7b6c7;
+    --flaky: #5ccbdc;
+    --judge: #b8b7b0;
+    --gold-bg: #3d3412;
+    --gold-text: #f3d77a;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+header {
+  display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center;
+  padding: 12px 16px; border-bottom: 1px solid var(--border); background: var(--panel);
+}
+header h1 { font-size: 17px; margin: 0; }
+header label { color: var(--muted); font-size: 13px; }
+select {
+  font: inherit; color: var(--text); background: var(--panel);
+  border: 1px solid var(--border); border-radius: 6px; padding: 4px 8px; max-width: 100%;
+}
+main { max-width: 1280px; margin: 0 auto; padding: 16px; display: grid; gap: 16px; grid-template-columns: minmax(0, 1fr); }
+.split { display: grid; gap: 16px; grid-template-columns: minmax(0, 1fr); }
+@media (min-width: 900px) { .split { grid-template-columns: minmax(280px, 2fr) minmax(0, 3fr); } }
+section {
+  background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+  padding: 12px 16px; min-width: 0;
+}
+h2 { font-size: 15px; margin: 0 0 8px; }
+h3 { font-size: 13px; margin: 16px 0 6px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+.muted { color: var(--muted); }
+.summary { font-size: 13px; color: var(--muted); margin-bottom: 8px; }
+ul.failures { list-style: none; margin: 0; padding: 0; }
+ul.failures li { border-top: 1px solid var(--border); }
+ul.failures button {
+  all: unset; box-sizing: border-box; display: block; width: 100%; cursor: pointer;
+  padding: 8px 6px; border-radius: 6px;
+}
+ul.failures button:hover, ul.failures button[aria-current="true"] { background: var(--select); }
+ul.failures button:focus-visible { outline: 2px solid var(--accent); }
+.q { display: block; overflow-wrap: anywhere; }
+.why { display: block; font-size: 13px; color: var(--muted); overflow-wrap: anywhere; }
+.badge {
+  display: inline-block; font-size: 12px; font-weight: 600; line-height: 1.6;
+  padding: 0 7px; border-radius: 999px; border: 1px solid currentColor; margin-right: 6px;
+  white-space: nowrap;
+}
+.b-missing { color: var(--missing); }
+.b-irrelevant { color: var(--irrelevant); }
+.b-ignored { color: var(--ignored); }
+.b-not_context { color: var(--not_context); }
+.b-flaky { color: var(--flaky); }
+.b-judge, .b-no_failure, .b-undiagnosed { color: var(--judge); }
+.b-pass { color: var(--pass); }
+.b-fail { color: var(--fail); }
+.pair { display: grid; gap: 8px; grid-template-columns: minmax(0, 1fr); }
+@media (min-width: 600px) { .pair { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); } }
+.box { border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; overflow-wrap: anywhere; white-space: pre-wrap; }
+.box .k { display: block; font-size: 12px; color: var(--muted); white-space: normal; }
+pre {
+  font: 12.5px/1.45 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere;
+  margin: 6px 0 0; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--border);
+  max-height: 360px; overflow: auto;
+}
+ol.chunks { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; }
+ol.chunks li { border: 1px solid var(--border); border-radius: 8px; padding: 6px 10px; }
+ol.chunks li.out { opacity: .6; border-style: dashed; }
+ol.chunks li.gold { background: var(--gold-bg); }
+ol.chunks li.cited { border-color: var(--accent); border-width: 2px; }
+.chunk-head { font-size: 12px; color: var(--muted); display: flex; flex-wrap: wrap; gap: 4px 10px; }
+.mark { font-weight: 600; }
+.mark.gold { color: var(--gold-text); }
+.mark.cited { color: var(--accent); }
+.chunk-text { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 13.5px; }
+details summary { cursor: pointer; color: var(--muted); font-size: 13px; margin-top: 8px; }
+ul.replays { margin: 4px 0 0; padding-left: 18px; font-size: 13.5px; }
+.table-wrap { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-size: 14px; }
+th, td { text-align: right; padding: 6px 10px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+th:first-child, td:first-child { text-align: left; white-space: normal; min-width: 8em; }
+th { white-space: normal; }
+th { font-size: 12px; color: var(--muted); font-weight: 600; }
+tr.best td { font-weight: 600; }
+.bar { display: inline-block; height: 8px; border-radius: 4px; background: var(--accent); vertical-align: middle; margin-right: 6px; }
+.metrics { font-size: 13px; color: var(--muted); display: flex; flex-wrap: wrap; gap: 4px 14px; }
+.error { color: var(--fail); }
+</style>
+</head>
+<body>
+<header>
+  <h1>contexteval</h1>
+  <label>Run <select id="run-picker" aria-label="Run"></select></label>
+  <label><input type="checkbox" id="show-all"> show passing traces</label>
+</header>
+<main>
+  <div class="split">
+    <section aria-labelledby="failures-title">
+      <h2 id="failures-title">Failures</h2>
+      <div id="run-summary" class="summary"></div>
+      <ul id="failures" class="failures"></ul>
+    </section>
+    <section aria-labelledby="detail-title">
+      <h2 id="detail-title">Trace</h2>
+      <div id="detail"><p class="muted">Pick a failure to see its chunks, prompt, and diagnosis.</p></div>
+    </section>
+  </div>
+  <section aria-labelledby="exp-title">
+    <h2 id="exp-title">Experiments</h2>
+    <div id="experiments"></div>
+  </section>
+</main>
+<script>
+"use strict";
+
+// Every string from the database reaches the page through textContent, never markup.
+function el(tag, props, ...children) {
+  const node = document.createElement(tag);
+  for (const [key, value] of Object.entries(props || {})) {
+    if (value === null || value === undefined || value === false) continue;
+    if (key === "text") node.textContent = String(value);
+    else if (key === "className") node.className = value;
+    else if (key === "onclick") node.addEventListener("click", value);
+    else node.setAttribute(key, value === true ? "" : String(value));
+  }
+  for (const child of children.flat()) {
+    if (child === null || child === undefined || child === false) continue;
+    node.append(child instanceof Node ? child : document.createTextNode(String(child)));
+  }
+  return node;
+}
+
+function clear(node) { node.replaceChildren(); return node; }
+
+async function getJson(path) {
+  const response = await fetch(path, { headers: { Accept: "application/json" } });
+  const body = await response.json();
+  if (!response.ok) throw new Error(body.error || response.statusText);
+  return body;
+}
+
+function fmt(value, digits) {
+  if (value === null || value === undefined) return "n/a";
+  return Number(value).toFixed(digits);
+}
+
+const LABEL_TEXT = {
+  missing: "missing", irrelevant: "irrelevant", ignored: "ignored",
+  not_context: "not context", flaky: "flaky", no_failure: "no failure",
+};
+
+function badge(diagnosis) {
+  if (!diagnosis) return el("span", { className: "badge b-undiagnosed", text: "undiagnosed" });
+  const label = diagnosis.label;
+  const judged = diagnosis.source === "judge";
+  const text = (judged ? "judge: " : "") + (LABEL_TEXT[label] || label);
+  return el("span", { className: "badge b-" + label, text });
+}
+
+function passBadge(passed) {
+  if (passed === null) return el("span", { className: "badge b-judge", text: "ungraded" });
+  return el("span", { className: "badge " + (passed ? "b-pass" : "b-fail"), text: passed ? "pass" : "fail" });
+}
+
+const state = { runs: [], runId: null, traceId: null };
+
+function readHash() {
+  const params = new URLSearchParams(location.hash.slice(1));
+  return { run: Number(params.get("run")) || null, trace: Number(params.get("trace")) || null };
+}
+
+function writeHash() {
+  const params = new URLSearchParams();
+  if (state.runId) params.set("run", state.runId);
+  if (state.traceId) params.set("trace", state.traceId);
+  history.replaceState(null, "", "#" + params.toString());
+}
+
+function runLabel(run) {
+  const graded = run.passed + run.failed;
+  const counts = graded > 0 ? `${run.passed}/${graded} passed` : `${run.traces} traces`;
+  const setting = run.setting === "baseline" ? "" : ` ${run.setting}`;
+  return `#${run.id} ${run.kind}${setting}, ${counts}`;
+}
+
+async function loadRuns() {
+  const { runs } = await getJson("/api/runs");
+  state.runs = runs;
+  const picker = clear(document.getElementById("run-picker"));
+  for (const run of runs) picker.append(el("option", { value: run.id, text: runLabel(run) }));
+  if (!runs.length) {
+    picker.append(el("option", { text: "no runs yet" }));
+    document.getElementById("run-summary").textContent = "Run `contexteval run` to record traces.";
+    return;
+  }
+  const wanted = readHash();
+  const fallback = runs.find((r) => r.kind === "baseline") || runs[0];
+  const chosen = runs.find((r) => r.id === wanted.run) || fallback;
+  picker.value = String(chosen.id);
+  await selectRun(chosen.id, chosen.id === wanted.run ? wanted.trace : null);
+}
+
+let currentTraces = [];
+
+async function selectRun(runId, traceId) {
+  state.runId = runId;
+  state.traceId = null;
+  const run = state.runs.find((r) => r.id === runId);
+  const summary = document.getElementById("run-summary");
+  summary.textContent = run
+    ? `${run.kind} run of ${run.app || "production traffic"}, setting ${run.setting}, ${run.created_at}`
+    : "";
+  const { traces } = await getJson(`/api/runs/${runId}/traces`);
+  currentTraces = traces;
+  renderFailures();
+  if (traceId && traces.some((t) => t.id === traceId)) await selectTrace(traceId);
+  else {
+    clear(document.getElementById("detail")).append(
+      el("p", { className: "muted", text: "Pick a failure to see its chunks, prompt, and diagnosis." }));
+    writeHash();
+  }
+}
+
+function renderFailures() {
+  const showAll = document.getElementById("show-all").checked;
+  const list = clear(document.getElementById("failures"));
+  const shown = currentTraces.filter((t) => showAll || t.passed !== true);
+  if (!shown.length) {
+    list.append(el("li", { className: "muted", text: currentTraces.length ? "No failures in this run." : "No traces in this run." }));
+    return;
+  }
+  for (const t of shown) {
+    const button = el("button", {
+      type: "button",
+      "aria-current": t.id === state.traceId ? "true" : "false",
+      "data-trace": t.id,
+      onclick: () => selectTrace(t.id, true),
+    },
+      el("span", {}, t.passed === false ? badge(t.diagnosis) : passBadge(t.passed),
+        el("span", { className: "q", text: t.question })),
+      t.diagnosis ? el("span", { className: "why", text: t.diagnosis.explain }) : null,
+      t.error ? el("span", { className: "why error", text: t.error }) : null);
+    list.append(el("li", {}, button));
+  }
+}
+
+function refKey(r, c) { return r + ":" + c; }
+
+function chunkItem(chunk, opts) {
+  const classes = [];
+  if (opts.delivered && !chunk.in_prompt) classes.push("out");
+  if (chunk.gold) classes.push("gold");
+  if (opts.cited) classes.push("cited");
+  const head = el("div", { className: "chunk-head" },
+    el("span", { text: "#" + chunk.index }),
+    opts.delivered ? el("span", { className: "mark", text: chunk.in_prompt ? "in prompt" : "not in prompt" }) : null,
+    chunk.gold === true ? el("span", { className: "mark gold", text: "gold" }) : null,
+    opts.cited ? el("span", { className: "mark cited", text: opts.citedText }) : null,
+    chunk.score !== null ? el("span", { text: "score " + fmt(chunk.score, 3) }) : null,
+    chunk.id !== null ? el("span", { text: "id " + chunk.id }) : null,
+    opts.delivered && chunk.source_index === null ? el("span", { className: "mark", text: "injected" }) : null);
+  return el("li", { className: classes.join(" ") }, head, el("div", { className: "chunk-text", text: chunk.text }));
+}
+
+const CITED_TEXT = { irrelevant: "removed by replay", ignored: "gold position before replay" };
+
+async function selectTrace(traceId, reveal) {
+  state.traceId = traceId;
+  writeHash();
+  for (const b of document.querySelectorAll("#failures button")) {
+    b.setAttribute("aria-current", Number(b.dataset.trace) === traceId ? "true" : "false");
+  }
+  const detail = clear(document.getElementById("detail"));
+  let t;
+  try {
+    t = await getJson(`/api/traces/${traceId}`);
+  } catch (err) {
+    detail.append(el("p", { className: "error", text: err.message }));
+    return;
+  }
+  if (state.traceId !== traceId) return;
+  const d = t.diagnosis;
+  const cited = new Set((d ? d.chunks : []).map(([r, c]) => refKey(r, c)));
+
+  detail.append(
+    el("p", {}, t.passed === null ? passBadge(null) : passBadge(t.passed), d ? badge(d) : null,
+      el("span", { className: "muted", text: `trace #${t.id}, setting ${t.setting}` + (t.grade_method ? `, graded by ${t.grade_method}` : "") })),
+    el("div", { className: "box" }, el("span", { className: "k", text: "Question" }), t.question),
+    el("h3", { text: "Answer vs expected" }),
+    el("div", { className: "pair" },
+      el("div", { className: "box" }, el("span", { className: "k", text: t.error ? "Crashed" : "Answer" }),
+        t.error ? el("span", { className: "error", text: t.error }) : t.answer),
+      el("div", { className: "box" }, el("span", { className: "k", text: "Expected" }),
+        t.expected_answer === null ? el("span", { className: "muted", text: "no test case (ungraded)" }) : t.expected_answer)));
+
+  detail.append(el("h3", { text: "Diagnosis" }));
+  if (!d) {
+    detail.append(el("p", { className: "muted", text: t.passed === false ? "Not diagnosed yet. Run `contexteval diagnose`." : "No diagnosis." }));
+  } else {
+    detail.append(el("p", {}, d.explain));
+    if (d.replays.length) {
+      detail.append(el("ul", { className: "replays" }, d.replays.map((r) =>
+        el("li", {}, el("span", { className: "badge " + (r.passed ? "b-pass" : "b-fail"), text: r.passed ? "pass" : "fail" }),
+          r.step.replace(/_/g, " "), r.answer === null ? el("span", { className: "muted", text: " (crashed)" }) : el("span", { className: "muted", text: ": " + r.answer })))));
+    }
+  }
+  if (t.evidence !== null) {
+    detail.append(el("h3", { text: "Gold evidence" }), el("div", { className: "box", text: t.evidence }));
+  }
+
+  t.retrievals.forEach((e, r) => {
+    detail.append(el("h3", { text: `Retrieval ${r}: ${e.source}` }));
+    detail.append(el("div", { className: "metrics" },
+      el("span", { text: "query " + (e.query === null ? "(vector only)" : JSON.stringify(e.query)) }),
+      el("span", { text: `${e.delivered.length} delivered of ${e.retrieved.length} retrieved` }),
+      el("span", { text: fmt(e.latency_ms, 0) + " ms" })));
+    const delivered = el("ol", { className: "chunks" }, e.delivered.map((c) => {
+      const isCited = cited.has(refKey(r, c.index));
+      return chunkItem(c, { delivered: true, cited: isCited, citedText: CITED_TEXT[d && d.label] || "cited" });
+    }));
+    detail.append(delivered);
+    detail.append(el("details", {}, el("summary", { text: `Retrieved by the store (${e.retrieved.length})` }),
+      el("ol", { className: "chunks" }, e.retrieved.map((c) => chunkItem(c, { delivered: false })))));
+  });
+  if (!t.retrievals.length) detail.append(el("h3", { text: "Retrievals" }), el("p", { className: "muted", text: "No retrieval was captured." }));
+
+  t.llm_calls.forEach((c, i) => {
+    detail.append(el("details", {},
+      el("summary", { text: `Prompt ${i}: ${c.provider} ${c.model}` + (c.gold === true ? ", contains gold" : c.gold === false ? ", no gold" : "") }),
+      el("pre", { text: c.prompt })));
+  });
+
+  const m = t.metrics;
+  detail.append(el("h3", { text: "Metrics" }), el("div", { className: "metrics" },
+    el("span", { text: `${m.input_tokens} input tokens` }),
+    el("span", { text: `${m.output_tokens} output tokens` }),
+    el("span", { text: fmt(m.latency_ms, 0) + " ms" }),
+    el("span", { text: m.cost_usd === null ? "cost n/a" : "$" + fmt(m.cost_usd, 4) })));
+  // Stacked layout on narrow screens puts the detail below the list, out of sight.
+  if (reveal && matchMedia("(max-width: 899px)").matches) detail.parentElement.scrollIntoView({ behavior: "smooth" });
+}
+
+async function loadExperiments() {
+  const box = clear(document.getElementById("experiments"));
+  const { experiments } = await getJson("/api/experiments");
+  if (!experiments.length) {
+    box.append(el("p", { className: "muted", text: "No experiments yet. Try `contexteval experiment top_k=3,10`." }));
+    return;
+  }
+  const picker = el("select", { "aria-label": "Experiment" },
+    experiments.map((x) => el("option", { value: x.id, text: `#${x.id} ${x.created_at}` })));
+  const tableBox = el("div", { className: "table-wrap" });
+  const render = () => {
+    const x = experiments.find((e) => String(e.id) === picker.value);
+    clear(tableBox).append(experimentTable(x.rows));
+  };
+  picker.addEventListener("change", render);
+  if (experiments.length > 1) box.append(el("p", {}, el("label", { className: "muted" }, "Experiment ", picker)));
+  box.append(tableBox);
+  render();
+}
+
+function experimentTable(rows) {
+  const best = Math.max(...rows.map((r) => r.accuracy));
+  return el("table", {},
+    el("thead", {}, el("tr", {}, ["Setting", "Accuracy", "Passed", "Mean input tokens", "Mean latency", "Total cost"].map((h) => el("th", { scope: "col", text: h })))),
+    el("tbody", {}, rows.map((r) => el("tr", { className: r.accuracy === best && rows.length > 1 ? "best" : null },
+      el("td", { text: r.setting }),
+      el("td", {}, el("span", { className: "bar", style: `width:${Math.round(r.accuracy * 48)}px` }), fmt(r.accuracy * 100, 0) + "%"),
+      el("td", { text: `${r.passed}/${r.cases}` }),
+      el("td", { text: fmt(r.mean_input_tokens, 0) }),
+      el("td", { text: fmt(r.mean_latency_ms, 0) + " ms" }),
+      el("td", { text: r.total_cost_usd === null ? "n/a" : "$" + fmt(r.total_cost_usd, 4) })))));
+}
+
+document.getElementById("run-picker").addEventListener("change", (event) => selectRun(Number(event.target.value), null));
+document.getElementById("show-all").addEventListener("change", renderFailures);
+
+function showError(err) {
+  clear(document.getElementById("detail")).append(el("p", { className: "error", text: "Could not load data: " + err.message }));
+}
+loadRuns().catch(showError);
+loadExperiments().catch(showError);
+</script>
+</body>
+</html>

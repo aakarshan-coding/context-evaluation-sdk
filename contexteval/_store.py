@@ -235,6 +235,15 @@ class RunInfo:
     created_at: str
 
 
+@dataclass(frozen=True)
+class RunSummary:
+    run: RunInfo
+    experiment_id: ExperimentId | None
+    traces: int
+    passed: int
+    failed: int  # graded traces that failed; ungraded (production) traces count in neither
+
+
 _TRACE_COLUMNS = """
     t.id, t.run_id, r.setting, t.case_id, t.question, t.answer, t.error, t.passed, t.grade_method,
     t.retrievals, t.llm_calls, t.in_prompt, t.input_tokens, t.output_tokens, t.latency_ms, t.cost_usd,
@@ -361,6 +370,25 @@ class Store:
             "SELECT id, kind, app, setting, created_at FROM runs WHERE kind = ? ORDER BY id DESC LIMIT 1", (kind,)
         ).fetchone()
         return self._run(row) if row else None
+
+    def runs(self) -> list[RunSummary]:
+        """Every run with its trace counts, newest first."""
+        rows = self._conn.execute(
+            """SELECT r.id, r.kind, r.app, r.setting, r.created_at, r.experiment_id,
+                      COUNT(t.id), COALESCE(SUM(t.passed = 1), 0), COALESCE(SUM(t.passed = 0), 0)
+               FROM runs r LEFT JOIN traces t ON t.run_id = r.id
+               GROUP BY r.id ORDER BY r.id DESC"""
+        ).fetchall()
+        return [
+            RunSummary(
+                run=self._run(row[:5]),
+                experiment_id=ExperimentId(row[5]) if row[5] is not None else None,
+                traces=row[6],
+                passed=row[7],
+                failed=row[8],
+            )
+            for row in rows
+        ]
 
     @staticmethod
     def _run(row: tuple[Any, ...]) -> RunInfo:
