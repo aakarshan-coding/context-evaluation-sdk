@@ -16,6 +16,8 @@ Planted mechanics (see planted.py for which case uses which):
 from __future__ import annotations
 
 import functools
+import hashlib
+import json
 import os
 import re
 import tempfile
@@ -27,6 +29,7 @@ from chromadb.api.types import EmbeddingFunction
 
 from .. import _text as text
 from .._store import PROJECT_DIR_NAME, find_project
+from ._lock import file_lock
 
 TOP_K = 4
 ARCHIVED_MARKER = "[ARCHIVED]"
@@ -103,12 +106,21 @@ def _collection_at(path: str) -> Any:
     # Persistent, not ephemeral: chromadb 1.5's in-memory client drops an older collection's
     # vector index once enough other collections are opened in the process (count() still
     # reports every row, queries return none). A persisted index is reloaded instead.
+    #
+    # Concurrent CLI processes share this directory. chromadb's first-time setup is not safe
+    # across processes ("table collections already exists"), and a write in one process can
+    # fail another's query ("database is locked"). So one process builds the index under a
+    # lock and no process writes after that. The corpus digest in the name keeps a corpus edit
+    # from reusing a stale index.
     import chromadb
 
-    client = chromadb.PersistentClient(path=path, settings=chromadb.Settings(anonymized_telemetry=False))
-    col = client.get_or_create_collection(COLLECTION_NAME, embedding_function=HashEmbedding())
     chunks = corpus_chunks()
-    col.upsert(ids=list(chunks), documents=list(chunks.values()))
+    digest = hashlib.sha256(json.dumps(chunks, sort_keys=True).encode("utf-8")).hexdigest()[:12]
+    with file_lock(Path(path + ".lock")):
+        client = chromadb.PersistentClient(path=path, settings=chromadb.Settings(anonymized_telemetry=False))
+        col = client.get_or_create_collection(f"{COLLECTION_NAME}_{digest}", embedding_function=HashEmbedding())
+        if col.count() != len(chunks):
+            col.upsert(ids=list(chunks), documents=list(chunks.values()))
     return col
 
 
