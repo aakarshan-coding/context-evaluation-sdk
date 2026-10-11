@@ -263,6 +263,36 @@ def test_migration_rerun_after_a_partial_step_opens_cleanly(tmp_path: Path, appl
     Store.open(tmp_path).close()
 
 
+def test_migration_steps_and_version_bump_commit_together(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Review P3. Defect: a step that fails after an earlier one succeeded leaves the earlier
+    column committed on its own, or the version bumped past steps that never ran. A failing
+    step rolls the whole version step back, and the next open, with the step repaired, applies it."""
+    from contexteval import _store
+
+    directory = tmp_path / PROJECT_DIR_NAME
+    directory.mkdir()
+    conn = sqlite3.connect(str(directory / "contexteval.db"))
+    conn.executescript(_V1_EXPERIMENTS + "PRAGMA user_version=1;")
+    conn.close()
+    good = _store._MIGRATIONS[1]
+    broken = _store._AddColumn("experiments", "report", "NOT A COLUMN TYPE (")
+    monkeypatch.setitem(_store._MIGRATIONS, 1, (good[0], broken))
+    with pytest.raises(sqlite3.OperationalError):
+        Store.open(tmp_path)
+    conn = sqlite3.connect(str(directory / "contexteval.db"))
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(experiments)")}
+    version = conn.execute("PRAGMA user_version").fetchone()[0]
+    conn.close()
+    assert ("kind" in columns, version) == (False, 1)
+    monkeypatch.setitem(_store._MIGRATIONS, 1, good)
+    store = Store.open(tmp_path)
+    try:
+        assert store.experiments()[0].kind == "manual"
+        assert store._conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+    finally:
+        store.close()
+
+
 def test_mean_app_tokens_reads_latest_baseline(store: Store) -> None:
     """Defect: the estimate reads an older baseline, or crashes when the latest run has no traces."""
     assert store.mean_app_tokens() is None
