@@ -788,9 +788,12 @@ def test_sweep_report_round_trips_through_json() -> None:
         recommended=RunId(5),
         reason="",
         passed_over=RunId(4),
+        not_applicable={"top_k=12": "no top_k parameter"},
     )
     assert _sweep.SweepReport.from_json(json.loads(json.dumps(report.to_json()))) == report
-    older = {k: v for k, v in report.to_json().items() if k != "passed_over"}
-    assert _sweep.SweepReport.from_json(older).passed_over is None
+    older = {k: v for k, v in report.to_json().items() if k not in ("passed_over", "not_applicable")}
+    assert _sweep.SweepReport.from_json(older) == _sweep.SweepReport.from_json({**older, "passed_over": None, "not_applicable": {}})
     kept = _sweep.SweepReport(report.source_run, 4, {}, report.split, report.baseline_run, (), None, None, "nothing beat the baseline")
     assert _sweep.SweepReport.from_json(kept.to_json()) == kept
+    stopped = _sweep.SweepReport(report.source_run, 4, {}, report.split, None, (), None, None, "the sweep stopped early: KeyboardInterrupt: ")
+    assert _sweep.SweepReport.from_json(json.loads(json.dumps(stopped.to_json()))) == stopped

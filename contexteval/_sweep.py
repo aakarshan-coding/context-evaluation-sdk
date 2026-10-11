@@ -10,11 +10,11 @@ this module never imports the runner or an app: the dashboard reads reports with
 from __future__ import annotations
 
 import random
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 from enum import Enum
 from typing import Any, Callable, Iterable, Literal, Mapping, Sequence, Union
 
-from ._intervention import BASELINE, Order, Setting
+from ._intervention import BASELINE, InterventionNotApplicable, Order, Setting
 from ._store import RunInfo, Store
 from .types import (
     CaseId,
@@ -390,12 +390,13 @@ class SweepReport:
     baseline_k: int
     counts: dict[FailureKind, int]
     split: Split
-    baseline_run: RunId  # the baseline on the tune cases
+    baseline_run: RunId | None  # the baseline on the tune cases; None when the sweep stopped before it finished
     rounds: tuple[tuple[RunId, ...], ...]  # candidate runs on the tune cases, per round
     holdout_runs: tuple[RunId, RunId] | None  # (baseline, winner) on the holdout cases
     recommended: RunId | None  # the winner's tune run, when it is recommended
     reason: str  # why nothing is recommended; empty when something is
     passed_over: RunId | None = None  # the more accurate, costlier tune run a recommendation passed over
+    not_applicable: dict[str, str] = field(default_factory=dict)  # setting name -> why the app's retrieval could not take it
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -414,6 +415,7 @@ class SweepReport:
             "recommended": self.recommended,
             "reason": self.reason,
             "passed_over": self.passed_over,
+            "not_applicable": dict(self.not_applicable),
         }
 
     @classmethod
@@ -425,12 +427,13 @@ class SweepReport:
             baseline_k=data["baseline_k"],
             counts={FailureKind(k): n for k, n in data["counts"].items()},
             split=Split(split["seed"], split["holdout"], tuple(CaseId(c) for c in split["tune"]), tuple(CaseId(c) for c in split["holdout_cases"])),
-            baseline_run=RunId(data["baseline_run"]),
+            baseline_run=RunId(data["baseline_run"]) if data["baseline_run"] is not None else None,
             rounds=tuple(tuple(RunId(r) for r in round_) for round_ in data["rounds"]),
             holdout_runs=(RunId(held[0]), RunId(held[1])) if held else None,
             recommended=RunId(data["recommended"]) if data["recommended"] is not None else None,
             reason=data["reason"],
             passed_over=RunId(data["passed_over"]) if data.get("passed_over") is not None else None,
+            not_applicable=dict(data.get("not_applicable", {})),
         )
 
 
@@ -441,18 +444,22 @@ CLI passes `_runner.run_suite`; tests pass a scripted one. May raise Interventio
 
 def run_sweep(store: Store, cases: Mapping[CaseId, TestCase], plan: Plan, run_cases: Runner) -> tuple[ExperimentId, SweepReport]:
     """Greedy rounds on the tune cases, then the holdout check. Round 1 runs the heaviest
-    candidates. Each later round combines the best setting so far with every round-1 candidate
-    that changes other knobs and did not lose to the baseline, and stops when the best setting is
-    the baseline or every combination has run. Every run is `run_cases` under one sweep
-    experiment, so a failure halfway leaves the finished rows stored.
+    candidates. Each later round combines the winner so far with every round-1 candidate that
+    changes other knobs and did not lose to the baseline, and stops when no setting beats the
+    baseline or every combination has run. A candidate the app's retrieval cannot take
+    (InterventionNotApplicable) is skipped with its reason, and so is every later single-knob
+    candidate on that knob. Every run is `run_cases` under one sweep experiment, and the report
+    is saved whatever happens: a sweep that stops early (a provider error, Ctrl-C) leaves its
+    finished runs stored and a report that says why.
     """
     experiment = store.new_experiment("sweep")
     tune = [cases[c] for c in plan.split.tune]
     held = [cases[c] for c in plan.split.holdout]
     runs: dict[Setting, RunId] = {}
-
-    def run(setting: Setting, on: Sequence[TestCase]) -> RunId:
-        return run_cases(experiment, setting, on)
+    rounds: list[list[RunId]] = []
+    holdout_runs: tuple[RunId, RunId] | None = None
+    not_applicable: dict[str, str] = {}
+    refused: dict[str, Setting] = {}  # knob -> the single-knob setting the app refused it on
 
     def rows() -> dict[RunId, ExperimentRow]:
         return {row.run_id: row for row in store.experiment_table(experiment)}
@@ -461,54 +468,79 @@ def run_sweep(store: Store, cases: Mapping[CaseId, TestCase], plan: Plan, run_ca
         by_run = rows()
         return {s: by_run[r] for s, r in runs.items()}
 
-    runs[BASELINE] = run(BASELINE, tune)
-    first_round = [r.setting for r in plan.candidates[: plan.max_settings]]
-    rounds: list[tuple[RunId, ...]] = []
-    for number in range(plan.rounds):
-        if number == 0:
-            todo = list(first_round)
-        else:
-            table = tune_rows()
-            best = winner(table, plan.window)
-            if best is None:
-                break
-            baseline_passed = table[BASELINE].passed
-            todo = []
-            for partner in first_round:
-                if not knobs(partner).isdisjoint(knobs(best)) or table[partner].passed < baseline_passed:
-                    continue
-                combined = merge(best, partner)
-                if combined not in runs and combined not in todo:
-                    todo.append(combined)
-            todo = todo[: plan.max_settings]
-        if not todo:
-            break
-        for setting in todo:
-            runs[setting] = run(setting, tune)
-        rounds.append(tuple(runs[s] for s in todo))
+    def attempt(setting: Setting) -> None:
+        shared = knobs(setting) & refused.keys()
+        if shared:
+            knob = min(shared)
+            not_applicable[setting.name] = f"sets {knob}, which {refused[knob].name} showed the app's retrieval cannot take"
+            return
+        try:
+            runs[setting] = run_cases(experiment, setting, tune)
+        except InterventionNotApplicable as e:
+            not_applicable[setting.name] = str(e)
+            if len(knobs(setting)) == 1:
+                refused[next(iter(knobs(setting)))] = setting
+            return
+        rounds[-1].append(runs[setting])
 
-    table = tune_rows()
-    best = winner(table, plan.window)
-    holdout_runs = None
-    holdout_rows = None
-    if best is not None and held:
-        holdout_runs = (run(BASELINE, held), run(best, held))
-        by_run = rows()
-        holdout_rows = {BASELINE: by_run[holdout_runs[0]], best: by_run[holdout_runs[1]]}
-    decision = decide(table, plan.window, holdout_rows)
-    report = SweepReport(
-        source_run=plan.source_run,
-        baseline_k=plan.baseline_k,
-        counts=dict(plan.counts),
-        split=plan.split,
-        baseline_run=runs[BASELINE],
-        rounds=tuple(rounds),
-        holdout_runs=holdout_runs,
-        recommended=runs[decision.recommended] if decision.recommended is not None else None,
-        reason=decision.reason,
-        passed_over=runs[decision.passed_over] if decision.passed_over is not None else None,
-    )
-    store.save_experiment_report(experiment, report.to_json())
+    def search() -> Decision:
+        runs[BASELINE] = run_cases(experiment, BASELINE, tune)
+        first_round = [r.setting for r in plan.candidates[: plan.max_settings]]
+        for number in range(plan.rounds):
+            if number == 0:
+                todo = list(first_round)
+            else:
+                table = tune_rows()
+                best = winner(table, plan.window)
+                if best is None:
+                    break
+                baseline_passed = table[BASELINE].passed
+                todo = []
+                for partner in first_round:
+                    if partner not in runs or not knobs(partner).isdisjoint(knobs(best)) or table[partner].passed < baseline_passed:
+                        continue
+                    combined = merge(best, partner)
+                    if combined not in runs and combined not in todo:
+                        todo.append(combined)
+                todo = todo[: plan.max_settings]
+            if not todo:
+                break
+            rounds.append([])
+            for setting in todo:
+                attempt(setting)
+        table = tune_rows()
+        best = winner(table, plan.window)
+        holdout_rows = None
+        if best is not None and held:
+            nonlocal holdout_runs
+            holdout_runs = (run_cases(experiment, BASELINE, held), run_cases(experiment, best, held))
+            by_run = rows()
+            holdout_rows = {BASELINE: by_run[holdout_runs[0]], best: by_run[holdout_runs[1]]}
+        decision = decide(table, plan.window, holdout_rows)
+        if len(runs) == 1 and not_applicable:
+            return Decision(None, None, "no candidate could run; " + "; ".join(f"{name}: {why}" for name, why in not_applicable.items()))
+        return decision
+
+    try:
+        decision = search()
+    except BaseException as e:
+        decision = Decision(None, None, f"the sweep stopped early: {type(e).__name__}: {e}")
+        raise
+    finally:
+        report = SweepReport(
+            source_run=plan.source_run,
+            baseline_k=plan.baseline_k,
+            counts=dict(plan.counts),
+            split=plan.split,
+            baseline_run=runs.get(BASELINE),
+            rounds=tuple(tuple(r) for r in rounds if r),
+            holdout_runs=holdout_runs,
+            recommended=runs[decision.recommended] if decision.recommended is not None else None,
+            reason=decision.reason,
+            passed_over=runs[decision.passed_over] if decision.passed_over is not None else None,
+            not_applicable=not_applicable,
+        )
+        store.save_experiment_report(experiment, report.to_json())
     return experiment, report
 
 
@@ -539,7 +571,7 @@ def _passed_over_clause(chosen: ExperimentRow, other: ExperimentRow) -> str:
 def recommendation_line(report: SweepReport, table: Sequence[ExperimentRow]) -> str:
     """One plain sentence or two: the change to make, the accuracy before and after on tune and
     holdout, and what it costs; or why to keep the current settings."""
-    if report.recommended is None:
+    if report.recommended is None or report.baseline_run is None:
         return f"Keep the current settings. {report.reason}."
     rows = {row.run_id: row for row in table}
     before, after = rows[report.baseline_run], rows[report.recommended]

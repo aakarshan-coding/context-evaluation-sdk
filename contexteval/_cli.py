@@ -462,6 +462,8 @@ def cmd_sweep(args: argparse.Namespace) -> int:
         if report.holdout_runs:
             print(f"holdout, {len(plan.split.holdout)} cases")
             print(format_experiment_table([table[r] for r in report.holdout_runs]))
+        for name, why in report.not_applicable.items():
+            print(f"not applicable: {name}: {why}")
         print(_sweep.recommendation_line(report, list(table.values())))
         return 0
     finally:
