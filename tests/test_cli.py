@@ -156,3 +156,18 @@ def test_cli_run_and_build_tests_user_errors(project: Path, capsys: pytest.Captu
     assert _cli.main(["build-tests", "--import", str(project / "missing.jsonl")]) == 1
     err = capsys.readouterr().err
     assert "no app given" in err and "no test cases" in err and "exactly one of" in err and "missing.jsonl" in err
+
+
+def test_run_remembers_the_app_only_after_it_loads(project: Path) -> None:
+    """Review Y5. Defect: `run` writes the app spec to config.json before importing it, so one typo
+    replaces the remembered app and every later `run` and `experiment` without a spec fails."""
+    assert _cli.main(["init", "--provider", "fake", "--app", "contexteval.demo.app:answer"]) == 0
+    tests = project / "t.jsonl"
+    tests.write_text(json.dumps({"question": "q?", "expected_answer": "a"}) + "\n", encoding="utf-8")
+    assert _cli.main(["build-tests", "--import", str(tests)]) == 0
+    try:
+        code = _cli.main(["run", "no_such_module_for_contexteval:answer", "--yes"])
+    except SystemExit as e:
+        code = e.code
+    assert code not in (0, None)
+    assert _cli.load_config(project).app == "contexteval.demo.app:answer"

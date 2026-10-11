@@ -229,8 +229,6 @@ def cmd_run(args: argparse.Namespace) -> int:
     spec = args.app or config.app
     if spec is None:
         raise UserError("no app given; pass MODULE:FUNCTION once and it is remembered")
-    if spec != config.app:
-        save_config(project, replace(config, app=spec))
     store = Store.open(project)
     try:
         cases = store.cases(args.test_set)
@@ -239,6 +237,8 @@ def cmd_run(args: argparse.Namespace) -> int:
             raise UserError(f"no test cases in {where}; run `contexteval build-tests` first")
         provider = _provider(config)
         app = _runner.load_app(spec)
+        if spec != config.app:
+            save_config(project, replace(config, app=spec))
         app_tokens = store.mean_app_tokens()
         if app_tokens is not None:
             print(f"app: {len(cases)} calls to {spec}, ~{app_tokens[0]} input tokens each in the last run")
