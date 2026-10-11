@@ -2,9 +2,7 @@
 
 This project follows [Semantic Versioning](https://semver.org/). Each release lists what changed for people who use contexteval.
 
-## 0.2.0 (v1.1, unreleased)
-
-Planned contents, from [docs/plan-v1.1.md](docs/plan-v1.1.md). This entry becomes final when the release is tagged.
+## 0.2.0 (v1.1, 2026-10-11)
 
 ### Changed
 
