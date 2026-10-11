@@ -20,10 +20,13 @@ exactly once either way, and its own exceptions propagate untouched.
 
 from __future__ import annotations
 
+import atexit
 import copy
 import functools
 import inspect
 import logging
+import os
+import queue
 import threading
 from collections import deque
 from contextlib import contextmanager
@@ -39,7 +42,7 @@ from ._intervention import BASELINE, NO_INTERVENTION, Intervention, Intervention
 from ._intervention import apply as apply_intervention
 from ._llm import cost_usd
 from ._store import Store
-from .types import Answered, Chunk, LLMCall, Metrics, Outcome, RetrievalEvent, TestOutcome, Trace
+from .types import Answered, Chunk, LLMCall, Metrics, Outcome, RetrievalEvent, RunId, TestOutcome, Trace
 
 R = TypeVar("R")
 F = TypeVar("F", bound=Callable[..., Any])
@@ -103,6 +106,19 @@ def _in_prompt(event: RetrievalEvent, prompt: str) -> bool:
     if event.query and text.chunk_in_prompt(event.query, prompt):
         return True
     return bool(text.in_prompt_pairs((event,), prompt))
+
+
+@dataclass(frozen=True)
+class PendingTrace:
+    """A closed production buffer with the LLM call that closed it. Pairing the two reads the
+    whole prompt once per event, so it runs on the writer thread, not the user's request."""
+
+    buffer: _Ambient
+    call: LLMCall
+    at: float
+
+    def close(self) -> ActiveRun:
+        return self.buffer.close(self.call, self.at)
 
 
 def _refuse(run: ActiveRun | _Ambient, error: InterventionNotApplicable) -> InterventionNotApplicable:
@@ -182,13 +198,13 @@ class Mode(Enum):
     PRODUCTION = "production"  # installed by init(); also record outside runs
 
 
-Sink = Callable[[ActiveRun], None]
+Sink = Callable[[PendingTrace], None]  # receives each closed production buffer
 
 
 @dataclass
 class _Process:
     mode: Mode = Mode.OFF
-    sink: Sink | None = None  # writes an ambient buffer as a Trace
+    sink: Sink | None = None  # the ProductionWriter in production mode; tests inject lists
     current: ActiveRun | None = None  # the one runner.execute in progress, visible to every thread
     logged: set[str] = field(default_factory=set)  # keys of warnings already emitted
 
@@ -214,7 +230,9 @@ def set_mode(mode: Mode, make_sink: Callable[[], Sink] | None = None) -> None:
 
 
 def reset_process() -> None:
-    """Test seam: back to OFF with no buffered events and no sink."""
+    """Test seam: back to OFF with no buffered events, no sink, and the writer stopped."""
+    if isinstance(_process.sink, ProductionWriter):
+        _process.sink.close()
     _process.mode = Mode.OFF
     _process.sink = None
     _process.current = None
@@ -222,20 +240,123 @@ def reset_process() -> None:
     _ambient.set(None)
 
 
-def production_sink(project_dir: Path) -> Sink:
-    """One production run per process, created on the first flushed trace, so an app that never
-    reaches an LLM call leaves no empty run behind."""
-    store = Store.open(project_dir)
-    lock = threading.Lock()
-    run_id: list[Any] = []
+WRITER_QUEUE_MAX = 256  # closed buffers waiting for the writer; beyond this they are dropped and counted
+WRITER_FLUSH_S = 5.0
+ATEXIT_FLUSH_S = 2.0  # how long interpreter exit waits for pending production traces
 
-    def sink(run: ActiveRun) -> None:
-        with lock:
-            if not run_id:
-                run_id.append(store.new_run("production", None, BASELINE))
-            store.add_trace(run_id[0], _ambient_trace(run))
+_getpid = os.getpid
 
-    return sink
+
+class _Flush:
+    def __init__(self) -> None:
+        self.done = threading.Event()
+
+
+class ProductionWriter:
+    """The production sink. The hot path enqueues a closed buffer and returns; one daemon thread
+    finalizes and writes it.
+
+    The thread owns the only connection, opened on the first write and dropped when the pid
+    changes, because a forked child inherits the parent's connection, queue, and no thread.
+    One production run per process, created on the first stored trace, so an app that never
+    reaches an LLM call leaves no empty run behind. A full queue drops and counts.
+    """
+
+    def __init__(self, project_dir: Path, maxsize: int = WRITER_QUEUE_MAX) -> None:
+        self._project_dir = project_dir
+        self._maxsize = maxsize
+        self._queue: queue.Queue[PendingTrace | _Flush | None] = queue.Queue(maxsize)
+        self._lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+        self._pid: int | None = None
+        self._store: Store | None = None
+        self._run_id: RunId | None = None
+        self.dropped = 0
+        self.closed = False
+        atexit.register(self.flush, ATEXIT_FLUSH_S)
+
+    def __call__(self, pending: PendingTrace) -> None:
+        self._ensure_thread()
+        try:
+            self._queue.put_nowait(pending)
+        except queue.Full:
+            self.dropped += 1
+            _log_once("writer:full", "contexteval dropped a production trace; the writer queue is full")
+
+    def _ensure_thread(self) -> None:
+        pid = _getpid()
+        with self._lock:
+            thread = self._thread
+            if thread is not None and thread.is_alive() and self._pid == pid:
+                return
+            if self._pid != pid:
+                self._store, self._run_id = None, None  # inherited from the parent: never use, never close
+                self._queue = queue.Queue(self._maxsize)
+            self._pid = pid
+            self._thread = threading.Thread(target=self._drain, args=(self._queue,), name="contexteval-writer", daemon=True)
+            self._thread.start()
+
+    def _drain(self, pending: queue.Queue[PendingTrace | _Flush | None]) -> None:
+        while True:
+            item = pending.get()
+            if item is None:
+                break
+            if isinstance(item, _Flush):
+                item.done.set()
+                continue
+            try:
+                self._write(item)
+            except Exception as e:
+                _log_once("writer", "contexteval could not store a production trace", e)
+        store, self._store = self._store, None
+        if store is not None:
+            store.close()
+
+    def _write(self, pending: PendingTrace) -> None:
+        if self._store is None:
+            self._store = Store.open(self._project_dir)
+            self._run_id = None
+        if self._run_id is None:
+            self._run_id = self._store.new_run("production", None, BASELINE)
+        self._store.add_trace(self._run_id, _ambient_trace(pending.close()))
+
+    def flush(self, timeout: float = WRITER_FLUSH_S) -> bool:
+        """Wait until every buffer enqueued so far is written. False when that took longer than
+        `timeout` (the writer keeps going) or the queue is full."""
+        thread = self._thread
+        if self.closed or thread is None or not thread.is_alive():
+            return self._queue.empty()
+        marker = _Flush()
+        try:
+            self._queue.put(marker, timeout=timeout)
+        except queue.Full:
+            return False
+        return marker.done.wait(timeout)
+
+    def close(self, timeout: float = WRITER_FLUSH_S) -> None:
+        """Flush, stop the thread, and close the connection."""
+        thread = self._thread
+        if thread is not None and thread.is_alive():
+            self.flush(timeout)
+            try:
+                self._queue.put(None, timeout=timeout)
+            except queue.Full:
+                pass
+            thread.join(timeout)
+        self.closed = True
+
+
+def flush_production(timeout: float = WRITER_FLUSH_S) -> bool:
+    """Block until the production writer has stored every trace closed so far. True when nothing
+    is pending (including outside production mode)."""
+    sink = _process.sink
+    return sink.flush(timeout) if isinstance(sink, ProductionWriter) else True
+
+
+def production_dropped() -> int:
+    """Traces the production writer dropped because its queue was full."""
+    sink = _process.sink
+    return sink.dropped if isinstance(sink, ProductionWriter) else 0
 
 
 def _ambient_trace(run: ActiveRun) -> Trace:
@@ -246,9 +367,13 @@ def _ambient_trace(run: ActiveRun) -> Trace:
     return finalize_trace(run, Answered(answer or ""), latency)
 
 
-def _log_once(key: str, message: str, error: BaseException) -> None:
-    if key not in _process.logged:
-        _process.logged.add(key)
+def _log_once(key: str, message: str, error: BaseException | None = None) -> None:
+    if key in _process.logged:
+        return
+    _process.logged.add(key)
+    if error is None:
+        log.warning("%s", message)
+    else:
         log.warning("%s: %s: %s", message, type(error).__name__, error)
 
 
@@ -420,7 +545,7 @@ def intercept_llm(adapter: LLMAdapter, call: Callable[[inspect.BoundArguments], 
     sink = _process.sink
     if sink is not None:
         try:
-            sink(run.close(llm_call, t0))
+            sink(PendingTrace(run, llm_call, t0))
         except Exception as e:
             _log_once("sink", "contexteval could not store a production trace", e)
     return response

@@ -412,7 +412,7 @@ def install(mode: Literal["cli", "production"], project_dir: Path | None = None,
     report = install_all(specs)
     if mode == "production":
         root = project_dir or Path.cwd()
-        capture.set_mode(Mode.PRODUCTION, lambda: capture.production_sink(root))
+        capture.set_mode(Mode.PRODUCTION, lambda: capture.ProductionWriter(root))
     else:
         capture.set_mode(Mode.CLI)
     return report

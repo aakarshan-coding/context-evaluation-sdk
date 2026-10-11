@@ -330,6 +330,7 @@ def test_production_mode_one_llm_call_closes_one_stored_trace(production: captur
     own trace so retrievals and the LLM call never meet."""
     assert capture._process.mode is capture.Mode.PRODUCTION
     answer, _ = _app(chroma, openai_client, QUESTION)
+    assert capture.flush_production()
     store = Store.open(project)
     try:
         run = store.latest_run("production")
@@ -341,6 +342,7 @@ def test_production_mode_one_llm_call_closes_one_stored_trace(production: captur
         assert len(t.retrievals) == 1 and len(t.llm_calls) == 1
         assert t.in_prompt == ((0, 0), (0, 1))
         openai_client.chat.completions.create(model="gpt-4o-mini", messages=[{"role": "user", "content": "hi"}])
+        assert capture.flush_production()
         traces = store.traces(run.id)
         assert len(traces) == 2 and traces[1].trace.retrievals == ()
         assert capture._ambient.get() is None

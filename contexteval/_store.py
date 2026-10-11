@@ -265,8 +265,9 @@ class Store:
         """Create .contexteval/ and the schema if missing. Idempotent; checks PRAGMA user_version."""
         directory = project_dir / PROJECT_DIR_NAME
         directory.mkdir(parents=True, exist_ok=True)
-        # check_same_thread=False: production capture flushes from whichever thread the app's
-        # LLM call runs on. Writes are short and serialized by sqlite's own locking.
+        # check_same_thread=False: the UI serves requests from handler threads over one store, and
+        # the production writer closes its connection from its own thread. Writes are short and
+        # serialized by sqlite's own locking.
         conn = sqlite3.connect(str(directory / DB_FILE), check_same_thread=False)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys=ON")

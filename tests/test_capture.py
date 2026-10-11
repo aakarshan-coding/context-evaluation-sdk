@@ -3,8 +3,11 @@ Driven through the public hook surface (intercept_*, @retriever, execute), not i
 
 from __future__ import annotations
 
+import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from pathlib import Path
+from time import perf_counter
 from types import SimpleNamespace
 from typing import Any, Iterator
 
@@ -15,7 +18,8 @@ from contexteval import _hooks, retriever
 from contexteval._intervention import NO_INTERVENTION, InjectEvidence, Intervention, InterventionNotApplicable
 from contexteval._llm import cost_usd
 from contexteval._runner import execute
-from contexteval.types import Answered, Evidence, LLMCall
+from contexteval._store import Store
+from contexteval.types import Answered, Evidence, LLMCall, Trace
 
 
 @dataclass
@@ -51,7 +55,7 @@ def llm() -> Iterator[FakeLLM]:
 def flushed() -> Iterator[list[capture.ActiveRun]]:
     """Production mode whose sink appends each closed buffer instead of writing it."""
     runs: list[capture.ActiveRun] = []
-    capture.set_mode(capture.Mode.PRODUCTION, lambda: runs.append)
+    capture.set_mode(capture.Mode.PRODUCTION, lambda: lambda pending: runs.append(pending.close()))
     try:
         yield runs
     finally:
@@ -60,6 +64,82 @@ def flushed() -> Iterator[list[capture.ActiveRun]]:
 
 def _ask(llm: FakeLLM, question: str, context: str = "") -> Any:
     return llm.create(messages=[{"role": "user", "content": f"{context}\n\nQ: {question}"}])
+
+
+@pytest.fixture
+def production(project: Path, llm: FakeLLM) -> FakeLLM:
+    _hooks.install("production", project)
+    return llm
+
+
+def _locked(project: Path) -> sqlite3.Connection:
+    locker = sqlite3.connect(str(project / ".contexteval" / "contexteval.db"), isolation_level=None)
+    locker.execute("BEGIN IMMEDIATE")
+    return locker
+
+
+def _production_traces(project: Path) -> list[Trace]:
+    store = Store.open(project)
+    try:
+        runs = [r for r in store.runs() if r.run.kind == "production"]
+        return [s.trace for r in runs for s in store.traces(r.run.id)]
+    finally:
+        store.close()
+
+
+def test_production_llm_call_returns_fast_while_the_db_is_write_locked(project: Path, production: FakeLLM) -> None:
+    """Review X3. Defect: the sink committed to SQLite on the caller's thread, so a locked database
+    stalled the user's LLM call for the busy timeout (measured 5.56 s). The hot path now only
+    enqueues; the writer thread stores the trace once the lock is gone."""
+    locker = _locked(project)
+    try:
+        hits = search("locked")
+        t0 = perf_counter()
+        _ask(production, "locked", "\n".join(h["text"] for h in hits))
+        elapsed = perf_counter() - t0
+    finally:
+        locker.execute("ROLLBACK")
+        locker.close()
+    assert elapsed < 0.1, f"LLM call took {elapsed * 1000:.1f} ms with the database locked"
+    assert capture.flush_production(timeout=10)
+    (trace,) = _production_traces(project)
+    assert trace.question == "locked" and len(trace.retrievals) == 1 and trace.outcome == Answered("ans")
+
+
+def test_writer_drops_and_counts_when_the_queue_is_full(project: Path, production: FakeLLM, caplog: pytest.LogCaptureFixture) -> None:
+    """Review X3. Defect: an unbounded queue (memory grows while the database is unavailable) or
+    a bounded one that blocks the caller. Every submitted trace is either stored or counted as
+    dropped, and the drop is logged once."""
+    submitted = capture.WRITER_QUEUE_MAX + 20
+    locker = _locked(project)
+    try:
+        for i in range(submitted):
+            _ask(production, f"burst {i}")
+    finally:
+        locker.execute("ROLLBACK")
+        locker.close()
+    assert capture.flush_production(timeout=30)
+    stored = len(_production_traces(project))
+    dropped = capture.production_dropped()
+    assert dropped > 0 and stored + dropped == submitted
+    assert caplog.text.count("writer queue is full") == 1
+
+
+def test_writer_reopens_its_connection_in_a_forked_child(project: Path, production: FakeLLM, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Review X3. Defect: the connection opened at init() is inherited across fork() and shared by
+    two processes. A pid change must discard the inherited connection and thread and open a
+    fresh one, which shows up as a second production run."""
+    _ask(production, "in the parent")
+    assert capture.flush_production(timeout=10)
+    monkeypatch.setattr(capture, "_getpid", lambda: -1)
+    _ask(production, "in the child")
+    assert capture.flush_production(timeout=10)
+    store = Store.open(project)
+    try:
+        runs = [r for r in store.runs() if r.run.kind == "production"]
+        assert len(runs) == 2 and [r.traces for r in runs] == [1, 1]
+    finally:
+        store.close()
 
 
 def test_production_buffer_does_not_bleed_across_requests(llm: FakeLLM, flushed: list[capture.ActiveRun]) -> None:
