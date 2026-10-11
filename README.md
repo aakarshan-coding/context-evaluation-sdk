@@ -82,7 +82,15 @@ Test a fix. The "never retrieved" case ranks 5th, and the demo retrieves 4 chunk
 contexteval experiment top_k=10 --yes
 ```
 
-The table compares the baseline with the new setting. The missing case passes under `top_k=10`. The cost column reads `unknown` because the fake model has no price. The flaky case alternates between runs, so it can move a row's accuracy up or down by one case.
+The table compares the baseline with the new setting:
+
+```text
+setting   accuracy  passed  mean input tokens  mean latency ms  total cost
+baseline  38%       3/8     124                62.0             unknown
+top_k=10  50%       4/8     272                7.9              unknown
+```
+
+The "never retrieved" case passes under `top_k=10`, so accuracy rises by one case. The flaky case failed only on its first call, so it passes in both rows. The cost column reads `unknown` because the fake model has no price.
 
 Open the dashboard:
 

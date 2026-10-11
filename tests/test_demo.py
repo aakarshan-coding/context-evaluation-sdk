@@ -99,16 +99,17 @@ def test_not_retrieved_case_passes_at_top_k_10(project: Path, hooks: None) -> No
     assert _passes(p, Intervention(top_k=10))
 
 
-def test_flipflop_alternates_and_persists_in_state_file(tmp_path: Path) -> None:
-    """Defect: the flaky counter kept in memory, or shared across questions."""
+def test_flaky_rule_fails_only_the_first_call_and_persists_in_state_file(tmp_path: Path) -> None:
+    """Defects: the flaky counter kept in memory, or shared across questions; a later call
+    failing again, which makes experiment rows after the first run noisy."""
     (p,) = [p for p in planted.PLANTED if p.expected is Label.FLAKY]
     state = tmp_path / "state.json"
     prompt = demo_app.build_prompt(p.case.question, ["Trailhead Gear is headquartered in Boulder, Colorado."])
     other = demo_app.build_prompt("unscripted question?", ["Some chunk."])
-    answers = [fake_llm.respond(prompt, state) for _ in range(3)]
-    assert answers == [fake_llm.WRONG, p.rule.answer, fake_llm.WRONG]  # type: ignore[union-attr]
+    answers = [fake_llm.respond(prompt, state) for _ in range(4)]
+    assert answers == [fake_llm.WRONG] + [p.rule.answer] * 3  # type: ignore[union-attr]
     assert fake_llm.respond(other, state) == "Some chunk."
-    assert '"Where is Trailhead Gear headquartered?": 3' in state.read_text(encoding="utf-8")
+    assert '"Where is Trailhead Gear headquartered?": 4' in state.read_text(encoding="utf-8")
 
 
 def test_flaky_counter_persists_across_separate_run_processes(project: Path) -> None:

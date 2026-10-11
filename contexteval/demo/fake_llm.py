@@ -12,7 +12,7 @@ top before only gold):
     NeedsEvidenceFirst evidence in the FIRST chunk    gold 2nd to 4th         fail   -       pass    -          ignored
     NeedsNoDistractor  evidence present, no marker    gold + marker chunk     fail   -       fail    pass       irrelevant
     AlwaysWrong        never                          gold present            fail   -       fail    fail       not_context
-    FlipFlop           even-numbered calls            gold present, call 1    pass   -       -       -          flaky
+    FailsFirstCall     every call after the first     gold present, call 1    pass   -       -       -          flaky
     NeedsEvidence      evidence in any chunk          gold present            (passes at baseline: healthy)
 
 Unscripted questions (synthetic cases from build-tests) echo the whole context back, so the
@@ -58,11 +58,11 @@ class AlwaysWrong:
 
 
 @dataclass(frozen=True)
-class FlipFlop:
+class FailsFirstCall:
     answer: str
 
 
-Rule = Union[NeedsEvidence, NeedsEvidenceFirst, NeedsNoDistractor, AlwaysWrong, FlipFlop]
+Rule = Union[NeedsEvidence, NeedsEvidenceFirst, NeedsNoDistractor, AlwaysWrong, FailsFirstCall]
 
 WRONG = "I don't know."
 
@@ -95,8 +95,8 @@ def evaluate(rule: Rule, question: str, chunks: list[str], state_file: Path) -> 
             return a if ok else WRONG
         case AlwaysWrong():
             return WRONG
-        case FlipFlop(answer=a):
-            return a if _bump(state_file, question) % 2 == 0 else WRONG
+        case FailsFirstCall(answer=a):
+            return a if _bump(state_file, question) > 1 else WRONG
         case _:
             never(rule)
 
@@ -104,9 +104,10 @@ def evaluate(rule: Rule, question: str, chunks: list[str], state_file: Path) -> 
 def respond(prompt: str, state_file: Path) -> str:
     """parse_prompt -> look up planted.script()[question] -> evaluate the rule.
 
-    FlipFlop increments a per-question counter in `state_file` (JSON). The counter must persist
-    because `run` and `diagnose` are separate processes: run is call 1 (fail), the diagnoser's
-    baseline rerun is call 2 (pass). Re-running the workflow keeps the odd/even alternation.
+    FailsFirstCall increments a per-question counter in `state_file` (JSON). The counter must
+    persist because `run` and `diagnose` are separate processes: run is call 1 (fail), the
+    diagnoser's baseline rerun is call 2 (pass). Every later call passes, so experiment rows
+    after the first run are stable.
     """
     from .app import parse_prompt
     from .planted import script

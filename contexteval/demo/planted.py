@@ -14,7 +14,7 @@ from typing import Literal
 
 from .._testset import case_id
 from ..types import Evidence, Label, TestCase
-from .fake_llm import AlwaysWrong, FlipFlop, NeedsEvidence, NeedsEvidenceFirst, NeedsNoDistractor, Rule
+from .fake_llm import AlwaysWrong, FailsFirstCall, NeedsEvidence, NeedsEvidenceFirst, NeedsNoDistractor, Rule
 
 IMPORT_FILE = "planted.jsonl"
 SOURCE = "contexteval.demo.planted"
@@ -104,7 +104,7 @@ PLANTED: tuple[Planted, ...] = (
     Planted(*_IGNORED, Label.IGNORED),
     Planted(*_IRRELEVANT, Label.IRRELEVANT),
     Planted(_NOT_CONTEXT, AlwaysWrong(), Label.NOT_CONTEXT),
-    Planted(_FLAKY, FlipFlop(answer="Trailhead Gear is based in Boulder, Colorado."), Label.FLAKY),
+    Planted(_FLAKY, FailsFirstCall(answer="Trailhead Gear is based in Boulder, Colorado."), Label.FLAKY),
     Planted(*_HEALTHY_RETURNS, None),
     Planted(*_HEALTHY_SHIPPING, None),
 )
