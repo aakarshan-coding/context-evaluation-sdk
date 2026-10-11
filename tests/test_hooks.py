@@ -634,7 +634,7 @@ def test_patch_method_reads_owner_dict_not_inherited(hooks: None) -> None:
     assert "query" not in Child.__dict__
 
 
-class _BrokenCodec:
+class _BrokenCodec(capture.RetrievalCodec[Any]):
     source = "broken"
     top_k_param = None
 

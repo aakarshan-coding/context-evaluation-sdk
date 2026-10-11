@@ -14,9 +14,12 @@ Who sees what:
 - No active run, mode == CLI or OFF: hooks pass through and record nothing.
 - Inside suppressed() (the SDK's own provider calls): hooks pass through and record nothing.
 - Inside another hooked retrieval in the same context (a LangChain retriever over a hooked
-  chromadb collection, a @retriever function that queries one): the inner call passes through.
-  The outermost hooked retrieval owns the event and the intervention, so one user-level
-  retrieval is one RetrievalEvent and the intervention applies once.
+  chromadb collection, a @retriever function that queries one): the inner call records nothing.
+  The outermost hooked retrieval owns the event and the transforms, so one user-level
+  retrieval is one RetrievalEvent and the intervention applies once. top_k goes to the
+  outermost layer that can set it: the outer layer first, else the first hooked call
+  underneath with a knob (a custom retriever over chromadb, a wrapper over a base retriever).
+  Only when the outer call returns with no layer having set it is the intervention refused.
 
 Error policy at the hook (architecture graft 3): recording errors are swallowed and logged
 once; intervention errors propagate as InterventionNotApplicable; the user's retrieval runs
@@ -132,13 +135,30 @@ def _refuse(run: ActiveRun | _Ambient, error: InterventionNotApplicable) -> Inte
     return error
 
 
+@dataclass
+class _Outermost:
+    """The outermost hooked retrieval in progress in this context. It owns the event and the
+    transforms. top_k is owned by the outermost layer that can apply it: the run's value stays
+    pending until this layer or a hooked call underneath sets its own knob, and the event
+    records the knob that was set. When the call returns with the value still pending, the
+    outermost layer refuses with its own reason."""
+
+    top_k: int | None  # the run's request; None when the intervention has none
+    applied: tuple[str, int] | None = None  # (knob name, value) set by the layer that took it
+    refusal: InterventionNotApplicable | None = None  # the outermost layer's reason it could not
+
+    @property
+    def pending(self) -> int | None:
+        return self.top_k if self.applied is None else None
+
+
 _active: ContextVar[ActiveRun | None] = ContextVar("contexteval_active", default=None)
 _ambient: ContextVar[_Ambient | None] = ContextVar("contexteval_ambient", default=None)
 _suppressed: ContextVar[bool] = ContextVar("contexteval_suppressed", default=False)
-# True while a hooked retrieval is in progress in this context. A hooked store it calls
-# underneath passes through, so the outermost retrieval owns the event. A ContextVar, so an
-# asyncio task's inner calls see its own flag, and langchain's executor hand-off copies it.
-_retrieving: ContextVar[bool] = ContextVar("contexteval_retrieving", default=False)
+# Set while a hooked retrieval is in progress in this context. A hooked call underneath records
+# nothing and only takes a pending top_k. A ContextVar, so an asyncio task's inner calls see its
+# own state, and langchain's executor hand-off copies it.
+_retrieving: ContextVar[_Outermost | None] = ContextVar("contexteval_retrieving", default=None)
 
 
 @contextmanager
@@ -267,7 +287,7 @@ def reset_process() -> None:
     _process.pinecone_text_key = "text"
     _process.logged.clear()
     _ambient.set(None)
-    _retrieving.set(False)
+    _retrieving.set(None)
 
 
 WRITER_QUEUE_MAX = 256  # closed buffers waiting for the writer; beyond this they are dropped and counted
@@ -424,12 +444,16 @@ def _current_run() -> ActiveRun | _Ambient | None:
 # --- the two intercepts every hook calls ------------------------------------
 
 
+Restore = Callable[[], None]
+
+
 @runtime_checkable
 class RetrievalCodec(Protocol[R]):
-    """Translates one retrieval API's native call and result to and from Chunks."""
+    """Translates one retrieval API's native call and result to and from Chunks. Codecs subclass
+    it explicitly, so the argument form of override_top_k is implemented once here."""
 
     source: str
-    top_k_param: str | None  # name of the argument to override, None if not overridable
+    top_k_param: str | None  # name of this site's top_k knob, as the event records it; None when it has none
 
     def query_text(self, args: inspect.BoundArguments) -> str | None: ...
 
@@ -439,19 +463,16 @@ class RetrievalCodec(Protocol[R]):
         """Rebuild a native result: reuse rows by source_index, synthesize rows for injected chunks."""
         ...
 
-
-Restore = Callable[[], None]
-
-
-@runtime_checkable
-class InstanceTopK(Protocol):
-    """A RetrievalCodec whose top_k knob is state on the retriever object (a framework retriever's
-    `search_kwargs` or `similarity_top_k`), not an argument of the hooked call. `top_k_param`
-    then names the knob in the event's params. override_top_k sets the knob for one call and
-    returns what puts the user's value back; it raises InterventionNotApplicable when this
-    instance has no such knob."""
-
-    def override_top_k(self, instance: Any, top_k: int) -> Restore: ...
+    def override_top_k(self, args: inspect.BoundArguments, top_k: int) -> Restore | None:
+        """Put the run's top_k where this one call reads it. The default sets the argument named
+        top_k_param. A codec whose knob is state on the retriever object (a framework retriever's
+        `search_kwargs` or `similarity_top_k`) overrides this, sets the knob for the call, and
+        returns what puts the user's value back. Raises InterventionNotApplicable when this site
+        cannot apply the value; a hooked call underneath may still."""
+        if self.top_k_param is None:
+            raise InterventionNotApplicable(f"{self.source}: top_k={top_k} requested but this site has no top_k parameter")
+        args.arguments[self.top_k_param] = top_k
+        return None
 
 
 @runtime_checkable
@@ -491,29 +512,56 @@ def _snapshot(args: inspect.BoundArguments) -> dict[str, Any]:
 # only in whether they await the call. `None` from a begin() means pass through untouched.
 
 
+def _run_restore(codec: RetrievalCodec[Any], restore: Restore | None) -> None:
+    if restore is None:
+        return
+    try:
+        restore()
+    except Exception as e:
+        _log_once(f"restore:{codec.source}", f"contexteval could not restore the {codec.source} top_k knob", e)
+
+
+@dataclass
+class _InnerOverride:
+    """A hooked call underneath the outermost retrieval that took the pending top_k onto its own
+    knob. It puts the user's value back when its call returns and records nothing."""
+
+    codec: RetrievalCodec[Any]
+    restore: Restore
+
+    def release(self) -> None:
+        _run_restore(self.codec, self.restore)
+
+    def finish(self, raw: R) -> R:
+        return raw
+
+
 @dataclass
 class _PendingRetrieval:
     codec: RetrievalCodec[Any]
     run: ActiveRun | _Ambient
     args: inspect.BoundArguments
-    params: dict[str, Any]  # the event's snapshot after the override; an instance knob is added by name, as it is not a call argument
-    token: Token[bool]  # the _retrieving flag this call set; release() resets it
-    restore: Restore | None  # puts an instance knob back; None for an argument knob
+    params: dict[str, Any]  # the event's snapshot after this layer's override; the applied knob is added by name at finish
+    token: Token[_Outermost | None]  # the _retrieving state this call set; release() resets it
+    restore: Restore | None  # puts this layer's instance knob back; None for an argument knob or no override
     t0: float
+    outer: _Outermost
 
     def release(self) -> None:
         """Runs once the library call returned or raised, before finish: inner hooked calls record
         again, and the retriever's own knob holds the user's value before anything else reads it."""
         _retrieving.reset(self.token)
-        if self.restore is not None:
-            try:
-                self.restore()
-            except Exception as e:
-                _log_once(f"restore:{self.codec.source}", f"contexteval could not restore the {self.codec.source} top_k knob", e)
+        _run_restore(self.codec, self.restore)
 
     def finish(self, raw: R) -> R:
         latency_ms = (perf_counter() - self.t0) * 1000
         codec, run, args, iv = self.codec, self.run, self.args, self.run.intervention
+
+        if self.outer.refusal is not None and self.outer.applied is None:
+            raise _refuse(run, self.outer.refusal)
+        if self.outer.applied is not None:
+            name, value = self.outer.applied
+            self.params[name] = value
 
         try:
             retrieved = codec.decode(raw)
@@ -556,34 +604,41 @@ class _PendingRetrieval:
         return out
 
 
-def _override_top_k(codec: RetrievalCodec[Any], run: ActiveRun | _Ambient, args: inspect.BoundArguments, top_k: int) -> Restore | None:
-    """Put the run's top_k where this site reads it: into the call's arguments, or onto the
-    retriever instance for an InstanceTopK codec, which returns the restore for release()."""
-    if codec.top_k_param is None:
-        raise _refuse(run, InterventionNotApplicable(f"{codec.source}: top_k={top_k} requested but this site has no top_k parameter"))
-    if not isinstance(codec, InstanceTopK):
-        args.arguments[codec.top_k_param] = top_k
+def _take_top_k(codec: RetrievalCodec[Any], args: inspect.BoundArguments, outer: _Outermost) -> Restore | None:
+    """Offer the pending top_k to this layer. When it applies, `outer.applied` names the knob and
+    the restore (if any) comes back for release(). When it cannot, the value stays pending for a
+    hooked call underneath, and the outermost layer's own reason is kept for the refusal."""
+    top_k = outer.pending
+    if top_k is None:
         return None
     try:
-        return codec.override_top_k(args.arguments.get("self"), top_k)
+        restore = codec.override_top_k(args, top_k)
     except InterventionNotApplicable as e:
-        raise _refuse(run, e)
-    except Exception as e:
-        raise _refuse(run, InterventionNotApplicable(f"{codec.source}: cannot set top_k={top_k} on this retriever")) from e
-
-
-def _begin_retrieval(codec: RetrievalCodec[Any], args: inspect.BoundArguments) -> _PendingRetrieval | None:
-    if _suppressed.get() or _retrieving.get():
+        outer.refusal = outer.refusal or e
         return None
+    except Exception as e:
+        refusal = InterventionNotApplicable(f"{codec.source}: cannot set top_k={top_k} on this retriever")
+        refusal.__cause__ = e
+        outer.refusal = outer.refusal or refusal
+        return None
+    outer.applied = (codec.top_k_param or "top_k", top_k)
+    return restore
+
+
+def _begin_retrieval(codec: RetrievalCodec[Any], args: inspect.BoundArguments) -> _PendingRetrieval | _InnerOverride | None:
+    if _suppressed.get():
+        return None
+    outer = _retrieving.get()
+    if outer is not None:
+        restore = _take_top_k(codec, args, outer)
+        return _InnerOverride(codec, restore) if restore is not None else None
     run = _current_run()
     if run is None:
         return None
-    iv = run.intervention
-    restore = _override_top_k(codec, run, args, iv.top_k) if iv.top_k is not None else None
+    outer = _Outermost(top_k=run.intervention.top_k)
+    restore = _take_top_k(codec, args, outer)
     params = _snapshot(args)
-    if restore is not None:
-        params[codec.top_k_param] = iv.top_k  # type: ignore[index]
-    return _PendingRetrieval(codec, run, args, params, _retrieving.set(True), restore, perf_counter())
+    return _PendingRetrieval(codec, run, args, params, _retrieving.set(outer), restore, perf_counter(), outer)
 
 
 def intercept_retrieval(codec: RetrievalCodec[R], call: Callable[[inspect.BoundArguments], R], args: inspect.BoundArguments) -> R:
@@ -734,7 +789,7 @@ Rebuild = Callable[[str], Any]
 
 
 @dataclass(frozen=True)
-class _DecoratorCodec:
+class _DecoratorCodec(RetrievalCodec[Any]):
     """Accepts results that are a sequence of str, of Mappings, or of arbitrary objects.
 
     Chunk text comes from `text`: a key or attribute name, or a callable over the item. Injected

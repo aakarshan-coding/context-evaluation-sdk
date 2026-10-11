@@ -49,7 +49,7 @@ def _get(obj: Any, key: str, default: Any = None) -> Any:
 
 
 @dataclass(frozen=True)
-class ChromaCodec:
+class ChromaCodec(RetrievalCodec[Any]):
     """chromadb Collection.query(query_texts=[...], n_results=k) -> dict of per-query lists.
 
     v1 intervenes only on single-query calls. Multi-query calls record their first row and
@@ -127,7 +127,7 @@ class _SyntheticMatch:
 
 
 @dataclass(frozen=True)
-class PineconeCodec:
+class PineconeCodec(RetrievalCodec[Any]):
     """pinecone Index.query(vector=..., top_k=k, include_metadata=True) -> matches.
 
     Queries are vectors, so query_text is None and transforms fall back to the run question.
@@ -199,10 +199,10 @@ class PineconeCodec:
 
 # --- framework retrievers (LangChain, LlamaIndex) ----------------------------
 #
-# A framework retriever's top_k is state on the retriever object, so these codecs implement
-# capture.InstanceTopK: the knob is set for one call and put back when the call returns.
-# Their LLM wrappers (ChatOpenAI, llama_index OpenAI, ...) call the official SDKs, which the
-# adapters below already hook, so no LLM rows are needed for them.
+# A framework retriever's top_k is state on the retriever object, so these codecs override
+# RetrievalCodec.override_top_k: the knob is set for one call and put back when the call
+# returns. Their LLM wrappers (ChatOpenAI, llama_index OpenAI, ...) call the official SDKs,
+# which the adapters below already hook, so no LLM rows are needed for them.
 
 _knob_lock = threading.Lock()
 # (id(instance), attribute) -> (the user's value, calls currently overriding it)
@@ -236,15 +236,17 @@ def _override_attr(instance: Any, attr: str, value: Any) -> Restore:
 
 
 @dataclass(frozen=True)
-class LangChainRetrieverCodec:
+class LangChainRetrieverCodec(RetrievalCodec[Any]):
     """langchain_core BaseRetriever.invoke(input, config=None, **kwargs) -> list[Document].
 
     Documents carry page_content, metadata, and an optional id; no score. The top_k knob is
     the retriever's own: `search_kwargs["k"]` on a VectorStoreRetriever (the dict is replaced
-    for the call, never edited in place) or an int `k` field. A retriever with neither refuses
-    a top_k intervention. langchain-chroma reaches the hooked chromadb `Collection.query`
-    underneath; that inner call passes through (capture's outermost rule), so one invoke is
-    one event.
+    for the call, never edited in place) or an int `k` field. VectorStoreRetriever merges the
+    call's kwargs over `search_kwargs`, so a per-call `k` is overridden too. A retriever with
+    no knob leaves top_k to the hooked call underneath it (a base retriever, a chromadb
+    collection) and refuses only when none takes it. langchain-chroma reaches the hooked
+    chromadb `Collection.query` underneath; that inner call records nothing (capture's
+    outermost rule), so one invoke is one event.
     """
 
     source: str = "langchain"
@@ -254,7 +256,11 @@ class LangChainRetrieverCodec:
         query = args.arguments.get("input")
         return query if isinstance(query, str) else None
 
-    def override_top_k(self, instance: Any, top_k: int) -> Restore:
+    def override_top_k(self, args: inspect.BoundArguments, top_k: int) -> Restore | None:
+        instance = args.arguments.get("self")
+        kwargs = args.arguments.get("kwargs")
+        if isinstance(kwargs, dict) and "k" in kwargs:
+            kwargs["k"] = top_k
         search_kwargs = getattr(instance, "search_kwargs", None)
         if isinstance(search_kwargs, Mapping):
             return _override_attr(instance, "search_kwargs", {**search_kwargs, "k": top_k})
@@ -282,14 +288,14 @@ class LangChainRetrieverCodec:
 
 
 @dataclass(frozen=True)
-class LlamaIndexRetrieverCodec:
+class LlamaIndexRetrieverCodec(RetrievalCodec[Any]):
     """llama_index.core BaseRetriever.retrieve(str_or_query_bundle) -> list[NodeWithScore].
 
     The query is a string or a QueryBundle (query_str). Chunk text is the node's content without
     metadata, so it matches what the node holds, not what a prompt template adds. The top_k
     knob is the retriever's `similarity_top_k` (a property on VectorIndexRetriever); a retriever
-    without one refuses a top_k intervention. An injected chunk is a NodeWithScore over a
-    TextNode at score 1.0, the best similarity, so a sort by score keeps it first.
+    without one leaves top_k to a hooked call underneath. An injected chunk is a NodeWithScore
+    over a TextNode at score 1.0, the best similarity, so a sort by score keeps it first.
     """
 
     source: str = "llamaindex"
@@ -302,7 +308,8 @@ class LlamaIndexRetrieverCodec:
         query_str = getattr(query, "query_str", None)
         return query_str if isinstance(query_str, str) else None
 
-    def override_top_k(self, instance: Any, top_k: int) -> Restore:
+    def override_top_k(self, args: inspect.BoundArguments, top_k: int) -> Restore | None:
+        instance = args.arguments.get("self")
         if not isinstance(getattr(instance, "similarity_top_k", None), int):
             raise InterventionNotApplicable(f"llamaindex: top_k={top_k} requested but {type(instance).__name__} has no similarity_top_k")
         return _override_attr(instance, "similarity_top_k", top_k)
