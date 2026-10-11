@@ -494,7 +494,7 @@ globalThis.history = { replaceState() {} };
 globalThis.matchMedia = () => ({ matches: false });
 const realFetch = fetch;
 globalThis.fetch = (path, opts) => realFetch(base + path, opts);
-(0, eval)(script);
+(0, eval)(script + "\nglobalThis.selectTrace = selectTrace;");
 const started = Date.now();
 const text = (n) => (n.children && n.children.length ? n.children.map(text).join("") : n.textContent);
 const find = (n, cls) => (n.className === cls ? [n] : (n.children || []).flatMap((c) => find(c, cls)));
@@ -525,8 +525,9 @@ def _run_page(served: Served, tmp_path: Path, *args: str) -> Any:
     page = resources.files("contexteval").joinpath("ui.html")
     out = subprocess.run(
         [node, str(harness), str(page), served.url, *args],
-        stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60, check=True,
+        stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60,
     )
+    assert out.returncode == 0, out.stderr
     return json.loads(out.stdout)
 
 
