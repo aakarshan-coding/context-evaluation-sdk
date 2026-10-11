@@ -7,6 +7,12 @@ This project follows [Semantic Versioning](https://semver.org/). Each release li
 ### Added
 
 - LangChain and LlamaIndex apps work without changes. contexteval hooks LangChain `BaseRetriever.invoke` and `ainvoke` and LlamaIndex `BaseRetriever.retrieve` and `aretrieve`. Captured chunks, `top_k` experiments (through `search_kwargs["k"]` or `similarity_top_k`, set per call and restored), and diagnosis replays work as for chromadb, and injected evidence arrives as a `Document` or a `NodeWithScore`. New extras `langchain` and `llamaindex`.
+- `contexteval sweep` picks experiment settings from the labels of the latest diagnosed run: larger `top_k` for `missing` chunks that were never retrieved, `rerank=lexical`, a smaller `max_chunks`, or `compress` for `irrelevant`, and `order=ends`, `order=reverse`, or `compress` for `ignored`. It says which labels no setting can fix (`dropped`, `not_context`, `flaky`) and why. It tunes on a seeded split of the cases, confirms the winner on the held-out rest, and ends with one plain recommendation, such as "Set top_k=8. Accuracy 93% -> 99% (holdout 90% -> 100%). Uses 88% more input tokens". `--rounds`, `--max-settings`, `--holdout`, and `--seed` control the search; the cost prompt states the worst case.
+- The dashboard lists sweeps among the experiments, labels each row as tune or holdout, and marks the recommended row.
+
+### Changed
+
+- The project database moves to schema version 2 (experiments carry a kind and a sweep report). A project created by 0.2.0 is upgraded in place the first time any command opens it.
 
 ### Fixed
 
