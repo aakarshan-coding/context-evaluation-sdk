@@ -171,3 +171,31 @@ def test_run_remembers_the_app_only_after_it_loads(project: Path) -> None:
         code = e.code
     assert code not in (0, None)
     assert _cli.load_config(project).app == "contexteval.demo.app:answer"
+
+
+def test_build_tests_keeps_cases_from_passages_before_a_provider_error(project: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    """Review Y9. Defect: build-tests stores cases only after every passage succeeds, so a provider
+    error on the last document throws away the cases the user already paid for."""
+    from contexteval._llm import FakeProvider, ProviderError, Task, _fake_generate
+
+    calls = []
+
+    def generate(req):  # type: ignore[no-untyped-def]
+        calls.append(req)
+        if len(calls) == 2:
+            raise ProviderError("openai: RateLimitError: slow down")
+        return _fake_generate(req)
+
+    monkeypatch.setattr(_cli, "make_provider", lambda name, model: FakeProvider(handlers={Task.GENERATE_CASES: generate}))
+    assert _cli.main(["init", "--provider", "fake"]) == 0
+    docs = project / "docs"
+    docs.mkdir()
+    (docs / "a.md").write_text("The Ridge 2 tent weighs 1.8 kilograms in total.\n", encoding="utf-8")
+    (docs / "b.md").write_text("Its poles are aluminum and the fly is silnylon.\n", encoding="utf-8")
+    assert _cli.main(["build-tests", str(docs), "--per-passage", "1", "--yes"]) == 1
+    assert "1 case from earlier passages is saved" in capsys.readouterr().err
+    store = Store.open(project)
+    try:
+        assert [c.source for c in store.cases()] == [(docs / "a.md").as_posix()]
+    finally:
+        store.close()

@@ -29,7 +29,7 @@ from . import _diagnose, _runner, _testset
 from ._intervention import InterventionNotApplicable, Setting
 from ._llm import Estimate, Provider, ProviderError, make_provider
 from ._store import PROJECT_DIR_NAME, Store, StoredTrace, find_project
-from .types import Diagnosis, ExperimentRow, RunId, explain, label_of
+from .types import Diagnosis, ExperimentRow, RunId, TestCase, explain, label_of
 
 CONFIG_FILE = "config.json"
 PROVIDERS = ("openai", "anthropic", "fake")
@@ -209,11 +209,18 @@ def cmd_build_tests(args: argparse.Namespace) -> int:
             raise UserError(f"no .md or .txt files under {root}")
         provider = _provider(config)
         confirm(_testset.estimate_build(docs, provider, args.per_passage), args.yes)
+        saved = new = 0
+
+        def save(cases: tuple[TestCase, ...]) -> None:
+            nonlocal saved, new
+            new += store.upsert_cases(_testset.SYNTHETIC_TEST_SET, cases)
+            saved += len(cases)
+
         try:
-            report = _testset.build_tests(docs, provider, args.per_passage)
+            report = _testset.build_tests(docs, provider, args.per_passage, on_cases=save)
         except ProviderError as e:
-            raise UserError(str(e)) from None
-        new = store.upsert_cases(_testset.SYNTHETIC_TEST_SET, report.cases)
+            what = "1 case from earlier passages is" if saved == 1 else f"{saved} cases from earlier passages are"
+            raise UserError(f"{e} ({what} saved)") from None
         print(f"built {len(report.cases)} cases ({new} new) from {len(docs)} documents; rejected {len(report.rejected)}")
         for reason in sorted({r.reason for r in report.rejected}):
             count = sum(r.reason == reason for r in report.rejected)

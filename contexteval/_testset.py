@@ -7,6 +7,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass
+from typing import Callable
 from pathlib import Path
 
 from . import _text as text
@@ -80,9 +81,17 @@ def estimate_build(docs: list[Document], provider: Provider, per_passage: int) -
     return estimate(provider.model, prompts, _OUTPUT_TOKENS_PER_CASE * per_passage)
 
 
-def build_tests(docs: list[Document], provider: Provider, per_passage: int = 2) -> BuildReport:
+OnCases = Callable[[tuple[TestCase, ...]], None]
+
+
+def build_tests(
+    docs: list[Document], provider: Provider, per_passage: int = 2, on_cases: OnCases = lambda cases: None
+) -> BuildReport:
     """One GENERATE_CASES request per passage asking for a JSON list of
     {question, answer, evidence}. Each item goes through parse_generated.
+
+    `on_cases` gets each passage's new cases as soon as they are parsed, so a caller that stores
+    them keeps every paid case when a later request raises ProviderError.
     """
     cases: dict[CaseId, TestCase] = {}
     rejected: list[Rejection] = []
@@ -97,12 +106,15 @@ def build_tests(docs: list[Document], provider: Provider, per_passage: int = 2) 
             if not isinstance(items, list):
                 rejected.append(Rejection(doc.path, "reply is not a JSON list"))
                 continue
+            new: list[TestCase] = []
             for item in items:
                 result = parse_generated(item, doc)
                 if isinstance(result, Rejection):
                     rejected.append(result)
-                else:
-                    cases.setdefault(result.id, result)
+                elif result.id not in cases:
+                    cases[result.id] = result
+                    new.append(result)
+            on_cases(tuple(new))
     return BuildReport(cases=tuple(cases.values()), rejected=tuple(rejected))
 
 
@@ -136,7 +148,7 @@ def import_tests(path: Path) -> list[TestCase]:
     the line on any malformed row; nothing is half-imported.
     """
     try:
-        raw = path.read_text(encoding="utf-8")
+        raw = path.read_text(encoding="utf-8-sig")  # Excel writes "CSV UTF-8" with a BOM
     except OSError as e:
         raise ValueError(f"{path}: {e.strerror or e}") from None
     if path.suffix.lower() == ".csv":
