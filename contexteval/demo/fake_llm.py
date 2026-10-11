@@ -29,6 +29,7 @@ from typing import Any, Union
 
 from .. import _text as text
 from ..types import Evidence, never
+from ._lock import file_lock
 
 STATE_FILE_NAME = "demo_fake_state.json"
 
@@ -68,16 +69,20 @@ WRONG = "I don't know."
 
 
 def _bump(state_file: Path, question: str) -> int:
-    """Increment and persist the per-question call counter; returns the new count."""
-    try:
-        counts = json.loads(state_file.read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError):
-        counts = {}
-    counts[question] = counts.get(question, 0) + 1
-    state_file.parent.mkdir(parents=True, exist_ok=True)
-    tmp = state_file.with_suffix(".tmp")
-    tmp.write_text(json.dumps(counts, indent=2), encoding="utf-8")
-    os.replace(tmp, state_file)
+    """Increment and persist the per-question call counter; returns the new count.
+
+    The lock makes the read-modify-write one step across concurrent CLI processes. Without it,
+    updates are lost and os.replace fails on Windows while another process has the file open.
+    """
+    with file_lock(state_file.with_suffix(".lock")):
+        try:
+            counts = json.loads(state_file.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError):
+            counts = {}
+        counts[question] = counts.get(question, 0) + 1
+        tmp = state_file.with_suffix(".tmp")
+        tmp.write_text(json.dumps(counts, indent=2), encoding="utf-8")
+        os.replace(tmp, state_file)
     return counts[question]
 
 

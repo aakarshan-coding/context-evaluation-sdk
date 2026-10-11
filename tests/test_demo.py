@@ -23,7 +23,7 @@ from contexteval._store import Store  # noqa: E402
 from contexteval.demo import app as demo_app  # noqa: E402
 from contexteval.demo import fake_llm, planted  # noqa: E402
 from contexteval.demo.fake_llm import NeedsEvidenceFirst, NeedsNoDistractor  # noqa: E402
-from contexteval.types import Label  # noqa: E402
+from contexteval.types import Crashed, Label  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 K = demo_app.TOP_K
@@ -138,3 +138,60 @@ def test_flaky_counter_persists_across_separate_run_processes(project: Path) -> 
     del outcome[0][flaky.case.question], outcome[1][flaky.case.question]
     assert outcome[0] == outcome[1] == {p.case.question: p.passes_baseline for p in planted.PLANTED if p is not flaky}
 
+
+
+def _spawn(code: str, *args: str, cwd: Path | None = None) -> subprocess.Popen[str]:
+    env = {**os.environ, "PYTHONPATH": str(REPO_ROOT), "CONTEXTEVAL_DEMO_LLM": "fake"}
+    return subprocess.Popen(
+        [sys.executable, "-c", code, *args], cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+    )
+
+
+def test_flaky_counter_survives_concurrent_processes(tmp_path: Path) -> None:
+    """Defect: an unlocked read-modify-write of the state file. Before the lock, 4 processes x
+    200 bumps ended near 700, with PermissionError from os.replace on Windows."""
+    state = tmp_path / "state.json"
+    code = "import sys; from pathlib import Path; from contexteval.demo import fake_llm\nfor _ in range(100): fake_llm._bump(Path(sys.argv[1]), 'q')"
+    procs = [_spawn(code, str(state)) for _ in range(4)]
+    errors = [p.communicate(timeout=240)[1] for p in procs]
+    assert [p.returncode for p in procs] == [0] * 4, errors
+    assert '"q": 400' in state.read_text(encoding="utf-8")
+
+
+def test_demo_collection_opens_concurrently_on_a_fresh_directory(tmp_path: Path) -> None:
+    """Defect: every process sets up and writes the shared chroma directory. Before the fix, 8
+    processes opening a fresh directory at once failed about one round in four with "table
+    collections already exists" or "database is locked"."""
+    code = (
+        "import sys; from contexteval.demo import app\n"
+        "print(len(app._collection_at(sys.argv[1]).query(query_texts=['warranty'], n_results=app.TOP_K)['documents'][0]))"
+    )
+    for round_ in range(2):
+        path = str(tmp_path / f"chroma{round_}")
+        procs = [_spawn(code, path) for _ in range(8)]
+        outs = [p.communicate(timeout=240) for p in procs]
+        assert [(p.returncode, out.strip()) for p, (out, _) in zip(procs, outs)] == [(0, str(K))] * 8, [err[-500:] for _, err in outs]
+
+
+def test_concurrent_run_processes_share_one_project(project: Path) -> None:
+    """Defects: concurrent `contexteval run` processes on one fresh project crash cases on the
+    shared chroma directory or lose a flaky-counter update. Each run must finish with no crash,
+    the counter must count every run, and only one run sees the flaky case's first call."""
+    assert _cli.main(["init", "--provider", "fake"]) == 0
+    jsonl = planted.write_jsonl(project / planted.IMPORT_FILE)
+    assert _cli.main(["build-tests", "--import", str(jsonl)]) == 0
+    code = "from contexteval._cli import main; raise SystemExit(main(['run', 'contexteval.demo.app:answer', '--yes']))"
+    procs = [_spawn(code, cwd=project) for _ in range(3)]
+    outs = [p.communicate(timeout=240) for p in procs]
+    assert [p.returncode for p in procs] == [0] * 3, [err[-500:] for _, err in outs]
+    (flaky,) = [p for p in planted.PLANTED if p.expected is Label.FLAKY]
+    store = Store.open(project)
+    try:
+        runs = [store.traces(r.run.id) for r in store.runs()]
+    finally:
+        store.close()
+    assert len(runs) == 3
+    assert not [s.trace.outcome for run in runs for s in run if isinstance(s.trace.outcome, Crashed)]
+    flaky_passed = sorted(s.trace.test.passed for run in runs for s in run if s.trace.question == flaky.case.question)  # type: ignore[union-attr]
+    assert flaky_passed == [False, True, True]
+    assert f'"{flaky.case.question}": 3' in fake_llm.default_state_file().read_text(encoding="utf-8")
