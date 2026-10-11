@@ -1,0 +1,370 @@
+"""v2 framework plugins: LangChain and LlamaIndex retrievers through the hook table, against real
+langchain-chroma over real chromadb and a real llama-index VectorStoreIndex, both with a
+deterministic embedding. Each docstring names the defect the test catches."""
+
+from __future__ import annotations
+
+import asyncio
+import inspect
+import json
+import sys
+import uuid
+from pathlib import Path
+from typing import Any, Iterator
+
+import pytest
+
+chromadb = pytest.importorskip("chromadb")
+pytest.importorskip("langchain_core")
+pytest.importorskip("langchain_chroma")
+pytest.importorskip("llama_index.core")
+
+from langchain_chroma import Chroma  # noqa: E402
+from langchain_core.callbacks import CallbackManagerForRetrieverRun  # noqa: E402
+from langchain_core.documents import Document  # noqa: E402
+from langchain_core.embeddings import Embeddings  # noqa: E402
+from langchain_core.retrievers import BaseRetriever as LCBaseRetriever  # noqa: E402
+from llama_index.core import VectorStoreIndex  # noqa: E402
+from llama_index.core.base.base_retriever import BaseRetriever as LIBaseRetriever  # noqa: E402
+from llama_index.core.embeddings import BaseEmbedding  # noqa: E402
+from llama_index.core.schema import NodeWithScore, QueryBundle, TextNode  # noqa: E402
+
+from contexteval import _capture as capture  # noqa: E402
+from contexteval import _cli, _hooks, retriever  # noqa: E402
+from contexteval._intervention import InjectEvidence, Intervention, InterventionNotApplicable, KeepFirst, Setting  # noqa: E402
+from contexteval._store import Store  # noqa: E402
+from contexteval.demo.app import HashEmbedding  # noqa: E402
+from contexteval.types import Evidence, Label, Missing, label_of  # noqa: E402
+
+DOCS = {
+    "d1": "The refund window closes thirty days after delivery.",
+    "d2": "Refunds are paid to the original payment method.",
+    "d3": "Shipping takes three to five business days.",
+    "d4": "Our office cat is named Pickles.",
+    "d5": "Gift cards cannot be refunded or exchanged.",
+}
+QUESTION = "When does the refund window close?"
+GOLD = Evidence("Refund requests need the order number.")
+FRAMEWORK_SPECS = tuple(s for s in _hooks.HOOKS if s.library in ("langchain_core", "llama_index"))
+
+
+# --- framework doubles over deterministic embeddings ---------------------------------------
+
+
+class HashEmbeddings(Embeddings):
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        return HashEmbedding()(texts)
+
+    def embed_query(self, text: str) -> list[float]:
+        return HashEmbedding()([text])[0]
+
+
+class HashEmbedModel(BaseEmbedding):
+    def _get_query_embedding(self, query: str) -> list[float]:
+        return HashEmbedding()([query])[0]
+
+    async def _aget_query_embedding(self, query: str) -> list[float]:
+        return self._get_query_embedding(query)
+
+    def _get_text_embedding(self, text: str) -> list[float]:
+        return HashEmbedding()([text])[0]
+
+
+@pytest.fixture
+def lc_retriever() -> Any:
+    """A langchain-chroma VectorStoreRetriever (k=2) over a real chromadb collection."""
+    client = chromadb.EphemeralClient(settings=chromadb.Settings(anonymized_telemetry=False))
+    store = Chroma(client=client, collection_name=f"lc_{uuid.uuid4().hex}", embedding_function=HashEmbeddings())
+    store.add_texts(list(DOCS.values()), ids=list(DOCS), metadatas=[{"src": k} for k in DOCS])
+    return store.as_retriever(search_kwargs={"k": 2})
+
+
+@pytest.fixture
+def li_retriever() -> Any:
+    """A llama-index VectorIndexRetriever (similarity_top_k=2) over an in-memory index."""
+    nodes = [TextNode(text=t, id_=k) for k, t in DOCS.items()]
+    return VectorStoreIndex(nodes=nodes, embed_model=HashEmbedModel()).as_retriever(similarity_top_k=2)
+
+
+class FixedLC(LCBaseRetriever):
+    """A LangChain retriever with no top_k knob of any kind."""
+
+    def _get_relevant_documents(self, query: str, *, run_manager: CallbackManagerForRetrieverRun) -> list[Document]:
+        return [Document(page_content=DOCS["d1"], id="d1")]
+
+
+class BoomLC(LCBaseRetriever):
+    search_kwargs: dict[str, Any] = {"k": 1}
+
+    def _get_relevant_documents(self, query: str, *, run_manager: CallbackManagerForRetrieverRun) -> list[Document]:
+        raise ValueError("index is down")
+
+
+class FixedLI(LIBaseRetriever):
+    def _retrieve(self, query_bundle: QueryBundle) -> list[NodeWithScore]:
+        return [NodeWithScore(node=TextNode(text=DOCS["d1"], id_="d1"), score=0.5)]
+
+
+# --- capture ------------------------------------------------------------------------------
+
+
+def test_langchain_retriever_is_captured_with_chunks_and_query(hooks: None, lc_retriever: Any) -> None:
+    """Defect: a LangChain app records no retrieval (only the SDK call), so every failure reads as
+    not_retrieved; or the event's query is the RunnableConfig instead of the input string."""
+    with capture.active_run(QUESTION) as run:
+        docs = lc_retriever.invoke(QUESTION)
+    assert [type(d) for d in docs] == [Document, Document]
+    (ev,) = run.retrievals
+    assert ev.source == "langchain" and ev.query == QUESTION and ev.params == {"input": QUESTION}
+    assert [c.text for c in ev.retrieved] == [d.page_content for d in docs]
+    assert [c.id for c in ev.retrieved] == [d.id for d in docs] == ["d1", "d2"]
+    assert [c.source_index for c in ev.retrieved] == [0, 1] and ev.delivered == ev.retrieved
+
+
+def test_llamaindex_retriever_is_captured_with_chunks_query_and_scores(hooks: None, li_retriever: Any) -> None:
+    """Defect: a LlamaIndex app records no retrieval; or a QueryBundle query is recorded as its
+    repr instead of its query_str; or node scores are dropped."""
+    with capture.active_run(QUESTION) as run:
+        nodes = li_retriever.retrieve(QUESTION)
+        li_retriever.retrieve(QueryBundle(query_str="second question"))
+    first, second = run.retrievals
+    assert first.source == "llamaindex" and first.query == QUESTION and first.params == {"str_or_query_bundle": QUESTION}
+    assert [c.text for c in first.retrieved] == [n.node.get_content() for n in nodes]
+    assert [c.id for c in first.retrieved] == ["d1", "d2"]
+    assert [c.score for c in first.retrieved] == [pytest.approx(n.score) for n in nodes]
+    assert second.query == "second question"
+
+
+# --- top_k override reaches the framework's own knob ----------------------------------------
+
+
+def test_top_k_override_reaches_search_kwargs_and_is_restored(hooks: None, lc_retriever: Any) -> None:
+    """Defect: the override is recorded but never reaches `search_kwargs["k"]`, so the user still
+    gets 2 documents; or the retriever is left with k=4 after the call (the user's own dict
+    mutated), so the next baseline question silently runs with the experiment's k."""
+    users_kwargs = lc_retriever.search_kwargs
+    with capture.active_run(QUESTION, Intervention(top_k=4)) as run:
+        docs = lc_retriever.invoke(QUESTION)
+    assert len(docs) == 4
+    (ev,) = run.retrievals
+    assert ev.params == {"input": QUESTION, "k": 4} and len(ev.retrieved) == 4
+    assert lc_retriever.search_kwargs is users_kwargs and users_kwargs == {"k": 2}
+    with capture.active_run(QUESTION) as run:
+        assert len(lc_retriever.invoke(QUESTION)) == 2
+
+
+def test_top_k_override_reaches_similarity_top_k_and_is_restored(hooks: None, li_retriever: Any) -> None:
+    """Defect: the override does not reach `similarity_top_k`, or leaves it at the experiment's
+    value after the call."""
+    with capture.active_run(QUESTION, Intervention(top_k=4)) as run:
+        nodes = li_retriever.retrieve(QUESTION)
+    assert len(nodes) == 4 and li_retriever.similarity_top_k == 2
+    assert run.retrievals[0].params == {"str_or_query_bundle": QUESTION, "similarity_top_k": 4}
+    assert len(asyncio.run(li_retriever.aretrieve(QUESTION))) == 2
+
+
+def test_knob_is_restored_when_the_retriever_raises(hooks: None) -> None:
+    """Defect: the override is restored only on the success path, so a retriever that raises
+    under an experiment keeps the experiment's k for the rest of the process."""
+    boom = BoomLC()
+    with capture.active_run(QUESTION, Intervention(top_k=5)):
+        with pytest.raises(ValueError, match="index is down"):
+            boom.invoke(QUESTION)
+    assert boom.search_kwargs == {"k": 1}
+    assert _hooks._knobs == {}
+
+
+def test_retriever_without_a_top_k_knob_refuses_a_top_k_intervention(hooks: None) -> None:
+    """Graft 3. Defect: a top_k experiment on a framework retriever with no knob silently runs the
+    baseline and the experiment table shows a fake no-change row."""
+    with capture.active_run(QUESTION, Intervention(top_k=5)) as run:
+        with pytest.raises(InterventionNotApplicable, match="langchain: top_k=5 .* no search_kwargs or k"):
+            FixedLC().invoke(QUESTION)
+        with pytest.raises(InterventionNotApplicable, match="llamaindex: top_k=5 .* no similarity_top_k"):
+            FixedLI().retrieve(QUESTION)
+    assert run.not_applicable is not None
+    with capture.active_run(QUESTION) as run:
+        assert FixedLC().invoke(QUESTION)[0].page_content == DOCS["d1"]
+        assert FixedLI().retrieve(QUESTION)[0].node.get_content() == DOCS["d1"]
+    assert [e.source for e in run.retrievals] == ["langchain", "llamaindex"]
+
+
+def test_concurrent_overrides_on_one_retriever_restore_the_users_value(hooks: None, lc_retriever: Any) -> None:
+    """Defect: two concurrent retrievals on one retriever each save the value they see, so the
+    second saves the first's override and restores it last; the user's retriever ends up with
+    the experiment's k for good. Under one run both calls want the same value, and the last
+    one out must restore the value the user set."""
+    users_kwargs = lc_retriever.search_kwargs
+
+    async def main() -> list[list[Document]]:
+        return await asyncio.gather(lc_retriever.ainvoke(QUESTION), lc_retriever.ainvoke("How are refunds paid?"))
+
+    with capture.active_run(QUESTION, Intervention(top_k=3)) as run:
+        results = asyncio.run(main())
+    assert [len(docs) for docs in results] == [3, 3]
+    assert len(run.retrievals) == 2 and all(len(e.retrieved) == 3 for e in run.retrievals)
+    assert lc_retriever.search_kwargs is users_kwargs and users_kwargs == {"k": 2}
+    assert _hooks._knobs == {}
+
+
+# --- transforms return the framework's own types --------------------------------------------
+
+
+def test_keep_first_and_inject_return_langchain_documents(hooks: None, lc_retriever: Any) -> None:
+    """Defect: the intervention is recorded in `delivered` but the app still gets the untouched
+    list; or the injected chunk comes back as a Chunk or dict and `doc.page_content` raises."""
+    with capture.active_run(QUESTION, Intervention(transforms=(KeepFirst(1), InjectEvidence(GOLD)))) as run:
+        docs = lc_retriever.invoke(QUESTION)
+    (ev,) = run.retrievals
+    assert len(ev.retrieved) == 2 and [c.text for c in ev.delivered] == [GOLD.text, DOCS["d1"]]
+    assert [type(d) for d in docs] == [Document, Document]
+    assert (docs[0].page_content, docs[0].id, docs[0].metadata) == (GOLD.text, "contexteval:evidence", {})
+    assert (docs[1].page_content, docs[1].id, docs[1].metadata) == (DOCS["d1"], "d1", {"src": "d1"})
+
+
+def test_keep_first_and_inject_return_llamaindex_nodes_with_score(hooks: None, li_retriever: Any) -> None:
+    """Defect: the injected chunk is not a NodeWithScore over a TextNode, so `n.node.get_content()`
+    or `n.score` fails in the user's prompt builder; or the kept node is rebuilt instead of the
+    retriever's own object."""
+    with capture.active_run(QUESTION, Intervention(transforms=(KeepFirst(1), InjectEvidence(GOLD)))) as run:
+        nodes = li_retriever.retrieve(QUESTION)
+    (ev,) = run.retrievals
+    assert len(ev.retrieved) == 2 and [c.text for c in ev.delivered] == [GOLD.text, DOCS["d1"]]
+    assert [type(n) for n in nodes] == [NodeWithScore, NodeWithScore] and isinstance(nodes[0].node, TextNode)
+    assert (nodes[0].node.get_content(), nodes[0].node.node_id, nodes[0].score) == (GOLD.text, "contexteval:evidence", 1.0)
+    assert nodes[1].node.node_id == "d1" and nodes[1].node.get_content() == DOCS["d1"]
+
+
+# --- no double counting -------------------------------------------------------------------
+
+
+def _assert_one_event_once_applied(run: capture.ActiveRun, docs: list[Document]) -> None:
+    (ev,) = run.retrievals
+    assert ev.source == "langchain"
+    assert len(ev.retrieved) == 2, "the inner chromadb call must run with the overridden k and record nothing itself"
+    assert [c.text for c in ev.delivered] == [GOLD.text, DOCS["d1"]]
+    assert [d.page_content for d in docs] == [GOLD.text, DOCS["d1"]]
+
+
+def test_langchain_over_chroma_records_one_event_and_applies_the_intervention_once(hooks: None, lc_retriever: Any) -> None:
+    """Defect: langchain-chroma calls the hooked `Collection.query`, so one user retrieval records
+    two events (langchain and chromadb) and the intervention runs twice: the inner KeepFirst(1)
+    leaves one chunk for the outer one, and InjectEvidence puts the gold in twice. The
+    outermost hooked retrieval owns the event; inner hooked calls pass through."""
+    iv = Intervention(top_k=2, transforms=(KeepFirst(1), InjectEvidence(GOLD)))
+    with capture.active_run(QUESTION, iv) as run:
+        docs = lc_retriever.invoke(QUESTION)
+    _assert_one_event_once_applied(run, docs)
+
+
+def test_langchain_over_chroma_records_one_event_async(hooks: None, lc_retriever: Any) -> None:
+    """Same defect for `ainvoke`: langchain runs the sync chroma query on an executor thread, so
+    the pass-through must travel with the task's context, not sit on the calling thread."""
+    iv = Intervention(top_k=2, transforms=(KeepFirst(1), InjectEvidence(GOLD)))
+    with capture.active_run(QUESTION, iv) as run:
+        docs = asyncio.run(lc_retriever.ainvoke(QUESTION))
+    _assert_one_event_once_applied(run, docs)
+
+
+def test_decorated_search_over_a_hooked_store_records_only_the_outer_event(hooks: None) -> None:
+    """The same rule for the decorator: a user function marked @retriever that queries chromadb
+    inside used to record two events for one search. Outside the function the store records
+    itself as before."""
+    client = chromadb.EphemeralClient(settings=chromadb.Settings(anonymized_telemetry=False))
+    col = client.create_collection(f"docs_{uuid.uuid4().hex}", embedding_function=HashEmbedding())
+    col.add(ids=list(DOCS), documents=list(DOCS.values()))
+
+    @retriever
+    def search(query: str, top_k: int = 2) -> list[str]:
+        return list(col.query(query_texts=[query], n_results=top_k)["documents"][0])
+
+    with capture.active_run(QUESTION, Intervention(top_k=3)) as run:
+        hits = search(QUESTION)
+        col.query(query_texts=[QUESTION], n_results=1)
+    assert len(hits) == 3
+    assert [(e.source, len(e.retrieved)) for e in run.retrievals] == [("retriever:search", 3), ("chromadb", 3)]
+
+
+# --- install ------------------------------------------------------------------------------
+
+
+def test_framework_hooks_install_once_and_uninstall_restores() -> None:
+    """Defect: a second install wraps the wrapper, or uninstall leaves the retriever classes
+    patched for the next test; the async wrappers must still be coroutine functions."""
+    owners = {LCBaseRetriever: ("invoke", "ainvoke"), LIBaseRetriever: ("retrieve", "aretrieve")}
+    originals = {(o, n): o.__dict__[n] for o, names in owners.items() for n in names}
+    try:
+        first = _hooks.install("cli")
+        assert first.statuses["langchain_core"] == "installed" and first.statuses["llama_index"] == "installed"
+        for (owner, name), original in originals.items():
+            wrapper = owner.__dict__[name]
+            assert wrapper is not original and wrapper.__contexteval_original__ is original
+            assert inspect.iscoroutinefunction(wrapper) == name.startswith("a")
+        second = _hooks.install("cli")
+        assert second.statuses["langchain_core"] == "already" and second.statuses["llama_index"] == "already"
+    finally:
+        _hooks.uninstall_all()
+        capture.reset_process()
+    for (owner, name), original in originals.items():
+        assert owner.__dict__[name] is original
+
+
+def test_not_installed_when_a_framework_is_absent(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Defect: a missing optional framework raises ImportError out of install() or is reported as
+    incompatible or failed; the other libraries must still install."""
+    for name in ("langchain_core", "langchain_core.retrievers", "llama_index", "llama_index.core", "llama_index.core.base.base_retriever"):
+        monkeypatch.setitem(sys.modules, name, None)
+    try:
+        report = _hooks.install("cli")
+    finally:
+        _hooks.uninstall_all()
+        capture.reset_process()
+    assert report.statuses["langchain_core"] == "not_installed" and report.statuses["llama_index"] == "not_installed"
+    assert report.statuses["chromadb"] == "installed" and report.error is None
+
+
+# --- end to end through the CLI --------------------------------------------------------------
+
+
+def test_langchain_rag_app_is_run_and_diagnosed_through_the_cli(project: Path, hooks: None, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    """DoD for the plugin: `contexteval run my_app:answer` on an unchanged LangChain app (chroma
+    retriever plus a chat model over the openai SDK) captures, diagnoses, and experiments like a
+    raw chromadb app. Defects: the planted missing case labeled anything but missing /
+    not_retrieved / confirmed (the inject replay must hand the app a Document), or the top_k=5
+    experiment not retrieving the gold (the override must reach search_kwargs through the CLI)."""
+    monkeypatch.syspath_prepend(str(Path(__file__).parent))
+    import lc_rag_app
+
+    tests = project / "cases.jsonl"
+    tests.write_text("".join(json.dumps(c) + "\n" for c in lc_rag_app.CASES), encoding="utf-8")
+    assert _cli.main(["init", "--provider", "fake"]) == 0
+    assert _cli.main(["build-tests", "--import", str(tests)]) == 0
+    assert _cli.main(["run", "lc_rag_app:answer", "--yes"]) == 0
+    assert "2 cases, 1 passed, 1 failed, 0 crashed" in capsys.readouterr().out
+
+    assert _cli.main(["diagnose", "--yes"]) == 0
+    out = capsys.readouterr().out
+    assert f"missing      {lc_rag_app.MISSING_QUESTION}" in out
+    assert "the gold chunk was never retrieved; injecting the evidence fixed it (2/2)" in out
+
+    assert _cli.main(["experiment", "top_k=5", "--yes"]) == 0
+    capsys.readouterr()
+
+    store = Store.open(project)
+    try:
+        baseline = store.latest_run("baseline")
+        assert baseline is not None
+        traces = {s.trace.question: s for s in store.traces(baseline.id)}
+        missing = traces[lc_rag_app.MISSING_QUESTION]
+        assert isinstance(missing.diagnosis, Missing) and label_of(missing.diagnosis) is Label.MISSING
+        assert (missing.diagnosis.cause, missing.diagnosis.confirmed) == ("not_retrieved", True)
+        (ev,) = missing.trace.retrievals
+        assert ev.source == "langchain" and len(ev.retrieved) == lc_rag_app.TOP_K
+        assert missing.trace.llm_calls[0].provider == "openai" and missing.trace.outcome.text == lc_rag_app.DONT_KNOW  # type: ignore[union-attr]
+        (experiment,) = [r for r in store.runs() if r.run.setting == Setting(top_k=5)]
+        assert (experiment.passed, experiment.failed) == (2, 0)
+        for s in store.traces(experiment.run.id):
+            assert s.trace.retrievals[0].params["k"] == 5 and len(s.trace.retrievals[0].retrieved) == 5
+    finally:
+        store.close()
+    assert lc_rag_app.retriever.search_kwargs == {"k": lc_rag_app.TOP_K}

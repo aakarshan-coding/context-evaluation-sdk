@@ -13,6 +13,10 @@ Who sees what:
   store as one ungraded Trace.
 - No active run, mode == CLI or OFF: hooks pass through and record nothing.
 - Inside suppressed() (the SDK's own provider calls): hooks pass through and record nothing.
+- Inside another hooked retrieval in the same context (a LangChain retriever over a hooked
+  chromadb collection, a @retriever function that queries one): the inner call passes through.
+  The outermost hooked retrieval owns the event and the intervention, so one user-level
+  retrieval is one RetrievalEvent and the intervention applies once.
 
 Error policy at the hook (architecture graft 3): recording errors are swallowed and logged
 once; intervention errors propagate as InterventionNotApplicable; the user's retrieval runs
@@ -31,7 +35,7 @@ import queue
 import threading
 from collections import deque
 from contextlib import contextmanager
-from contextvars import ContextVar
+from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -131,6 +135,10 @@ def _refuse(run: ActiveRun | _Ambient, error: InterventionNotApplicable) -> Inte
 _active: ContextVar[ActiveRun | None] = ContextVar("contexteval_active", default=None)
 _ambient: ContextVar[_Ambient | None] = ContextVar("contexteval_ambient", default=None)
 _suppressed: ContextVar[bool] = ContextVar("contexteval_suppressed", default=False)
+# True while a hooked retrieval is in progress in this context. A hooked store it calls
+# underneath passes through, so the outermost retrieval owns the event. A ContextVar, so an
+# asyncio task's inner calls see its own flag, and langchain's executor hand-off copies it.
+_retrieving: ContextVar[bool] = ContextVar("contexteval_retrieving", default=False)
 
 
 @contextmanager
@@ -259,6 +267,7 @@ def reset_process() -> None:
     _process.pinecone_text_key = "text"
     _process.logged.clear()
     _ambient.set(None)
+    _retrieving.set(False)
 
 
 WRITER_QUEUE_MAX = 256  # closed buffers waiting for the writer; beyond this they are dropped and counted
@@ -431,6 +440,20 @@ class RetrievalCodec(Protocol[R]):
         ...
 
 
+Restore = Callable[[], None]
+
+
+@runtime_checkable
+class InstanceTopK(Protocol):
+    """A RetrievalCodec whose top_k knob is state on the retriever object (a framework retriever's
+    `search_kwargs` or `similarity_top_k`), not an argument of the hooked call. `top_k_param`
+    then names the knob in the event's params. override_top_k sets the knob for one call and
+    returns what puts the user's value back; it raises InterventionNotApplicable when this
+    instance has no such knob."""
+
+    def override_top_k(self, instance: Any, top_k: int) -> Restore: ...
+
+
 @runtime_checkable
 class LLMAdapter(Protocol):
     provider: Literal["openai", "anthropic"]
@@ -473,7 +496,20 @@ class _PendingRetrieval:
     codec: RetrievalCodec[Any]
     run: ActiveRun | _Ambient
     args: inspect.BoundArguments
+    params: dict[str, Any]  # the event's snapshot after the override; an instance knob is added by name, as it is not a call argument
+    token: Token[bool]  # the _retrieving flag this call set; release() resets it
+    restore: Restore | None  # puts an instance knob back; None for an argument knob
     t0: float
+
+    def release(self) -> None:
+        """Runs once the library call returned or raised, before finish: inner hooked calls record
+        again, and the retriever's own knob holds the user's value before anything else reads it."""
+        _retrieving.reset(self.token)
+        if self.restore is not None:
+            try:
+                self.restore()
+            except Exception as e:
+                _log_once(f"restore:{self.codec.source}", f"contexteval could not restore the {self.codec.source} top_k knob", e)
 
     def finish(self, raw: R) -> R:
         latency_ms = (perf_counter() - self.t0) * 1000
@@ -509,7 +545,7 @@ class _PendingRetrieval:
                 RetrievalEvent(
                     source=codec.source,
                     query=query,
-                    params=_snapshot(args),
+                    params=self.params,
                     retrieved=retrieved,
                     delivered=delivered,
                     latency_ms=latency_ms,
@@ -520,32 +556,58 @@ class _PendingRetrieval:
         return out
 
 
+def _override_top_k(codec: RetrievalCodec[Any], run: ActiveRun | _Ambient, args: inspect.BoundArguments, top_k: int) -> Restore | None:
+    """Put the run's top_k where this site reads it: into the call's arguments, or onto the
+    retriever instance for an InstanceTopK codec, which returns the restore for release()."""
+    if codec.top_k_param is None:
+        raise _refuse(run, InterventionNotApplicable(f"{codec.source}: top_k={top_k} requested but this site has no top_k parameter"))
+    if not isinstance(codec, InstanceTopK):
+        args.arguments[codec.top_k_param] = top_k
+        return None
+    try:
+        return codec.override_top_k(args.arguments.get("self"), top_k)
+    except InterventionNotApplicable as e:
+        raise _refuse(run, e)
+    except Exception as e:
+        raise _refuse(run, InterventionNotApplicable(f"{codec.source}: cannot set top_k={top_k} on this retriever")) from e
+
+
 def _begin_retrieval(codec: RetrievalCodec[Any], args: inspect.BoundArguments) -> _PendingRetrieval | None:
-    if _suppressed.get():
+    if _suppressed.get() or _retrieving.get():
         return None
     run = _current_run()
     if run is None:
         return None
     iv = run.intervention
-    if iv.top_k is not None:
-        if codec.top_k_param is None:
-            raise _refuse(run, InterventionNotApplicable(f"{codec.source}: top_k={iv.top_k} requested but this site has no top_k parameter"))
-        args.arguments[codec.top_k_param] = iv.top_k
-    return _PendingRetrieval(codec, run, args, perf_counter())
+    restore = _override_top_k(codec, run, args, iv.top_k) if iv.top_k is not None else None
+    params = _snapshot(args)
+    if restore is not None:
+        params[codec.top_k_param] = iv.top_k  # type: ignore[index]
+    return _PendingRetrieval(codec, run, args, params, _retrieving.set(True), restore, perf_counter())
 
 
 def intercept_retrieval(codec: RetrievalCodec[R], call: Callable[[inspect.BoundArguments], R], args: inspect.BoundArguments) -> R:
     """Shared body of every sync retrieval hook and the @retriever decorator."""
     pending = _begin_retrieval(codec, args)
-    raw = call(args)
-    return raw if pending is None else pending.finish(raw)
+    if pending is None:
+        return call(args)
+    try:
+        raw = call(args)
+    finally:
+        pending.release()
+    return pending.finish(raw)
 
 
 async def intercept_retrieval_async(codec: RetrievalCodec[R], call: Callable[[inspect.BoundArguments], Awaitable[R]], args: inspect.BoundArguments) -> R:
     """The same intercept for a coroutine target: the call is awaited, nothing else differs."""
     pending = _begin_retrieval(codec, args)
-    raw = await call(args)
-    return raw if pending is None else pending.finish(raw)
+    if pending is None:
+        return await call(args)
+    try:
+        raw = await call(args)
+    finally:
+        pending.release()
+    return pending.finish(raw)
 
 
 @dataclass

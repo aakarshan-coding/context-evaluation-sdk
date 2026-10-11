@@ -1,4 +1,6 @@
-"""Third-party library knowledge. One HookSpec row per patched method; HOOKS is the only list.
+"""Third-party library knowledge. One HookSpec row per patched method; HOOKS is the only list:
+chromadb and pinecone stores, OpenAI and Anthropic clients, and the LangChain and LlamaIndex
+retriever base classes.
 
 Patching is class-level (`Owner.method = wrapper`), so instances created before or after
 init() are both captured. capture.wrap_call builds each wrapper: it binds the call with
@@ -20,12 +22,13 @@ import copy
 import importlib
 import importlib.util
 import inspect
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Literal, Mapping, Union
 
 from . import _capture as capture
-from ._capture import InstallReport, LLMAdapter, Mode, RetrievalCodec
+from ._capture import InstallReport, LLMAdapter, Mode, Restore, RetrievalCodec
 from ._intervention import InterventionNotApplicable
 from ._store import Store, find_project
 from .types import Chunk
@@ -194,6 +197,140 @@ class PineconeCodec:
         return out
 
 
+# --- framework retrievers (LangChain, LlamaIndex) ----------------------------
+#
+# A framework retriever's top_k is state on the retriever object, so these codecs implement
+# capture.InstanceTopK: the knob is set for one call and put back when the call returns.
+# Their LLM wrappers (ChatOpenAI, llama_index OpenAI, ...) call the official SDKs, which the
+# adapters below already hook, so no LLM rows are needed for them.
+
+_knob_lock = threading.Lock()
+# (id(instance), attribute) -> (the user's value, calls currently overriding it)
+_knobs: dict[tuple[int, str], tuple[Any, int]] = {}
+
+
+def _override_attr(instance: Any, attr: str, value: Any) -> Restore:
+    """Set `instance.attr` for one call and return what puts the user's value back.
+
+    Calls that overlap on one instance (an app that gathers two retrievals for one question)
+    all want the same value, because one run has one intervention: the first one in saves the
+    user's value and the last one out restores it, so no call restores another call's override.
+    Two runs wanting different values on one shared instance are not supported; the runner
+    executes one question at a time (plan item 7)."""
+    key = (id(instance), attr)
+    with _knob_lock:
+        saved, depth = _knobs.get(key, (getattr(instance, attr), 0))
+        _knobs[key] = (saved, depth + 1)
+        setattr(instance, attr, value)
+
+    def restore() -> None:
+        with _knob_lock:
+            saved, depth = _knobs[key]
+            if depth > 1:
+                _knobs[key] = (saved, depth - 1)
+            else:
+                del _knobs[key]
+                setattr(instance, attr, saved)
+
+    return restore
+
+
+@dataclass(frozen=True)
+class LangChainRetrieverCodec:
+    """langchain_core BaseRetriever.invoke(input, config=None, **kwargs) -> list[Document].
+
+    Documents carry page_content, metadata, and an optional id; no score. The top_k knob is
+    the retriever's own: `search_kwargs["k"]` on a VectorStoreRetriever (the dict is replaced
+    for the call, never edited in place) or an int `k` field. A retriever with neither refuses
+    a top_k intervention. langchain-chroma reaches the hooked chromadb `Collection.query`
+    underneath; that inner call passes through (capture's outermost rule), so one invoke is
+    one event.
+    """
+
+    source: str = "langchain"
+    top_k_param: str | None = "k"
+
+    def query_text(self, args: inspect.BoundArguments) -> str | None:
+        query = args.arguments.get("input")
+        return query if isinstance(query, str) else None
+
+    def override_top_k(self, instance: Any, top_k: int) -> Restore:
+        search_kwargs = getattr(instance, "search_kwargs", None)
+        if isinstance(search_kwargs, Mapping):
+            return _override_attr(instance, "search_kwargs", {**search_kwargs, "k": top_k})
+        if isinstance(getattr(instance, "k", None), int):
+            return _override_attr(instance, "k", top_k)
+        raise InterventionNotApplicable(f"langchain: top_k={top_k} requested but {type(instance).__name__} has no search_kwargs or k")
+
+    def decode(self, result: Any) -> tuple[Chunk, ...]:
+        return tuple(
+            Chunk(text=str(doc.page_content), id=str(doc.id) if doc.id is not None else None, score=None, source_index=i)
+            for i, doc in enumerate(result)
+        )
+
+    def encode(self, result: Any, chunks: tuple[Chunk, ...]) -> Any:
+        from langchain_core.documents import Document  # the hook fired, so the framework is importable
+
+        out = []
+        for c in chunks:
+            if c.source_index is None:
+                out.append(Document(page_content=c.text, metadata={}, id=c.id or INJECTED_ID))
+                continue
+            doc = result[c.source_index]
+            out.append(doc if doc.page_content == c.text else doc.model_copy(update={"page_content": c.text}))
+        return out
+
+
+@dataclass(frozen=True)
+class LlamaIndexRetrieverCodec:
+    """llama_index.core BaseRetriever.retrieve(str_or_query_bundle) -> list[NodeWithScore].
+
+    The query is a string or a QueryBundle (query_str). Chunk text is the node's content without
+    metadata, so it matches what the node holds, not what a prompt template adds. The top_k
+    knob is the retriever's `similarity_top_k` (a property on VectorIndexRetriever); a retriever
+    without one refuses a top_k intervention. An injected chunk is a NodeWithScore over a
+    TextNode at score 1.0, the best similarity, so a sort by score keeps it first.
+    """
+
+    source: str = "llamaindex"
+    top_k_param: str | None = "similarity_top_k"
+
+    def query_text(self, args: inspect.BoundArguments) -> str | None:
+        query = args.arguments.get("str_or_query_bundle")
+        if isinstance(query, str):
+            return query
+        query_str = getattr(query, "query_str", None)
+        return query_str if isinstance(query_str, str) else None
+
+    def override_top_k(self, instance: Any, top_k: int) -> Restore:
+        if not isinstance(getattr(instance, "similarity_top_k", None), int):
+            raise InterventionNotApplicable(f"llamaindex: top_k={top_k} requested but {type(instance).__name__} has no similarity_top_k")
+        return _override_attr(instance, "similarity_top_k", top_k)
+
+    def decode(self, result: Any) -> tuple[Chunk, ...]:
+        return tuple(
+            Chunk(text=str(scored.node.get_content()), id=str(scored.node.node_id), score=float(scored.score) if scored.score is not None else None, source_index=i)
+            for i, scored in enumerate(result)
+        )
+
+    def encode(self, result: Any, chunks: tuple[Chunk, ...]) -> Any:
+        from llama_index.core.schema import NodeWithScore, TextNode
+
+        out = []
+        for c in chunks:
+            if c.source_index is None:
+                out.append(NodeWithScore(node=TextNode(text=c.text, id_=c.id or INJECTED_ID), score=1.0))
+                continue
+            scored = result[c.source_index]
+            if scored.node.get_content() == c.text:
+                out.append(scored)
+                continue
+            node = scored.node
+            rewritten = node.model_copy(update={"text": c.text}) if hasattr(node, "text") else TextNode(text=c.text, id_=node.node_id, metadata=dict(node.metadata))
+            out.append(NodeWithScore(node=rewritten, score=scored.score))
+        return out
+
+
 # --- LLM adapters -----------------------------------------------------------
 
 
@@ -329,6 +466,10 @@ HOOKS: tuple[HookSpec, ...] = (
     HookSpec("openai", ("openai.resources.responses:AsyncResponses.create",), OpenAIResponsesAdapter()),
     HookSpec("anthropic", ("anthropic.resources.messages:Messages.create",), AnthropicMessagesAdapter()),
     HookSpec("anthropic", ("anthropic.resources.messages:AsyncMessages.create",), AnthropicMessagesAdapter()),
+    HookSpec("langchain_core", ("langchain_core.retrievers:BaseRetriever.invoke",), LangChainRetrieverCodec()),
+    HookSpec("langchain_core", ("langchain_core.retrievers:BaseRetriever.ainvoke",), LangChainRetrieverCodec()),
+    HookSpec("llama_index", ("llama_index.core.base.base_retriever:BaseRetriever.retrieve",), LlamaIndexRetrieverCodec()),
+    HookSpec("llama_index", ("llama_index.core.base.base_retriever:BaseRetriever.aretrieve",), LlamaIndexRetrieverCodec()),
 )
 
 # Worse statuses win when a library has several specs.
