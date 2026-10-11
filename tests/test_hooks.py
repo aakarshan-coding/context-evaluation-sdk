@@ -175,7 +175,7 @@ def test_p1_acceptance_stored_trace_has_retrieval_llm_and_in_prompt(chroma: Any,
     assert stored.in_prompt == ((0, 0), (0, 1))
     assert stored.outcome == Answered(ANSWER) and stored.test is None
     assert (stored.metrics.input_tokens, stored.metrics.output_tokens) == (42, 7)
-    assert stored.metrics.cost_usd is None  # gpt-4o-mini is not in the price table yet
+    assert stored.metrics.cost_usd == pytest.approx((42 * 0.15 + 7 * 0.60) / 1_000_000)  # gpt-4o-mini rates
 
 
 # --- interventions through the chromadb hook -----------------------------------
