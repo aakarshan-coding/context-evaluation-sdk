@@ -7,6 +7,7 @@ import json
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import urllib.error
 import urllib.request
@@ -323,6 +324,40 @@ def test_experiments_endpoint_marks_a_sweeps_recommended_row_and_its_splits(serv
     ]
     listed = _json(served.url + "/api/experiments")["experiments"]
     assert [(e["id"], e["kind"]) for e in listed] == [(sweep, "sweep"), (served.seed.experiment, "manual")]
+
+
+def test_experiments_endpoint_survives_a_bad_or_missing_sweep_report(served: Served) -> None:
+    """Review Q8. Defect: one sweep whose stored report does not parse (written by another build,
+    or cut short) makes /api/experiments a 500, so the page shows no experiment at all. Each
+    experiment renders on its own; a sweep with an unreadable or missing report shows its rows
+    and no recommendation, and says the report could not be read."""
+    store = Store.open(Path.cwd())
+    try:
+        garbled = store.new_experiment("sweep")
+        store.add_trace(store.new_run("experiment", "app:answer", BASELINE, experiment=garbled), _trace(REFUND, False, "a", (OTHER,), ((0, 0),)))
+        store.save_experiment_report(garbled, {"recommended": 1, "rounds": "not a list"})
+        unfinished = store.new_experiment("sweep")
+        store.add_trace(store.new_run("experiment", "app:answer", BASELINE, experiment=unfinished), _trace(REFUND, True, "a", (OTHER,), ((0, 0),)))
+    finally:
+        store.close()
+    listed = {e["id"]: e for e in _json(served.url + "/api/experiments")["experiments"]}
+    assert set(listed) == {garbled, unfinished, served.seed.experiment}
+    assert listed[garbled]["recommendation"] is None and listed[garbled]["report_error"]
+    assert [(r["setting"], r["passed"], r["split"], r["recommended"]) for r in listed[garbled]["rows"]] == [("baseline", 0, None, False)]
+    assert listed[unfinished]["recommendation"] is None and listed[unfinished]["report_error"] is None
+    assert [(r["setting"], r["passed"]) for r in listed[unfinished]["rows"]] == [("baseline", 1)]
+    assert [r["setting"] for r in listed[served.seed.experiment]["rows"]] == ["baseline", "top_k=10"]
+    assert _json(f"{served.url}/api/experiments/{garbled}")["report_error"] == listed[garbled]["report_error"]
+
+
+def test_ui_does_not_import_the_runner() -> None:
+    """Review Q8. Defect: importing the dashboard imports the sweep, which imports the runner,
+    which loads app machinery the dashboard never uses; a runner import error then takes the
+    dashboard down with it."""
+    probe = "import sys, contexteval._ui; print(sorted(m for m in sys.modules if m.startswith('contexteval._') and m.endswith('_runner')))"
+    out = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.strip() == "[]"
 
 
 @pytest.mark.parametrize("path", ["/api/runs/999/traces", "/api/traces/999", "/api/experiments/999", "/api/nope", "/api/traces/abc"])
