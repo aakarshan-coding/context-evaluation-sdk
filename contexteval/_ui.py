@@ -193,18 +193,28 @@ def _row_json(row: ExperimentRow, split: str | None, recommended: bool) -> Json:
 
 
 def _experiment_json(store: Store, info: ExperimentInfo) -> Json:
+    """A sweep's report may be missing (the sweep was cut short) or unreadable (written by another
+    build); the experiment then shows its rows with no recommendation and `report_error` says why."""
     rows = store.experiment_table(info.id)
-    report = _sweep.SweepReport.from_json(info.report) if info.report is not None else None
     split: dict[RunId, str] = {}
-    if report is not None:
-        split.update({r: "tune" for r in (report.baseline_run, *(r for round_ in report.rounds for r in round_))})
-        split.update({r: "holdout" for r in report.holdout_runs or ()})
+    recommendation = recommended = error = None
+    if info.report is not None:
+        try:  # boundary: the stored JSON is another build's data, not this one's types
+            report = _sweep.SweepReport.from_json(info.report)
+            recommendation = _sweep.recommendation_line(report, rows)
+        except Exception as e:
+            error = f"{type(e).__name__}: {e}"
+        else:
+            recommended = report.recommended
+            split.update({r: "tune" for r in (report.baseline_run, *(r for round_ in report.rounds for r in round_))})
+            split.update({r: "holdout" for r in report.holdout_runs or ()})
     return {
         "id": info.id,
         "kind": info.kind,
         "created_at": info.created_at,
-        "recommendation": _sweep.recommendation_line(report, rows) if report is not None else None,
-        "rows": [_row_json(r, split.get(r.run_id), report is not None and r.run_id == report.recommended) for r in rows],
+        "recommendation": recommendation,
+        "report_error": error,
+        "rows": [_row_json(r, split.get(r.run_id), r.run_id == recommended) for r in rows],
     }
 
 

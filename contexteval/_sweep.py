@@ -1,9 +1,10 @@
 """The diagnosis-guided sweep (v2): labels in, one plain recommendation out.
 
 The policy is a table from failure kind to candidate settings. The search is greedy over
-rounds on a tune split and confirms the winner on a holdout split. Every run goes through
-_runner.run_suite under one experiment, so a sweep is an experiment the dashboard already
-shows, marked `sweep` and carrying its report.
+rounds on a tune split and confirms the winner on a holdout split. Every run is made by the
+`Runner` the caller hands in (the CLI passes `_runner.run_suite`) under one experiment, so a
+sweep is an experiment the dashboard already shows, marked `sweep` and carrying its report, and
+this module never imports the runner or an app: the dashboard reads reports without them.
 """
 
 from __future__ import annotations
@@ -11,10 +12,9 @@ from __future__ import annotations
 import random
 from dataclasses import dataclass, fields
 from enum import Enum
-from typing import Any, Iterable, Literal, Mapping, Sequence, Union
+from typing import Any, Callable, Iterable, Literal, Mapping, Sequence, Union
 
 from ._intervention import BASELINE, Order, Setting
-from ._runner import App, Grader, run_suite
 from ._store import RunInfo, Store
 from .types import (
     CaseId,
@@ -378,12 +378,17 @@ class SweepReport:
         )
 
 
-def run_sweep(store: Store, app_spec: str, app: App, cases: Mapping[CaseId, TestCase], grade: Grader, plan: Plan) -> tuple[ExperimentId, SweepReport]:
+Runner = Callable[[ExperimentId, Setting, Sequence[TestCase]], RunId]
+"""Runs the cases under the setting as one stored run of the experiment and returns its id. The
+CLI passes `_runner.run_suite`; tests pass a scripted one. May raise InterventionNotApplicable."""
+
+
+def run_sweep(store: Store, cases: Mapping[CaseId, TestCase], plan: Plan, run_cases: Runner) -> tuple[ExperimentId, SweepReport]:
     """Greedy rounds on the tune cases, then the holdout check. Round 1 runs the heaviest
     candidates. Each later round combines the best setting so far with every round-1 candidate
     that changes other knobs and did not lose to the baseline, and stops when the best setting is
-    the baseline or every combination has run. Every run is run_suite under one sweep experiment,
-    so a failure halfway leaves the finished rows stored.
+    the baseline or every combination has run. Every run is `run_cases` under one sweep
+    experiment, so a failure halfway leaves the finished rows stored.
     """
     experiment = store.new_experiment("sweep")
     tune = [cases[c] for c in plan.split.tune]
@@ -391,7 +396,7 @@ def run_sweep(store: Store, app_spec: str, app: App, cases: Mapping[CaseId, Test
     runs: dict[Setting, RunId] = {}
 
     def run(setting: Setting, on: Sequence[TestCase]) -> RunId:
-        return run_suite(store, app_spec, app, on, grade, setting, experiment).run
+        return run_cases(experiment, setting, on)
 
     def rows() -> dict[RunId, ExperimentRow]:
         return {row.run_id: row for row in store.experiment_table(experiment)}

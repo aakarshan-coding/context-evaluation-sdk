@@ -402,6 +402,7 @@ async function loadExperiments() {
     const x = experiments.find((e) => String(e.id) === picker.value);
     clear(tableBox).append(experimentTable(x.rows, x.kind === "sweep"));
     if (x.recommendation) tableBox.append(el("p", { className: "recommendation", text: x.recommendation }));
+    if (x.report_error) tableBox.append(el("p", { className: "muted", text: "The sweep's report could not be read, so no recommendation is shown: " + x.report_error }));
   };
   picker.addEventListener("change", render);
   if (experiments.length > 1) box.append(el("p", {}, el("label", { className: "muted" }, "Experiment ", picker)));

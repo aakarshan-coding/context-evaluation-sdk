@@ -30,7 +30,7 @@ from . import _diagnose, _runner, _sweep, _testset
 from ._intervention import InterventionNotApplicable, Setting
 from ._llm import Estimate, Provider, ProviderError, make_provider
 from ._store import PROJECT_DIR_NAME, Store, StoredTrace, find_project
-from .types import Diagnosis, ExperimentRow, RunId, TestCase, explain, label_of
+from .types import Diagnosis, ExperimentId, ExperimentRow, RunId, TestCase, explain, label_of
 
 CONFIG_FILE = "config.json"
 PROVIDERS = ("openai", "anthropic", "fake")
@@ -443,8 +443,13 @@ def cmd_sweep(args: argparse.Namespace) -> int:
         app = _runner.load_app(spec, pinecone_text_key=config.pinecone_text_key)
         graded = [cases[c] for c in plan.split.tune] * (1 + plan.round_size * plan.rounds) + [cases[c] for c in plan.split.holdout] * 2
         confirm(_runner.estimate_grading(provider, graded), args.yes)
+        grade = _runner.make_grader(provider)
+
+        def run_cases(experiment: ExperimentId, setting: Setting, on: Sequence[TestCase]) -> RunId:
+            return _runner.run_suite(store, spec, app, on, grade, setting, experiment).run
+
         try:
-            experiment, report = _sweep.run_sweep(store, spec, app, cases, _runner.make_grader(provider), plan)
+            experiment, report = _sweep.run_sweep(store, cases, plan, run_cases)
         except ProviderError as e:
             raise UserError(f"{e} (the sweep's finished runs are stored as an experiment)") from None
         except InterventionNotApplicable as e:
