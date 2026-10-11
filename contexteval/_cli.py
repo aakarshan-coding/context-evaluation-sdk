@@ -18,12 +18,13 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
 from typing import Callable, Sequence
 
+from . import _runner, _testset
 from ._intervention import Setting
-from ._llm import Estimate
+from ._llm import Estimate, Provider, ProviderError, make_provider
 from ._store import PROJECT_DIR_NAME, Store, find_project
 
 CONFIG_FILE = "config.json"
@@ -88,8 +89,31 @@ def parse_grid(tokens: Sequence[str]) -> list[Setting]:
 
 
 def confirm(estimate: Estimate, yes: bool) -> None:
-    """Print calls, tokens, and $ estimate; prompt y/N unless --yes. Raises SystemExit(2) on no."""
-    raise NotImplementedError
+    """Print calls, tokens, and $ estimate; prompt y/N unless --yes. Raises SystemExit(2) on no.
+
+    A closed or non-interactive stdin (EOF) counts as no, so a script without --yes never hangs.
+    """
+    usd = "unknown cost (model not in the price table)" if estimate.usd is None else f"about ${estimate.usd:.4f}"
+    print(
+        f"estimate: {estimate.calls} LLM calls, ~{estimate.input_tokens} input and "
+        f"~{estimate.output_tokens} output tokens, {usd}"
+    )
+    if yes:
+        return
+    try:
+        reply = input("continue? [y/N] ")
+    except (EOFError, OSError):
+        reply = ""
+    if reply.strip().lower() not in ("y", "yes"):
+        print("aborted")
+        raise SystemExit(2)
+
+
+def _provider(config: Config) -> Provider:
+    try:
+        return make_provider(config.provider, config.model)
+    except ValueError as e:
+        raise UserError(str(e)) from None
 
 
 # --- commands ---------------------------------------------------------------
@@ -104,11 +128,73 @@ def cmd_init(args: argparse.Namespace) -> int:
 
 
 def cmd_build_tests(args: argparse.Namespace) -> int:
-    raise NotImplementedError
+    if (args.docs_dir is None) == (args.import_file is None):
+        raise UserError("give exactly one of DOCS_DIR or --import FILE")
+    project = require_project()
+    config = load_config(project)
+    store = Store.open(project)
+    try:
+        if args.import_file is not None:
+            path = Path(args.import_file)
+            try:
+                cases = _testset.import_tests(path)
+            except ValueError as e:
+                raise UserError(str(e)) from None
+            new = store.upsert_cases(path.stem, cases)
+            print(f"imported {len(cases)} cases ({new} new) into test set {path.stem!r}")
+            return 0
+
+        root = Path(args.docs_dir)
+        if not root.is_dir():
+            raise UserError(f"{root} is not a directory")
+        docs = _testset.read_documents(root)
+        if not docs:
+            raise UserError(f"no .md or .txt files under {root}")
+        provider = _provider(config)
+        confirm(_testset.estimate_build(docs, provider, args.per_passage), args.yes)
+        try:
+            report = _testset.build_tests(docs, provider, args.per_passage)
+        except ProviderError as e:
+            raise UserError(str(e)) from None
+        new = store.upsert_cases(_testset.SYNTHETIC_TEST_SET, report.cases)
+        print(f"built {len(report.cases)} cases ({new} new) from {len(docs)} documents; rejected {len(report.rejected)}")
+        for reason in sorted({r.reason for r in report.rejected}):
+            count = sum(r.reason == reason for r in report.rejected)
+            print(f"  rejected {count}: {reason}")
+        return 0
+    finally:
+        store.close()
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    raise NotImplementedError
+    project = require_project()
+    config = load_config(project)
+    spec = args.app or config.app
+    if spec is None:
+        raise UserError("no app given; pass MODULE:FUNCTION once and it is remembered")
+    if spec != config.app:
+        save_config(project, replace(config, app=spec))
+    store = Store.open(project)
+    try:
+        cases = store.cases(args.test_set)
+        if not cases:
+            where = f"test set {args.test_set!r}" if args.test_set else "this project"
+            raise UserError(f"no test cases in {where}; run `contexteval build-tests` first")
+        provider = _provider(config)
+        app = _runner.load_app(spec)
+        app_tokens = store.mean_app_tokens()
+        if app_tokens is not None:
+            print(f"app: {len(cases)} calls to {spec}, ~{app_tokens[0]} input tokens each in the last run")
+        confirm(_runner.estimate_grading(provider, cases), args.yes)
+        try:
+            summary = _runner.run_suite(store, spec, app, cases, _runner.make_grader(provider))
+        except ProviderError as e:
+            raise UserError(str(e)) from None
+        failed = summary.cases - summary.passed - summary.crashed
+        print(f"run {summary.run}: {summary.cases} cases, {summary.passed} passed, {failed} failed, {summary.crashed} crashed")
+        return 0
+    finally:
+        store.close()
 
 
 def cmd_diagnose(args: argparse.Namespace) -> int:
