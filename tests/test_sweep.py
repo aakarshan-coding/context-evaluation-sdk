@@ -246,6 +246,7 @@ def _plan(counts: dict[FailureKind, int], tune: Sequence[CaseId], holdout: Seque
         rounds=2,
         max_settings=6,
         tolerance=None,
+        tokens_known=True,
     )
 
 

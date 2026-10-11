@@ -219,18 +219,27 @@ class Plan:
     rounds: int
     max_settings: int
     tolerance: int | None  # tune cases a cheaper setting may trail the most accurate one by; None for NEAR_TIE_PERCENT of them
+    tokens_known: bool  # the source run recorded input tokens; without them no setting is cheaper than another
 
     @property
-    def window(self) -> int:
+    def requested_window(self) -> int:
         if self.tolerance is not None:
             return self.tolerance
         return len(self.split.tune) * NEAR_TIE_PERCENT // 100
 
     @property
+    def window(self) -> int:
+        """The near-tie window the search uses: the requested one, or 0 when input tokens are
+        unknown, because the window exists to trade accuracy for tokens."""
+        return self.requested_window if self.tokens_known else 0
+
+    @property
     def window_note(self) -> str | None:
-        """The near-tie window in words, or None when it is 0 and accuracy alone decides."""
-        if not self.window:
+        """The near-tie window in words, or None when none was asked for and accuracy alone decides."""
+        if not self.requested_window:
             return None
+        if not self.tokens_known:
+            return f"near-tie window: 0 (run {self.source_run} recorded no input tokens, so accuracy alone decides)"
         cases = "case" if self.window == 1 else "cases"
         source = "--tolerance" if self.tolerance is not None else f"{NEAR_TIE_PERCENT}% of {len(self.split.tune)}"
         return f"near-tie window: {self.window} {cases} ({source})"
@@ -304,6 +313,7 @@ def plan_sweep(store: Store, run: RunInfo, *, rounds: int, max_settings: int, ho
         rounds=rounds,
         max_settings=max_settings,
         tolerance=tolerance,
+        tokens_known=any(s.trace.metrics.input_tokens > 0 for s in traces),
     )
     return plan, cases
 
@@ -311,19 +321,65 @@ def plan_sweep(store: Store, run: RunInfo, *, rounds: int, max_settings: int, ho
 # --- search -----------------------------------------------------------------------
 
 
-def choose(rows: Mapping[Setting, ExperimentRow], baseline_passed: int, tolerance: int) -> Setting:
-    """The best setting on the same cases. Every setting within `tolerance` passes of the most
+def choose(rows: Mapping[Setting, ExperimentRow], baseline_passed: int, window: int) -> Setting:
+    """The best setting on the same cases. Every setting within `window` passes of the most
     passing one, and passing more than the baseline, is a contender; the cheapest contender wins:
-    fewest input tokens, then lowest latency, then most passes. When nothing passes more than the
+    fewest input tokens, then most passes, then lowest latency. When nothing passes more than the
     baseline, only the most passing settings contend. Table order breaks exact ties."""
     top = max(row.passed for row in rows.values())
-    floor = top if top <= baseline_passed else max(top - tolerance, baseline_passed + 1)
+    floor = top if top <= baseline_passed else max(top - window, baseline_passed + 1)
     contenders = [s for s, row in rows.items() if row.passed >= floor]
-    return min(contenders, key=lambda s: (rows[s].mean_input_tokens, rows[s].mean_latency_ms, -rows[s].passed))
+    return min(contenders, key=lambda s: (rows[s].mean_input_tokens, -rows[s].passed, rows[s].mean_latency_ms))
 
 
-def beats(candidate: ExperimentRow, baseline: ExperimentRow) -> bool:
-    return candidate.passed > baseline.passed
+def winner(table: Mapping[Setting, ExperimentRow], window: int) -> Setting | None:
+    """The setting the sweep carries forward from the tune rows, BASELINE among them: `choose`
+    over them, or None when no setting passed more cases than the baseline. Each round's base and
+    the final pick both use it, so a setting that only tied the baseline is never built on."""
+    baseline_passed = table[BASELINE].passed
+    if max(row.passed for row in table.values()) <= baseline_passed:
+        return None
+    return choose(table, baseline_passed, window)
+
+
+@dataclass(frozen=True)
+class Decision:
+    """The sweep's verdict: the setting to recommend and the more accurate, costlier one it
+    passed over; or neither, and the reason."""
+
+    recommended: Setting | None
+    passed_over: Setting | None
+    reason: str
+
+
+def decide(table: Mapping[Setting, ExperimentRow], window: int, holdout: Mapping[Setting, ExperimentRow] | None) -> Decision:
+    """Pure over the tune rows (BASELINE among them) and the holdout rows of the baseline and the
+    winner, or None when no case was held out. The winner is recommended when it passed at least
+    as many holdout cases as the baseline; with no holdout it is recommended unconfirmed, which
+    the recommendation line says."""
+    baseline = table[BASELINE]
+    best = winner(table, window)
+    if best is None:
+        candidates = {s: row for s, row in table.items() if s != BASELINE}
+        if not candidates:
+            return Decision(None, None, "no candidate ran")
+        runner_up = choose(candidates, baseline.passed, 0)
+        return Decision(
+            None,
+            None,
+            f"no candidate beat the baseline on the tune cases (the best, {runner_up.name}, passed {candidates[runner_up].accuracy:.0%} against {baseline.accuracy:.0%})",
+        )
+    if holdout is not None:
+        hb, hw = holdout[BASELINE], holdout[best]
+        if hw.passed < hb.passed:
+            return Decision(
+                None,
+                None,
+                f"{best.name} won on the tune cases ({baseline.accuracy:.0%} -> {table[best].accuracy:.0%}) "
+                f"but lost on the holdout cases ({hb.accuracy:.0%} -> {hw.accuracy:.0%}), so it fits the tune cases rather than the app",
+            )
+    most_accurate = choose(table, baseline.passed, 0)
+    return Decision(best, most_accurate if most_accurate != best else None, "")
 
 
 @dataclass(frozen=True)
@@ -401,8 +457,9 @@ def run_sweep(store: Store, cases: Mapping[CaseId, TestCase], plan: Plan, run_ca
     def rows() -> dict[RunId, ExperimentRow]:
         return {row.run_id: row for row in store.experiment_table(experiment)}
 
-    def best_on_tune(table: Mapping[RunId, ExperimentRow], tolerance: int) -> Setting:
-        return choose({s: table[r] for s, r in runs.items()}, table[runs[BASELINE]].passed, tolerance)
+    def tune_rows() -> dict[Setting, ExperimentRow]:
+        by_run = rows()
+        return {s: by_run[r] for s, r in runs.items()}
 
     runs[BASELINE] = run(BASELINE, tune)
     first_round = [r.setting for r in plan.candidates[: plan.max_settings]]
@@ -411,14 +468,14 @@ def run_sweep(store: Store, cases: Mapping[CaseId, TestCase], plan: Plan, run_ca
         if number == 0:
             todo = list(first_round)
         else:
-            table = rows()
-            best = best_on_tune(table, plan.window)
-            if best == BASELINE:
+            table = tune_rows()
+            best = winner(table, plan.window)
+            if best is None:
                 break
-            baseline_passed = table[runs[BASELINE]].passed
+            baseline_passed = table[BASELINE].passed
             todo = []
             for partner in first_round:
-                if not knobs(partner).isdisjoint(knobs(best)) or table[runs[partner]].passed < baseline_passed:
+                if not knobs(partner).isdisjoint(knobs(best)) or table[partner].passed < baseline_passed:
                     continue
                 combined = merge(best, partner)
                 if combined not in runs and combined not in todo:
@@ -430,39 +487,15 @@ def run_sweep(store: Store, cases: Mapping[CaseId, TestCase], plan: Plan, run_ca
             runs[setting] = run(setting, tune)
         rounds.append(tuple(runs[s] for s in todo))
 
-    table = rows()
-    baseline_row = table[runs[BASELINE]]
-    winner = best_on_tune(table, plan.window)
+    table = tune_rows()
+    best = winner(table, plan.window)
     holdout_runs = None
-    recommended = None
-    passed_over = None
-    if winner == BASELINE or not beats(table[runs[winner]], baseline_row):
-        contenders = [s for s in runs if s != BASELINE]
-        if contenders:
-            runner_up = choose({s: table[runs[s]] for s in contenders}, baseline_row.passed, 0)
-            reason = (
-                f"no candidate beat the baseline on the tune cases "
-                f"(the best, {runner_up.name}, passed {table[runs[runner_up]].accuracy:.0%} against {baseline_row.accuracy:.0%})"
-            )
-        else:
-            reason = "no candidate was run"
-    elif held:
-        holdout_runs = (run(BASELINE, held), run(winner, held))
-        table = rows()
-        hb, hw = table[holdout_runs[0]], table[holdout_runs[1]]
-        if hw.passed >= hb.passed:
-            recommended, reason = runs[winner], ""
-        else:
-            reason = (
-                f"{winner.name} won on the tune cases ({baseline_row.accuracy:.0%} -> {table[runs[winner]].accuracy:.0%}) "
-                f"but lost on the holdout cases ({hb.accuracy:.0%} -> {hw.accuracy:.0%}), so it fits the tune cases rather than the app"
-            )
-    else:
-        recommended, reason = runs[winner], ""
-    if recommended is not None:
-        most_accurate = best_on_tune(table, 0)
-        if most_accurate != winner:
-            passed_over = runs[most_accurate]
+    holdout_rows = None
+    if best is not None and held:
+        holdout_runs = (run(BASELINE, held), run(best, held))
+        by_run = rows()
+        holdout_rows = {BASELINE: by_run[holdout_runs[0]], best: by_run[holdout_runs[1]]}
+    decision = decide(table, plan.window, holdout_rows)
     report = SweepReport(
         source_run=plan.source_run,
         baseline_k=plan.baseline_k,
@@ -471,9 +504,9 @@ def run_sweep(store: Store, cases: Mapping[CaseId, TestCase], plan: Plan, run_ca
         baseline_run=runs[BASELINE],
         rounds=tuple(rounds),
         holdout_runs=holdout_runs,
-        recommended=recommended,
-        reason=reason,
-        passed_over=passed_over,
+        recommended=runs[decision.recommended] if decision.recommended is not None else None,
+        reason=decision.reason,
+        passed_over=runs[decision.passed_over] if decision.passed_over is not None else None,
     )
     store.save_experiment_report(experiment, report.to_json())
     return experiment, report
