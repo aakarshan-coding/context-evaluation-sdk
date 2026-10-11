@@ -1,8 +1,9 @@
 """Third-party library knowledge. One HookSpec row per patched method; HOOKS is the only list.
 
 Patching is class-level (`Owner.method = wrapper`), so instances created before or after
-init() are both captured. Each wrapper binds the call with inspect.signature so codecs and
-adapters read and override arguments by name, then delegates to capture.intercept_*.
+init() are both captured. capture.wrap_call builds each wrapper: it binds the call with
+inspect.signature so codecs and adapters read and override arguments by name, delegates to
+capture.intercept_*, and awaits when the target is a coroutine function (the async clients).
 
 Idempotent install: every wrapper carries `__contexteval_original__`. If the attribute on
 the owner already has it, the spec reports "already" and nothing is rewrapped. The method is
@@ -16,7 +17,6 @@ types <- _text <- _intervention <- _capture <- _hooks <- __init__.
 from __future__ import annotations
 
 import copy
-import functools
 import importlib
 import importlib.util
 import inspect
@@ -321,10 +321,14 @@ class HookSpec:
 
 HOOKS: tuple[HookSpec, ...] = (
     HookSpec("chromadb", ("chromadb.api.models.Collection:Collection.query",), ChromaCodec()),
+    HookSpec("chromadb", ("chromadb.api.models.AsyncCollection:AsyncCollection.query",), ChromaCodec()),
     HookSpec("pinecone", ("pinecone.db_data.index:Index.query", "pinecone.data.index:Index.query"), PineconeCodec()),
     HookSpec("openai", ("openai.resources.chat.completions:Completions.create",), OpenAIChatAdapter()),
+    HookSpec("openai", ("openai.resources.chat.completions:AsyncCompletions.create",), OpenAIChatAdapter()),
     HookSpec("openai", ("openai.resources.responses:Responses.create",), OpenAIResponsesAdapter()),
+    HookSpec("openai", ("openai.resources.responses:AsyncResponses.create",), OpenAIResponsesAdapter()),
     HookSpec("anthropic", ("anthropic.resources.messages:Messages.create",), AnthropicMessagesAdapter()),
+    HookSpec("anthropic", ("anthropic.resources.messages:AsyncMessages.create",), AnthropicMessagesAdapter()),
 )
 
 # Worse statuses win when a library has several specs.
@@ -382,7 +386,7 @@ def patch_method(owner: type, name: str, handler: Handler) -> Status:
     if hasattr(current, "__contexteval_original__"):
         return "already"
     try:
-        wrapper = _wrap(current, handler)
+        wrapper = capture.wrap_call(current, handler)
     except Exception as e:
         capture._log_once(f"install:{owner.__name__}.{name}", f"contexteval could not wrap {owner.__name__}.{name}; it runs unhooked", e)
         return "failed"
@@ -396,22 +400,6 @@ def uninstall_all() -> None:
     while _patched:
         owner, name, original = _patched.pop()
         setattr(owner, name, original)
-
-
-def _wrap(original: Callable[..., Any], handler: Handler) -> Callable[..., Any]:
-    sig = inspect.signature(original)
-    intercept: Callable[..., Any] = capture.intercept_retrieval if isinstance(handler, RetrievalCodec) else capture.intercept_llm
-
-    @functools.wraps(original)
-    def wrapper(*a: Any, **kw: Any) -> Any:
-        try:
-            bound = sig.bind(*a, **kw)
-        except TypeError:
-            return original(*a, **kw)  # let the library raise its own argument error
-        return intercept(handler, lambda b: original(*b.args, **b.kwargs), bound)
-
-    wrapper.__contexteval_original__ = original  # type: ignore[attr-defined]
-    return wrapper
 
 
 # --- entry points -----------------------------------------------------------
