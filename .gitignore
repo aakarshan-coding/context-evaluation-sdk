@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.contexteval/
+decisions.tsv
+todo.md
+.worktrees/
+*.egg-info/
+build/
+dist/
