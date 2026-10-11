@@ -10,7 +10,7 @@ import json
 import sys
 import uuid
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, Mapping
 
 import pytest
 
@@ -287,6 +287,40 @@ def test_decorated_function_without_a_knob_takes_top_k_from_the_hooked_store_ins
         hits = search(QUESTION)
     assert len(hits) == 3
     assert [(e.source, len(e.retrieved), e.params["n_results"]) for e in run.retrievals] == [("retriever:search", 3, 3)]
+
+
+class _UnreadableConfig(Mapping[str, Any]):
+    """A config whose items() raises, so the params snapshot cannot read it."""
+
+    def __getitem__(self, key: str) -> Any:
+        raise KeyError(key)
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(())
+
+    def __len__(self) -> int:
+        return 0
+
+    def items(self) -> Any:
+        raise RuntimeError("no items for you")
+
+
+def test_snapshot_failure_leaves_no_override_behind(hooks: None, lc_retriever: Any, caplog: pytest.LogCaptureFixture) -> None:
+    """Review P5. Defect: the params snapshot ran after the override and outside the recording
+    error guard, so an argument it could not read raised out of the hook before the call, and
+    the retriever kept the experiment's k for the rest of the process. The snapshot falls back
+    to {} and the call runs; here langchain itself then rejects the config, and the knob is
+    restored on that path too."""
+    users_kwargs = lc_retriever.search_kwargs
+    with capture.active_run(QUESTION, Intervention(top_k=4)):
+        with pytest.raises(RuntimeError, match="no items for you"):
+            lc_retriever.invoke(QUESTION, config=_UnreadableConfig())
+    assert lc_retriever.search_kwargs is users_kwargs and users_kwargs == {"k": 2}
+    assert capture._knobs == {}
+    assert caplog.text.count("could not snapshot") == 1
+    with capture.active_run(QUESTION) as run:
+        assert len(lc_retriever.invoke(QUESTION)) == 2
+    assert run.retrievals[0].params == {"input": QUESTION}
 
 
 def test_failed_knob_setattr_leaves_no_entry_and_a_later_restore_restores(hooks: None) -> None:
