@@ -225,8 +225,8 @@ The estimate counts characters divided by 4 as tokens, priced from a built-in ta
 
 ## Limits in v1
 
-- Sync clients only. Async clients are not hooked.
-- Hooked calls are chromadb `Collection.query`, pinecone `Index.query`, OpenAI chat completions and responses, and Anthropic messages. The pinecone hook is tested against mocks only.
+- Hooked calls are chromadb `Collection.query` and `AsyncCollection.query`, pinecone `Index.query`, OpenAI chat completions and responses (`OpenAI` and `AsyncOpenAI`), and Anthropic messages (`Anthropic` and `AsyncAnthropic`). The pinecone hook is tested against mocks only, and pinecone's async index is not hooked.
+- `@contexteval.retriever` accepts `async def` functions, and `answer` may be `async def`. The CLI runs an async `answer` on one event loop for the whole command, so clients bound to the loop stay valid across questions. In production each asyncio task has its own capture buffer.
 - pgvector has no client library to hook. Use `@contexteval.retriever` on your query function.
 - Production traces are split by a heuristic. Each LLM call closes one trace that holds the retrievals since the previous LLM call. An agent that calls the LLM several times per question produces several traces.
 - Cases run one at a time, in the same process as the CLI.
