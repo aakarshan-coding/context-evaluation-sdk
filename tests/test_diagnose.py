@@ -20,16 +20,20 @@ from contexteval.types import (
     Chunk,
     Crashed,
     Evidence,
+    Flaky,
     Judged,
     JudgeVerdict,
     LLMCall,
     Metrics,
+    Missing,
     ReplayStep,
     RetrievalEvent,
+    StepTally,
     TestCase,
     TestOutcome,
     Trace,
     label_of,
+    tallies,
 )
 
 GOLD = Evidence("Phone support is open from 7 am to 9 pm Mountain Time, every day of the year.")
@@ -245,9 +249,46 @@ def test_estimate_counts_judge_calls_and_worst_case_grades(store: Store) -> None
     store.add_trace(run, _trace([OFF_TOPIC], [OFF_TOPIC], test=TestOutcome(CASE.id, False, "crash"), crashed=True))
     todo = _diagnose.pending(store, run)
     assert len(todo) == 3
-    est = _diagnose.estimate_diagnosis(FakeProvider(), todo)
-    assert est.calls == 1 + _diagnose.MAX_REPLAYS
+    est = _diagnose.estimate_diagnosis(FakeProvider(), todo, samples=1)
+    assert est.calls == 1 + _diagnose.MAX_STEPS
     assert est.usd == 0.0
+
+
+def test_estimate_counts_every_sample_of_every_step(store: Store) -> None:
+    """v1.1 A. Each step may draw up to N samples, and each sample may need a grade. Defect: the
+    estimate prices one grade per step, so the cost prompt under-reports by a factor of N."""
+    store.upsert_cases("imported", [CASE])
+    run = store.new_run("baseline", "app:answer", BASELINE)
+    store.add_trace(run, _trace([OFF_TOPIC], [OFF_TOPIC], test=TestOutcome(CASE.id, False, "llm")))
+    todo = _diagnose.pending(store, run)
+    assert _diagnose.estimate_diagnosis(FakeProvider(), todo, samples=1).calls == _diagnose.MAX_STEPS
+    assert _diagnose.estimate_diagnosis(FakeProvider(), todo, samples=3).calls == 3 * _diagnose.MAX_STEPS
+    assert _diagnose.estimate_diagnosis(FakeProvider(), todo, samples=5).calls == 5 * _diagnose.MAX_STEPS
+    assert _diagnose.estimate_diagnosis(FakeProvider(), todo).calls == _diagnose.DEFAULT_SAMPLES * _diagnose.MAX_STEPS
+
+
+def test_diagnose_run_hands_samples_to_the_case_sampler(store: Store) -> None:
+    """v1.1 A. Defect: `samples` is accepted by diagnose_run but never reaches diagnose_case, so
+    the CLI flag changes the estimate and nothing else. An app that answers right once and wrong
+    afterwards is flaky at --samples 1 and missing (unconfirmed, 0 of 2 injects) at 3."""
+    store.upsert_cases("imported", [CASE])
+    calls = {"n": 0}
+
+    def app(question: str) -> str:
+        calls["n"] += 1
+        return "7 am to 9 pm" if calls["n"] == 1 else "no idea"
+
+    for samples, expected in [(1, Flaky), (3, Missing)]:
+        run = store.new_run("baseline", "app:answer", BASELINE)
+        store.add_trace(run, _trace([OFF_TOPIC], [OFF_TOPIC], test=TestOutcome(CASE.id, False, "llm")))
+        calls["n"] = 0
+        provider = FakeProvider()
+        diagnose_run(store, run, app, make_grader(provider), provider, samples=samples)
+        (stored,) = store.traces(run)
+        assert isinstance(stored.diagnosis, expected), samples
+    assert isinstance(stored.diagnosis, Missing)
+    assert stored.diagnosis.confirmed is False
+    assert tallies(stored.diagnosis.replays) == (StepTally(ReplayStep.BASELINE_RERUN, 1, 3), StepTally(ReplayStep.INJECT_EVIDENCE, 0, 2))
 
 
 def test_locate_gold_names_the_ladder_steps_that_would_change_nothing() -> None:

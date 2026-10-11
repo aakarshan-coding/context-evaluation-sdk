@@ -119,6 +119,7 @@ ol.chunks li.cited { border-color: var(--accent); border-width: 2px; }
 .chunk-text { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 13.5px; }
 details summary { cursor: pointer; color: var(--muted); font-size: 13px; margin-top: 8px; }
 ul.replays { margin: 4px 0 0; padding-left: 18px; font-size: 13.5px; }
+ul.samples { margin: 2px 0 6px; padding-left: 18px; font-size: 13px; }
 .table-wrap { overflow-x: auto; }
 table { border-collapse: collapse; width: 100%; font-size: 14px; }
 th, td { text-align: right; padding: 6px 10px; border-bottom: 1px solid var(--border); white-space: nowrap; }
@@ -342,10 +343,12 @@ async function selectTrace(traceId, reveal) {
     detail.append(el("p", { className: "muted", text: t.passed === false ? "Not diagnosed yet. Run `contexteval diagnose`." : "No diagnosis." }));
   } else {
     detail.append(el("p", {}, d.explain));
-    if (d.replays.length) {
-      detail.append(el("ul", { className: "replays" }, d.replays.map((r) =>
-        el("li", {}, el("span", { className: "badge " + (r.passed ? "b-pass" : "b-fail"), text: r.passed ? "pass" : "fail" }),
-          r.step.replace(/_/g, " "), r.answer === null ? el("span", { className: "muted", text: " (crashed)" }) : el("span", { className: "muted", text: ": " + r.answer })))));
+    if (d.steps.length) {
+      detail.append(el("ul", { className: "replays" }, d.steps.map((s) =>
+        el("li", {}, passBadge(s.majority), ` ${s.step.replace(/_/g, " ")} (${s.passed}/${s.total})`,
+          el("ul", { className: "samples" }, d.replays.filter((r) => r.step === s.step).map((r) =>
+            el("li", {}, passBadge(r.passed),
+              r.answer === null ? el("span", { className: "muted", text: " (crashed)" }) : el("span", { className: "muted", text: ": " + r.answer }))))))));
     }
   }
   if (t.evidence !== null) {
@@ -353,7 +356,7 @@ async function selectTrace(traceId, reveal) {
   }
 
   t.retrievals.forEach((e, r) => {
-    detail.append(el("h3", { text: `Retrieval ${r}: ${e.source}` }));
+    detail.append(el("h3", { text: `Retrieval ${r + 1}: ${e.source}` }));
     detail.append(el("div", { className: "metrics" },
       el("span", { text: "query " + (e.query === null ? "(vector only)" : JSON.stringify(e.query)) }),
       el("span", { text: `${e.delivered.length} delivered of ${e.retrieved.length} retrieved` }),

@@ -3,7 +3,9 @@ pinecone through a stand-in class, plus install idempotence and the mode rules."
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
+import inspect
 import json
 import sqlite3
 import sys
@@ -77,6 +79,47 @@ def _openai_handler(request: httpx.Request) -> httpx.Response:
 @pytest.fixture
 def openai_client() -> Any:
     return openai.OpenAI(api_key="fake", http_client=httpx.Client(transport=httpx.MockTransport(_openai_handler)))
+
+
+@pytest.fixture
+def async_openai_client() -> Any:
+    return openai.AsyncOpenAI(api_key="fake", http_client=httpx.AsyncClient(transport=httpx.MockTransport(_openai_handler)))
+
+
+def _anthropic_response(body: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": "msg-1", "type": "message", "role": "assistant", "model": body["model"],
+        "content": [{"type": "text", "text": ANSWER}], "stop_reason": "end_turn", "stop_sequence": None,
+        "usage": {"input_tokens": 11, "output_tokens": 3},
+    }
+
+
+class _FakeAsyncChromaClient:
+    """The HTTP half of chromadb's AsyncClient. AsyncCollection.query validates, embeds, and
+    reshapes around this one coroutine, so the real collection class runs in the test."""
+
+    def __init__(self) -> None:
+        self.n_results: list[int] = []
+
+    async def _query(self, **kw: Any) -> Any:
+        n = kw["n_results"]
+        self.n_results.append(n)
+        rows = list(DOCS.items())[:n]
+        return {
+            "ids": [[k for k, _ in rows]], "documents": [[v for _, v in rows]], "distances": [[0.1 * i for i in range(len(rows))]],
+            "metadatas": [[{"src": k} for k, _ in rows]], "embeddings": None, "uris": None, "data": None,
+            "included": ["metadatas", "documents", "distances"],
+        }
+
+
+@pytest.fixture
+def async_chroma() -> tuple[Any, _FakeAsyncChromaClient]:
+    from chromadb.api.models.AsyncCollection import AsyncCollection
+    from chromadb.types import Collection as CollectionModel
+
+    client = _FakeAsyncChromaClient()
+    model = CollectionModel(id=uuid.uuid4(), name="docs", configuration_json={}, serialized_schema=None, metadata=None, dimension=None, tenant="t", database="d")
+    return AsyncCollection(client, model, embedding_function=HashEmbedding()), client
 
 
 def _app(col: Any, client: Any, question: str, *, n_results: int = 3, use: int = 2) -> tuple[str, Any]:
@@ -252,15 +295,7 @@ def test_anthropic_messages_recorded(hooks: None) -> None:
     httpx2 = pytest.importorskip("httpx2")  # anthropic >= 1.x ships its own httpx fork
 
     def handler(request: Any) -> Any:
-        body = json.loads(request.content)
-        return httpx2.Response(
-            200,
-            json={
-                "id": "msg-1", "type": "message", "role": "assistant", "model": body["model"],
-                "content": [{"type": "text", "text": ANSWER}], "stop_reason": "end_turn", "stop_sequence": None,
-                "usage": {"input_tokens": 11, "output_tokens": 3},
-            },
-        )
+        return httpx2.Response(200, json=_anthropic_response(json.loads(request.content)))
 
     client = anthropic.Anthropic(api_key="fake", http_client=httpx2.Client(transport=httpx2.MockTransport(handler)))
     with capture.active_run("q") as run:
@@ -275,6 +310,84 @@ def test_anthropic_messages_recorded(hooks: None) -> None:
     assert (call.provider, call.model, call.answer) == ("anthropic", "claude-haiku-4-5", ANSWER)
     assert call.prompt == "system: Be terse.\nuser: What is the refund window?"
     assert (call.input_tokens, call.output_tokens) == (11, 3)
+
+
+def test_async_openai_chat_and_responses_recorded(hooks: None, async_openai_client: Any) -> None:
+    """v1.1 B. Defect: AsyncOpenAI is not hooked, so an async app records no LLM call and no
+    production trace ever closes; or the wrapper hands the adapter the un-awaited coroutine, so
+    prompt and usage are empty and user code gets a coroutine where it expects a response."""
+
+    async def main() -> tuple[Any, Any]:
+        chat = await async_openai_client.chat.completions.create(model="gpt-4o-mini", messages=[{"role": "user", "content": QUESTION}])
+        resp = await async_openai_client.responses.create(model="gpt-4o-mini", instructions="Be terse.", input=QUESTION)
+        return chat, resp
+
+    with capture.active_run(QUESTION) as run:
+        chat, resp = asyncio.run(main())
+    assert chat.choices[0].message.content == ANSWER and resp.output_text == ANSWER
+    first, second = run.llm_calls
+    assert (first.provider, first.model, first.answer, first.prompt) == ("openai", "gpt-4o-mini", ANSWER, f"user: {QUESTION}")
+    assert (first.input_tokens, first.output_tokens) == (42, 7)
+    assert (second.provider, second.model, second.answer) == ("openai", "gpt-4o-mini", ANSWER)
+    assert second.prompt == f"instructions: Be terse.\nuser: {QUESTION}"
+    assert (second.input_tokens, second.output_tokens) == (9, 2)
+
+
+def test_async_anthropic_messages_recorded(hooks: None) -> None:
+    """v1.1 B. Defect: AsyncAnthropic is not hooked, or its class-level `create` (a sync function
+    that returns a coroutine) is wrapped as sync and the adapter parses the coroutine."""
+    anthropic = pytest.importorskip("anthropic")
+    httpx2 = pytest.importorskip("httpx2")
+
+    def handler(request: Any) -> Any:
+        return httpx2.Response(200, json=_anthropic_response(json.loads(request.content)))
+
+    client = anthropic.AsyncAnthropic(api_key="fake", http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(handler)))
+
+    async def main() -> Any:
+        return await client.messages.create(
+            model="claude-haiku-4-5",
+            max_tokens=16,
+            system="Be terse.",
+            messages=[{"role": "user", "content": [{"type": "text", "text": "What is the refund window?"}]}],
+        )
+
+    with capture.active_run("q") as run:
+        r = asyncio.run(main())
+    assert r.content[0].text == ANSWER
+    call = run.llm_calls[0]
+    assert (call.provider, call.model, call.answer) == ("anthropic", "claude-haiku-4-5", ANSWER)
+    assert call.prompt == "system: Be terse.\nuser: What is the refund window?"
+    assert (call.input_tokens, call.output_tokens) == (11, 3)
+
+
+def test_async_chroma_query_is_hooked_with_top_k_and_transform(hooks: None, async_chroma: tuple[Any, _FakeAsyncChromaClient]) -> None:
+    """v1.1 B. Defect: only the sync Collection is hooked, so an app on chromadb's AsyncClient
+    records no retrieval and a top_k experiment leaves n_results untouched. chromadb's async
+    client is HTTP-only, so the real AsyncCollection runs over a stand-in for its HTTP half."""
+    col, client = async_chroma
+    with capture.active_run(QUESTION, Intervention(top_k=2, transforms=(KeepFirst(1),))) as run:
+        res = asyncio.run(col.query(query_texts=[QUESTION], n_results=4))
+    assert client.n_results == [2]
+    assert res["documents"][0] == [DOCS["d1"]] and res["ids"][0] == ["d1"] and res["metadatas"][0] == [{"src": "d1"}]
+    ev = run.retrievals[0]
+    assert ev.source == "chromadb" and ev.query == QUESTION and ev.params["n_results"] == 2
+    assert [c.text for c in ev.retrieved] == [DOCS["d1"], DOCS["d2"]] and len(ev.delivered) == 1
+
+
+def test_suppressed_covers_async_sdk_calls(hooks: None, async_openai_client: Any) -> None:
+    """v1.1 B. Defect: suppression is honored on the sync path only, so an SDK provider built on
+    an async client would record its own grader calls as the app's."""
+
+    async def ask() -> Any:
+        return await async_openai_client.chat.completions.create(model="gpt-4o-mini", messages=[{"role": "user", "content": "hi"}])
+
+    with capture.active_run(QUESTION) as run:
+        with capture.suppressed():
+            assert asyncio.run(ask()).choices[0].message.content == ANSWER
+        assert run.llm_calls == []
+        asyncio.run(ask())
+        assert len(run.llm_calls) == 1
 
 
 def test_pinecone_stand_in_top_k_question_fallback_and_native_rows(pinecone_index: FakeIndex) -> None:
@@ -477,11 +590,12 @@ def test_patch_method_reports_a_method_without_a_readable_signature(clean_hooks:
 def test_install_twice_is_noop_and_uninstall_restores_originals() -> None:
     """Defect: a second install wraps the wrapper (double recording), or uninstall leaves the
     wrapper in place so the next test's hooks report 'already' and never record."""
+    from chromadb.api.models.AsyncCollection import AsyncCollection
     from chromadb.api.models.Collection import Collection
-    from openai.resources.chat.completions import Completions
-    from openai.resources.responses import Responses
+    from openai.resources.chat.completions import AsyncCompletions, Completions
+    from openai.resources.responses import AsyncResponses, Responses
 
-    owners = {Collection: "query", Completions: "create", Responses: "create"}
+    owners = {Collection: "query", Completions: "create", Responses: "create", AsyncCollection: "query", AsyncCompletions: "create", AsyncResponses: "create"}
     originals = {owner: owner.__dict__[name] for owner, name in owners.items()}
     try:
         first = _hooks.install("cli")
@@ -491,6 +605,10 @@ def test_install_twice_is_noop_and_uninstall_restores_originals() -> None:
         wrapped = Collection.__dict__["query"]
         assert wrapped is not originals[Collection]
         assert wrapped.__contexteval_original__ is originals[Collection]
+        for owner in (AsyncCollection, AsyncCompletions, AsyncResponses):
+            name = owners[owner]
+            assert owner.__dict__[name].__contexteval_original__ is originals[owner]
+            assert inspect.iscoroutinefunction(owner.__dict__[name]), f"{owner.__name__}.{name} wrapper must stay awaitable"
         second = _hooks.install("cli")
         assert second.statuses["chromadb"] == "already" and second.statuses["openai"] == "already"
         assert Collection.__dict__["query"] is wrapped

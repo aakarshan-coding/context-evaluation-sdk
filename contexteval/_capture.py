@@ -1,5 +1,6 @@
 """Capture core: the active-run context variable, the two intercept functions every hook
-calls, the @retriever decorator, trace finalization, and the process mode.
+calls (each in a sync and an async form over one shared body), the wrapper builder the hook
+table and @retriever share, trace finalization, and the process mode.
 
 Library knowledge (which class, which kwarg, which response shape) lives in _hooks.py, as do
 install() and init(), so this module imports nothing that imports it back.
@@ -35,7 +36,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from time import perf_counter
-from typing import Any, Callable, Iterator, Literal, Mapping, Protocol, Sequence, TypeVar, overload, runtime_checkable
+from typing import Any, Awaitable, Callable, Iterator, Literal, Mapping, Protocol, Sequence, TypeVar, overload, runtime_checkable
 
 from . import _text as text
 from ._intervention import BASELINE, NO_INTERVENTION, Intervention, InterventionNotApplicable
@@ -462,63 +463,143 @@ def _snapshot(args: inspect.BoundArguments) -> dict[str, Any]:
     return {name: _json_safe(value) for name, value in args.arguments.items() if name not in ("self", "cls")}
 
 
-def intercept_retrieval(codec: RetrievalCodec[R], call: Callable[[inspect.BoundArguments], R], args: inspect.BoundArguments) -> R:
-    """Shared body of every retrieval hook and the @retriever decorator."""
+# Each intercept is one decision before the library call and one after it, split so the sync
+# and async wrappers share every rule (decode, intervention, record, error policy) and differ
+# only in whether they await the call. `None` from a begin() means pass through untouched.
+
+
+@dataclass
+class _PendingRetrieval:
+    codec: RetrievalCodec[Any]
+    run: ActiveRun | _Ambient
+    args: inspect.BoundArguments
+    t0: float
+
+    def finish(self, raw: R) -> R:
+        latency_ms = (perf_counter() - self.t0) * 1000
+        codec, run, args, iv = self.codec, self.run, self.args, self.run.intervention
+
+        try:
+            retrieved = codec.decode(raw)
+        except Exception as e:
+            if iv.is_noop:
+                _log_once(f"decode:{codec.source}", f"contexteval could not read {codec.source} result; not recorded", e)
+                return raw
+            raise _refuse(run, InterventionNotApplicable(f"{codec.source}: cannot decode result to apply the intervention")) from e
+
+        try:
+            query = codec.query_text(args)
+        except Exception as e:
+            _log_once(f"query:{codec.source}", f"contexteval could not read the {codec.source} query text", e)
+            query = None
+
+        if iv.is_noop:
+            delivered, out = retrieved, raw
+        else:
+            try:
+                delivered = apply_intervention(iv, retrieved, query if query is not None else run.question)
+                out = codec.encode(raw, delivered)
+            except InterventionNotApplicable as e:
+                raise _refuse(run, e)
+            except Exception as e:
+                raise _refuse(run, InterventionNotApplicable(f"{codec.source}: cannot rebuild the result after the intervention")) from e
+
+        try:
+            run.record(
+                RetrievalEvent(
+                    source=codec.source,
+                    query=query,
+                    params=_snapshot(args),
+                    retrieved=retrieved,
+                    delivered=delivered,
+                    latency_ms=latency_ms,
+                )
+            )
+        except Exception as e:
+            _log_once(f"record:{codec.source}", f"contexteval could not record the {codec.source} call", e)
+        return out
+
+
+def _begin_retrieval(codec: RetrievalCodec[Any], args: inspect.BoundArguments) -> _PendingRetrieval | None:
     if _suppressed.get():
-        return call(args)
+        return None
     run = _current_run()
     if run is None:
-        return call(args)
+        return None
     iv = run.intervention
-
     if iv.top_k is not None:
         if codec.top_k_param is None:
             raise _refuse(run, InterventionNotApplicable(f"{codec.source}: top_k={iv.top_k} requested but this site has no top_k parameter"))
         args.arguments[codec.top_k_param] = iv.top_k
+    return _PendingRetrieval(codec, run, args, perf_counter())
 
-    t0 = perf_counter()
+
+def intercept_retrieval(codec: RetrievalCodec[R], call: Callable[[inspect.BoundArguments], R], args: inspect.BoundArguments) -> R:
+    """Shared body of every sync retrieval hook and the @retriever decorator."""
+    pending = _begin_retrieval(codec, args)
     raw = call(args)
-    latency_ms = (perf_counter() - t0) * 1000
+    return raw if pending is None else pending.finish(raw)
 
-    try:
-        retrieved = codec.decode(raw)
-    except Exception as e:
-        if iv.is_noop:
-            _log_once(f"decode:{codec.source}", f"contexteval could not read {codec.source} result; not recorded", e)
-            return raw
-        raise _refuse(run, InterventionNotApplicable(f"{codec.source}: cannot decode result to apply the intervention")) from e
 
-    try:
-        query = codec.query_text(args)
-    except Exception as e:
-        _log_once(f"query:{codec.source}", f"contexteval could not read the {codec.source} query text", e)
-        query = None
+async def intercept_retrieval_async(codec: RetrievalCodec[R], call: Callable[[inspect.BoundArguments], Awaitable[R]], args: inspect.BoundArguments) -> R:
+    """The same intercept for a coroutine target: the call is awaited, nothing else differs."""
+    pending = _begin_retrieval(codec, args)
+    raw = await call(args)
+    return raw if pending is None else pending.finish(raw)
 
-    if iv.is_noop:
-        delivered, out = retrieved, raw
-    else:
+
+@dataclass
+class _PendingLLM:
+    adapter: LLMAdapter
+    run: ActiveRun | _Ambient
+    prompt: str
+    model: str
+    t0: float
+
+    def finish(self, response: Any) -> Any:
+        latency_ms = (perf_counter() - self.t0) * 1000
+        adapter, run = self.adapter, self.run
         try:
-            delivered = apply_intervention(iv, retrieved, query if query is not None else run.question)
-            out = codec.encode(raw, delivered)
-        except InterventionNotApplicable as e:
-            raise _refuse(run, e)
+            answer, input_tokens, output_tokens = adapter.parse(response)
         except Exception as e:
-            raise _refuse(run, InterventionNotApplicable(f"{codec.source}: cannot rebuild the result after the intervention")) from e
-
-    try:
-        run.record(
-            RetrievalEvent(
-                source=codec.source,
-                query=query,
-                params=_snapshot(args),
-                retrieved=retrieved,
-                delivered=delivered,
-                latency_ms=latency_ms,
-            )
+            _log_once(f"parse:{adapter.provider}", f"contexteval could not read the {adapter.provider} response", e)
+            answer, input_tokens, output_tokens = None, None, None
+        llm_call = LLMCall(
+            provider=adapter.provider,
+            model=self.model,
+            prompt=self.prompt,
+            answer=answer,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            latency_ms=latency_ms,
         )
+
+        if isinstance(run, ActiveRun):
+            run.llm_calls.append(llm_call)
+            return response
+        sink = _process.sink
+        if sink is not None:
+            try:
+                sink(PendingTrace(run, llm_call, self.t0))
+            except Exception as e:
+                _log_once("sink", "contexteval could not store a production trace", e)
+        return response
+
+
+def _begin_llm(adapter: LLMAdapter, args: inspect.BoundArguments) -> _PendingLLM | None:
+    if _suppressed.get():
+        return None
+    run = _current_run()
+    if run is None:
+        return None
+    if isinstance(run, _Ambient):
+        _ambient.set(None)
+    try:
+        prompt, model = adapter.prompt_text(args), adapter.model(args)
     except Exception as e:
-        _log_once(f"record:{codec.source}", f"contexteval could not record the {codec.source} call", e)
-    return out
+        _log_once(f"prompt:{adapter.provider}", f"contexteval could not read the {adapter.provider} prompt", e)
+        prompt, model = "", ""
+    return _PendingLLM(adapter, run, prompt, model, perf_counter())
 
 
 def intercept_llm(adapter: LLMAdapter, call: Callable[[inspect.BoundArguments], Any], args: inspect.BoundArguments) -> Any:
@@ -526,49 +607,61 @@ def intercept_llm(adapter: LLMAdapter, call: Callable[[inspect.BoundArguments], 
     In production mode with no active run, the LLM call closes the ambient buffer: one call,
     one stored trace. The buffer leaves the context before the call, so a call that raises
     cannot hand its retrievals to the next one."""
-    if _suppressed.get():
-        return call(args)
-    run = _current_run()
-    if run is None:
-        return call(args)
-    if isinstance(run, _Ambient):
-        _ambient.set(None)
-
-    try:
-        prompt, model = adapter.prompt_text(args), adapter.model(args)
-    except Exception as e:
-        _log_once(f"prompt:{adapter.provider}", f"contexteval could not read the {adapter.provider} prompt", e)
-        prompt, model = "", ""
-
-    t0 = perf_counter()
+    pending = _begin_llm(adapter, args)
     response = call(args)
-    latency_ms = (perf_counter() - t0) * 1000
+    return response if pending is None else pending.finish(response)
 
+
+async def intercept_llm_async(adapter: LLMAdapter, call: Callable[[inspect.BoundArguments], Awaitable[Any]], args: inspect.BoundArguments) -> Any:
+    pending = _begin_llm(adapter, args)
+    response = await call(args)
+    return response if pending is None else pending.finish(response)
+
+
+# --- the one wrapper shape for hooked methods and @retriever -----------------
+
+
+def is_coroutine_function(fn: Callable[..., Any]) -> bool:
+    """Looks through functools.wraps layers: the openai and anthropic SDKs decorate their async
+    `create` methods, so the class attribute itself is a plain function returning a coroutine."""
     try:
-        answer, input_tokens, output_tokens = adapter.parse(response)
-    except Exception as e:
-        _log_once(f"parse:{adapter.provider}", f"contexteval could not read the {adapter.provider} response", e)
-        answer, input_tokens, output_tokens = None, None, None
-    llm_call = LLMCall(
-        provider=adapter.provider,
-        model=model,
-        prompt=prompt,
-        answer=answer,
-        input_tokens=input_tokens,
-        output_tokens=output_tokens,
-        latency_ms=latency_ms,
-    )
+        return inspect.iscoroutinefunction(inspect.unwrap(fn))
+    except ValueError:
+        return inspect.iscoroutinefunction(fn)
 
-    if isinstance(run, ActiveRun):
-        run.llm_calls.append(llm_call)
-        return response
-    sink = _process.sink
-    if sink is not None:
-        try:
-            sink(PendingTrace(run, llm_call, t0))
-        except Exception as e:
-            _log_once("sink", "contexteval could not store a production trace", e)
-    return response
+
+def wrap_call(original: Callable[..., Any], handler: RetrievalCodec[Any] | LLMAdapter) -> Callable[..., Any]:
+    """Bind the call by name, hand it to the intercept that matches the handler, and keep the
+    target's sync or async nature: a coroutine function gets an `async def` wrapper, so it is
+    still awaitable and still reports as a coroutine function. Arguments the signature rejects
+    go straight to the original, so the library raises its own error."""
+    sig = inspect.signature(original)
+    retrieval = isinstance(handler, RetrievalCodec)
+    wrapper: Callable[..., Any]
+    if is_coroutine_function(original):
+        intercept_async = intercept_retrieval_async if retrieval else intercept_llm_async
+
+        @functools.wraps(original)
+        async def wrapper(*a: Any, **kw: Any) -> Any:
+            try:
+                bound = sig.bind(*a, **kw)
+            except TypeError:
+                return await original(*a, **kw)
+            return await intercept_async(handler, lambda b: original(*b.args, **b.kwargs), bound)  # type: ignore[arg-type]
+
+    else:
+        intercept = intercept_retrieval if retrieval else intercept_llm
+
+        @functools.wraps(original)
+        def wrapper(*a: Any, **kw: Any) -> Any:
+            try:
+                bound = sig.bind(*a, **kw)
+            except TypeError:
+                return original(*a, **kw)
+            return intercept(handler, lambda b: original(*b.args, **b.kwargs), bound)  # type: ignore[arg-type]
+
+    wrapper.__contexteval_original__ = original  # type: ignore[attr-defined]
+    return wrapper
 
 
 # --- decorator for custom retrieval (pgvector, SQL, internal APIs) ----------
@@ -692,7 +785,8 @@ def retriever(
     score: str | None = "score",
     rebuild: Rebuild | None = None,
 ) -> Any:
-    """Mark a user search function as a retrieval source.
+    """Mark a user search function as a retrieval source. `async def` functions are supported
+    and stay awaitable.
 
         @contexteval.retriever                 # top_k override uses a parameter named `top_k`
         @contexteval.retriever(top_k="k")      # the user's parameter is called `k`
@@ -722,13 +816,6 @@ def retriever(
             score_field=score,
             rebuild=rebuild,
         )
-
-        @functools.wraps(func)
-        def wrapper(*a: Any, **kw: Any) -> Any:
-            bound = sig.bind(*a, **kw)
-            return intercept_retrieval(codec, lambda b: func(*b.args, **b.kwargs), bound)
-
-        wrapper.__contexteval_original__ = func  # type: ignore[attr-defined]
-        return wrapper  # type: ignore[return-value]
+        return wrap_call(func, codec)  # type: ignore[return-value]
 
     return decorate(fn) if fn is not None else decorate

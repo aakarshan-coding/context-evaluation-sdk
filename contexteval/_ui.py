@@ -36,6 +36,7 @@ from .types import (
     label_of,
     never,
     source_of,
+    tallies,
 )
 
 Json = dict[str, Any]
@@ -77,6 +78,7 @@ def _diagnosis_json(d: Diagnosis | None) -> Json | None:
         "source": source_of(d),
         "explain": explain(d),
         "chunks": chunks,
+        "steps": [{"step": t.step.value, "passed": t.passed, "total": t.total, "majority": t.majority} for t in tallies(replays)],
         "replays": [{"step": r.step.value, "passed": r.passed, "answer": r.answer} for r in replays],
     }
 

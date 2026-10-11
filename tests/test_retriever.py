@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 from dataclasses import dataclass
 
 import pytest
@@ -250,3 +252,31 @@ def test_outside_any_run_in_off_mode_is_passthrough() -> None:
     assert search("q") == ["a"]
     assert capture._ambient.get() is None
     assert search.__wrapped__("q") == ["a"]  # type: ignore[attr-defined]
+
+
+def test_async_retriever_is_overridden_and_transformed() -> None:
+    """v1.1 B. Defect: the decorator hands the coroutine object to the codec as the result, so
+    an `async def` search records nothing without an intervention and raises
+    InterventionNotApplicable under one; the awaited list never sees the transform."""
+    seen: list[int] = []
+
+    @retriever(top_k="limit")
+    async def search(query: str, limit: int = 5) -> list[str]:
+        await asyncio.sleep(0)
+        seen.append(limit)
+        return [f"doc{i}" for i in range(limit)]
+
+    assert inspect.iscoroutinefunction(search)
+    with capture.active_run("q", Intervention(top_k=3, transforms=(KeepFirst(2),))) as run:
+        out = asyncio.run(search("refund"))
+    assert seen == [3] and out == ["doc0", "doc1"]
+    ev = run.retrievals[0]
+    assert ev.source == "retriever:search" and ev.query == "refund"
+    assert ev.params == {"query": "refund", "limit": 3}
+    assert [c.text for c in ev.retrieved] == ["doc0", "doc1", "doc2"]
+    assert [c.text for c in ev.delivered] == ["doc0", "doc1"]
+
+    with capture.active_run("q") as run:
+        assert asyncio.run(search("plain")) == [f"doc{i}" for i in range(5)]
+    assert run.retrievals[0].delivered == run.retrievals[0].retrieved
+    assert asyncio.run(search("outside any run")) == [f"doc{i}" for i in range(5)]
