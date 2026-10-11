@@ -218,3 +218,40 @@ def test_build_tests_keeps_cases_from_passages_before_a_provider_error(project: 
         assert [c.source for c in store.cases()] == [(docs / "a.md").as_posix()]
     finally:
         store.close()
+
+
+@pytest.mark.parametrize("n", ["0", "2", "-3", "four"])
+def test_diagnose_rejects_a_samples_count_that_is_not_a_positive_odd_integer(n: str, capsys: pytest.CaptureFixture[str]) -> None:
+    """v1.1 A. An even N lets a step tie, zero draws nothing, and a negative loops forever.
+    Defect: the value is accepted at the boundary and the sampler misbehaves on the first case."""
+    with pytest.raises(SystemExit) as e:
+        _cli.main(["diagnose", "--samples", n])
+    assert e.value.code == 2
+    assert "odd" in capsys.readouterr().err
+
+
+def test_diagnose_hands_samples_to_the_run_and_states_the_worst_case(project: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    """v1.1 A. Defect: --samples is parsed but not passed to diagnose_run, or the app line still
+    counts one replay per step, so the user confirms a cost a third of the real worst case."""
+    assert _cli.main(["init", "--provider", "fake"]) == 0
+    tests = project / "t.jsonl"
+    tests.write_text(json.dumps({"question": "q?", "expected_answer": "a", "evidence": "the answer is a"}) + "\n", encoding="utf-8")
+    assert _cli.main(["build-tests", "--import", str(tests)]) == 0
+    monkeypatch.setattr(_cli._runner, "load_app", lambda spec, pinecone_text_key=None: (lambda question: "wrong"))
+    assert _cli.main(["run", "my_app:answer", "--yes"]) == 0
+    seen: dict[str, object] = {}
+
+    def fake_diagnose_run(store, run, app, grade, provider, *, force=False, on_diagnosis=None, samples=None):  # type: ignore[no-untyped-def]
+        seen["samples"] = samples
+        return _cli._diagnose.DiagnoseReport(0, 0, 0, 0)
+
+    monkeypatch.setattr(_cli._diagnose, "diagnose_run", fake_diagnose_run)
+    steps = _cli._diagnose.MAX_STEPS
+    capsys.readouterr()
+    assert _cli.main(["diagnose", "--yes", "--samples", "5"]) == 0
+    assert seen == {"samples": 5}
+    out = capsys.readouterr().out
+    assert f"up to {5 * steps} replay calls" in out and f"{steps} steps x 5 samples" in out and "worst case" in out
+    assert _cli.main(["diagnose", "--yes", "--force"]) == 0
+    assert seen == {"samples": 3}
+    assert f"up to {3 * steps} replay calls" in capsys.readouterr().out

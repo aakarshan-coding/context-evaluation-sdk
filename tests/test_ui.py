@@ -83,7 +83,13 @@ def _replay(step: ReplayStep, passed: bool, answer: str | None = "x") -> ReplayO
 
 
 IGNORED = Ignored(
-    replays=(_replay(ReplayStep.BASELINE_RERUN, False), _replay(ReplayStep.GOLD_TO_TOP, True, "thirty days")),
+    replays=(
+        _replay(ReplayStep.BASELINE_RERUN, False, "sixty days"),
+        _replay(ReplayStep.BASELINE_RERUN, False, "sixty days"),
+        _replay(ReplayStep.GOLD_TO_TOP, True, "thirty days"),
+        _replay(ReplayStep.GOLD_TO_TOP, False, "sixty days"),
+        _replay(ReplayStep.GOLD_TO_TOP, True, "thirty days"),
+    ),
     gold_at=((0, 2),),
 )
 MISSING = Missing("not_retrieved", True, (_replay(ReplayStep.BASELINE_RERUN, False), _replay(ReplayStep.INJECT_EVIDENCE, True)))
@@ -205,9 +211,9 @@ def test_run_traces_carry_pass_fail_label_and_explain_line(served: Served) -> No
         s.passing: (True, None),
         s.imported: (False, "ignored"),
     }
-    assert rows[s.ignored]["diagnosis"]["explain"] == "moving the gold chunk to the top fixed it; gold was at chunk 2 of retrieval 0"
-    assert rows[s.irrelevant]["diagnosis"]["explain"] == "keeping only the gold chunks fixed it; removed chunks 0, 1 of retrieval 0"
-    assert rows[s.missing]["diagnosis"]["explain"] == "the gold chunk was never retrieved; injecting the evidence fixed it"
+    assert rows[s.ignored]["diagnosis"]["explain"] == "moving the gold chunk to the top fixed it (2/3); gold was at chunk 3 of retrieval 1"
+    assert rows[s.irrelevant]["diagnosis"]["explain"] == "keeping only the gold chunks fixed it (1/1); removed chunks 1, 2 of retrieval 1"
+    assert rows[s.missing]["diagnosis"]["explain"] == "the gold chunk was never retrieved; injecting the evidence fixed it (1/1)"
     assert rows[s.imported]["diagnosis"]["source"] == "judge"
     assert rows[s.imported]["diagnosis"]["source"] != rows[s.ignored]["diagnosis"]["source"]
     assert rows[s.ignored]["answer"] == "sixty days"
@@ -233,6 +239,11 @@ def test_trace_detail_marks_in_prompt_gold_and_diagnosis_chunks(served: Served) 
 
     ignored = _json(f"{served.url}/api/traces/{served.seed.ignored}")
     assert ignored["diagnosis"]["chunks"] == [[0, 2]]
+    assert ignored["diagnosis"]["steps"] == [
+        {"step": "baseline_rerun", "passed": 0, "total": 2, "majority": False},
+        {"step": "gold_to_top", "passed": 2, "total": 3, "majority": True},
+    ]
+    assert [r["passed"] for r in ignored["diagnosis"]["replays"]] == [False, False, True, False, True]
     assert [(c["in_prompt"], c["gold"]) for c in ignored["retrievals"][0]["delivered"]] == [(True, False), (False, False), (True, True)]
     assert ignored["llm_calls"][0]["gold"] is True
     irrelevant = _json(f"{served.url}/api/traces/{served.seed.irrelevant}")
@@ -459,7 +470,7 @@ def test_handler_error_is_a_json_500(served: Served, monkeypatch: pytest.MonkeyP
 # elements, then prints the badge text of each row in the failure list.
 _PAGE_HARNESS = r"""
 const fs = require("fs");
-const [htmlPath, base, runId] = process.argv.slice(2);
+const [htmlPath, base, runId, traceId] = process.argv.slice(2);
 const script = fs.readFileSync(htmlPath, "utf8").match(/<script>([\s\S]*)<\/script>/)[1];
 class Node {}
 class El extends Node {
@@ -485,18 +496,27 @@ const realFetch = fetch;
 globalThis.fetch = (path, opts) => realFetch(base + path, opts);
 (0, eval)(script);
 const started = Date.now();
-const timer = setInterval(() => {
+const text = (n) => (n.children && n.children.length ? n.children.map(text).join("") : n.textContent);
+const find = (n, cls) => (n.className === cls ? [n] : (n.children || []).flatMap((c) => find(c, cls)));
+const timer = setInterval(async () => {
   const rows = (ids.failures || { children: [] }).children;
   if (!rows.length && Date.now() - started < 5000) return;
   clearInterval(timer);
-  console.log(JSON.stringify(rows.map((li) => li.children[0].children[0].children[0].textContent)));
+  if (!traceId) {
+    console.log(JSON.stringify(rows.map((li) => li.children[0].children[0].children[0].textContent)));
+    return;
+  }
+  await selectTrace(Number(traceId));
+  const [list] = find(ids.detail, "replays");
+  console.log(JSON.stringify(list.children.map((li) => ({
+    head: text({ children: li.children.filter((c) => c.tag !== "ul") }),
+    samples: li.children.filter((c) => c.tag === "ul").flatMap((ul) => ul.children.map(text)),
+  }))));
 }, 50);
 """
 
 
-def test_list_shows_the_judge_label_for_judged_production_traces(served: Served, tmp_path: Path) -> None:
-    """Review Y6. Defect: the failure list shows "ungraded" for a production trace the judge has
-    labeled, because the list only shows a diagnosis badge for graded failures."""
+def _run_page(served: Served, tmp_path: Path, *args: str) -> Any:
     node = shutil.which("node")
     if node is None:
         pytest.skip("node is not installed")
@@ -504,7 +524,27 @@ def test_list_shows_the_judge_label_for_judged_production_traces(served: Served,
     harness.write_text(_PAGE_HARNESS, encoding="utf-8")
     page = resources.files("contexteval").joinpath("ui.html")
     out = subprocess.run(
-        [node, str(harness), str(page), served.url, str(served.seed.production)],
+        [node, str(harness), str(page), served.url, *args],
         stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60, check=True,
     )
-    assert json.loads(out.stdout) == ["judge: no failure"]
+    return json.loads(out.stdout)
+
+
+def test_detail_shows_each_step_with_its_pass_count_and_every_sample(served: Served, tmp_path: Path) -> None:
+    """v1.1 A. Defect: the detail view lists one line per sample with no per-step verdict, so a
+    2-of-3 step reads as three contradicting lines, or it shows only the majority and hides the
+    dissenting answers. Each step shows its majority badge, name, count, and every sample."""
+    s = served.seed
+    assert _run_page(served, tmp_path, str(s.base), str(s.ignored)) == [
+        {"head": "fail baseline rerun (0/2)", "samples": ["fail: sixty days", "fail: sixty days"]},
+        {"head": "pass gold to top (2/3)", "samples": ["pass: thirty days", "fail: sixty days", "pass: thirty days"]},
+    ]
+    assert _run_page(served, tmp_path, str(s.base), str(s.not_context)) == [
+        {"head": "fail baseline rerun (0/1)", "samples": ["fail (crashed)"]},
+    ]
+
+
+def test_list_shows_the_judge_label_for_judged_production_traces(served: Served, tmp_path: Path) -> None:
+    """Review Y6. Defect: the failure list shows "ungraded" for a production trace the judge has
+    labeled, because the list only shows a diagnosis badge for graded failures."""
+    assert _run_page(served, tmp_path, str(served.seed.production)) == ["judge: no failure"]
