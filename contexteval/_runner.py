@@ -145,8 +145,22 @@ def run_suite(
     return RunSummary(run=run, cases=len(cases), passed=passed, crashed=crashed)
 
 
+def experiment_settings(grid: Sequence[Setting]) -> list[Setting]:
+    """BASELINE first, then the grid in order with duplicates and BASELINE itself removed, so
+    every table has exactly one comparison row. The cost estimate counts the same list."""
+    settings = [BASELINE]
+    for setting in grid:
+        if setting not in settings:
+            settings.append(setting)
+    return settings
+
+
 def run_experiment(store: Store, app_spec: str, app: App, cases: Sequence[TestCase], grade: Grader, grid: Sequence[Setting]) -> ExperimentId:
-    """One run per setting under a new experiment. BASELINE is prepended when the grid lacks it,
-    so every table has a comparison row.
+    """One stored run per setting of experiment_settings(grid), all under one new experiment.
+    Each run goes through run_suite, the same path as `contexteval run`, with the setting stored
+    on the run. InterventionNotApplicable propagates and leaves the runs done so far stored.
     """
-    raise NotImplementedError  # P4
+    experiment = store.new_experiment()
+    for setting in experiment_settings(grid):
+        run_suite(store, app_spec, app, cases, grade, setting, experiment)
+    return experiment

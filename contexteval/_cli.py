@@ -5,7 +5,7 @@
     contexteval build-tests --import FILE
     contexteval run [module:function] [--test-set NAME] [--yes]
     contexteval diagnose [--run ID] [--force] [--yes]
-    contexteval experiment KNOB=v1,v2 ... [--app module:function] [--yes]
+    contexteval experiment [module:function] KNOB=v1,v2 ... [--yes]
     contexteval ui [--port 8765] [--no-open]
 
 Every command finds the project by walking up from cwd to a .contexteval/ directory, except
@@ -16,16 +16,20 @@ the cost prompt.
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import sys
+import typing
 from dataclasses import asdict, dataclass, fields, replace
+from enum import Enum
 from pathlib import Path
 from typing import Callable, Sequence
 
 from . import _runner, _testset
-from ._intervention import Setting
+from ._intervention import InterventionNotApplicable, Setting
 from ._llm import Estimate, Provider, ProviderError, make_provider
 from ._store import PROJECT_DIR_NAME, Store, find_project
+from .types import ExperimentRow
 
 CONFIG_FILE = "config.json"
 PROVIDERS = ("openai", "anthropic", "fake")
@@ -79,13 +83,66 @@ def require_project() -> Path:
     return project
 
 
-def parse_grid(tokens: Sequence[str]) -> list[Setting]:
-    """["top_k=3,10", "rerank=none,lexical"] -> cartesian product of Settings.
+KnobParser = Callable[[str], object]
 
-    Unknown knob or bad value -> UserError listing the valid knobs and values, which come
-    from Setting's fields so the list is never hand-synced.
+
+def _knob_parsers() -> dict[str, tuple[KnobParser, str]]:
+    """Knob name -> (parse one value, valid values for the error), derived from Setting's field
+    types so a new knob needs no edit here."""
+    parsers: dict[str, tuple[KnobParser, str]] = {}
+    for name, hint in typing.get_type_hints(Setting).items():
+        args = typing.get_args(hint)
+        if isinstance(hint, type) and issubclass(hint, Enum):
+            parsers[name] = (hint, "|".join(m.value for m in hint))
+        elif typing.get_origin(hint) is typing.Literal:
+            parsers[name] = (_one_of(args), "|".join(args))
+        elif int in args or hint is int:
+            parsers[name] = (int, "a positive integer")
+        else:
+            raise TypeError(f"Setting.{name}: no grid parser for {hint!r}")
+    return parsers
+
+
+def _one_of(allowed: tuple[str, ...]) -> KnobParser:
+    def parse(value: str) -> str:
+        if value not in allowed:
+            raise ValueError(value)
+        return value
+
+    return parse
+
+
+def parse_grid(tokens: Sequence[str]) -> list[Setting]:
+    """["top_k=3,10", "rerank=none,lexical"] -> cartesian product of Settings, first knob slowest.
+
+    The only place strings become Setting values. Unknown knob or bad value -> UserError naming
+    it, with the valid knobs or values taken from Setting's fields.
     """
-    raise NotImplementedError
+    parsers = _knob_parsers()
+    axes: dict[str, list[object]] = {}
+    for token in tokens:
+        knob, sep, raw = token.partition("=")
+        if not sep or not raw:
+            raise UserError(f"grid entry {token!r} must look like knob=v1,v2")
+        if knob not in parsers:
+            raise UserError(f"unknown knob {knob!r}; valid knobs are {', '.join(parsers)}")
+        if knob in axes:
+            raise UserError(f"knob {knob!r} given twice; list its values once, as {knob}=v1,v2")
+        parse, valid = parsers[knob]
+        values = []
+        for value in raw.split(","):
+            try:
+                values.append(parse(value))
+            except ValueError:
+                raise UserError(f"bad value {value!r} for {knob}; expected {valid}") from None
+        axes[knob] = values
+    settings = []
+    for combo in itertools.product(*axes.values()):
+        try:
+            settings.append(Setting(**dict(zip(axes, combo))))  # type: ignore[arg-type]
+        except ValueError as e:
+            raise UserError(str(e)) from None
+    return settings
 
 
 def confirm(estimate: Estimate, yes: bool) -> None:
@@ -202,7 +259,57 @@ def cmd_diagnose(args: argparse.Namespace) -> int:
 
 
 def cmd_experiment(args: argparse.Namespace) -> int:
-    raise NotImplementedError
+    tokens = list(args.tokens)
+    spec_arg = tokens.pop(0) if ":" in tokens[0] and "=" not in tokens[0] else None
+    if not tokens:
+        raise UserError("give at least one knob=v1,v2 grid entry")
+    grid = parse_grid(tokens)
+    project = require_project()
+    config = load_config(project)
+    spec = spec_arg or config.app
+    if spec is None:
+        raise UserError("no app given; pass MODULE:FUNCTION or run `contexteval run MODULE:FUNCTION` first")
+    store = Store.open(project)
+    try:
+        cases = store.cases()
+        if not cases:
+            raise UserError("no test cases in this project; run `contexteval build-tests` first")
+        settings = _runner.experiment_settings(grid)
+        provider = _provider(config)
+        app = _runner.load_app(spec)
+        print(f"experiment: {len(cases)} cases x {len(settings)} settings ({', '.join(s.name for s in settings)})")
+        app_tokens = store.mean_app_tokens()
+        if app_tokens is not None:
+            print(f"app: {len(cases) * len(settings)} calls to {spec}, ~{app_tokens[0]} input tokens each in the last run")
+        confirm(_runner.estimate_grading(provider, list(cases) * len(settings)), args.yes)
+        try:
+            experiment = _runner.run_experiment(store, spec, app, cases, _runner.make_grader(provider), grid)
+        except ProviderError as e:
+            raise UserError(str(e)) from None
+        except InterventionNotApplicable as e:
+            raise UserError(f"the app's retrieval cannot take this setting: {e}") from None
+        print(f"experiment {experiment}")
+        print(format_experiment_table(store.experiment_table(experiment)))
+        return 0
+    finally:
+        store.close()
+
+
+def format_experiment_table(rows: Sequence[ExperimentRow]) -> str:
+    header = ("setting", "accuracy", "passed", "mean input tokens", "mean latency ms", "total cost")
+    body = [
+        (
+            r.setting_name,
+            f"{r.accuracy:.0%}",
+            f"{r.passed}/{r.cases}",
+            f"{r.mean_input_tokens:.0f}",
+            f"{r.mean_latency_ms:.1f}",
+            "unknown" if r.total_cost_usd is None else f"${r.total_cost_usd:.4f}",
+        )
+        for r in rows
+    ]
+    widths = [max(len(row[i]) for row in (header, *body)) for i in range(len(header))]
+    return "\n".join("  ".join(cell.ljust(w) for cell, w in zip(row, widths)).rstrip() for row in (header, *body))
 
 
 def cmd_ui(args: argparse.Namespace) -> int:
@@ -244,8 +351,7 @@ def _args_diagnose(p: argparse.ArgumentParser) -> None:
 
 
 def _args_experiment(p: argparse.ArgumentParser) -> None:
-    p.add_argument("grid", nargs="+", metavar="KNOB=v1,v2")
-    p.add_argument("--app", default=None, metavar="MODULE:FUNCTION")
+    p.add_argument("tokens", nargs="+", metavar="[MODULE:FUNCTION] KNOB=v1,v2")
     p.add_argument("--yes", action="store_true")
 
 
