@@ -274,34 +274,40 @@ class SweepNotPossible(Exception):
 
 
 def plan_sweep(store: Store, run: RunInfo, *, rounds: int, max_settings: int, holdout: float, seed: int, tolerance: int | None) -> tuple[Plan, dict[CaseId, TestCase]]:
-    """Read the source run's labels and retrievals and decide the candidates and the split. The
-    cases are the ones the source run ran, so the sweep measures the set it was diagnosed on."""
+    """Read the source run's graded cases, split them, then count the tune cases' labels and
+    decide the candidates. The holdout cases' labels never reach the search, so the holdout stays
+    unseen by it. The cases are the ones the source run ran, so the sweep measures the set it was
+    diagnosed on."""
     traces = store.traces(run.id)
     cases: dict[CaseId, TestCase] = {}
-    failed: set[CaseId] = set()
-    counts: dict[FailureKind, int] = {}
-    unlabeled = 0
+    labels: dict[CaseId, Diagnosis | None] = {}  # the failed cases and their diagnosis
     for stored in traces:
         test = stored.trace.test
         case = store.case(test.case_id) if test else None
         if test is None or case is None:
             continue
         cases[case.id] = case
-        if test.passed:
-            continue
-        failed.add(case.id)
-        if stored.diagnosis is None:
-            unlabeled += 1
-            continue
-        kind = kind_of(stored.diagnosis)
-        if kind is not None:
-            counts[kind] = counts.get(kind, 0) + 1
+        if not test.passed:
+            labels[case.id] = stored.diagnosis
     if not cases:
         raise SweepNotPossible(f"run {run.id} has no graded cases")
-    if failed and not counts and unlabeled:
-        raise SweepNotPossible(f"run {run.id} has {unlabeled} failures and none is labeled; run `contexteval diagnose` first")
+    split = split_cases(list(cases.values()), labels, holdout, seed)
+    counts: dict[FailureKind, int] = {}
+    unlabeled = 0
+    for case_id in split.tune:
+        if case_id not in labels:
+            continue
+        diagnosis = labels[case_id]
+        if diagnosis is None:
+            unlabeled += 1
+            continue
+        kind = kind_of(diagnosis)
+        if kind is not None:
+            counts[kind] = counts.get(kind, 0) + 1
+    if unlabeled and not counts:
+        raise SweepNotPossible(f"run {run.id} has {unlabeled} failures among the tune cases and none is labeled; run `contexteval diagnose` first")
     k = max((len(e.retrieved) for s in traces for e in s.trace.retrievals), default=0)
-    if failed and k == 0:
+    if labels and k == 0:
         raise SweepNotPossible(f"run {run.id} captured no retrieval, so no setting can reach the app's context")
     plan = Plan(
         source_run=run.id,
@@ -309,7 +315,7 @@ def plan_sweep(store: Store, run: RunInfo, *, rounds: int, max_settings: int, ho
         counts=counts,
         unlabeled=unlabeled,
         candidates=rank_candidates(counts, k),
-        split=split_cases(list(cases.values()), failed, holdout, seed),
+        split=split,
         rounds=rounds,
         max_settings=max_settings,
         tolerance=tolerance,

@@ -392,10 +392,14 @@ def _tolerance(value: str) -> int:
 
 
 def _print_plan(plan: _sweep.Plan, spec: str) -> None:
+    split = plan.split
+    print(f"split: {len(split.tune)} tune cases, {len(split.holdout)} holdout cases (seed {split.seed}); only the tune cases' labels guide the search")
+    if not split.holdout:
+        print("warning: no holdout cases, so the recommendation is not confirmed on cases the search did not see")
     labeled = ", ".join(f"{kind.value} {n}" for kind, n in plan.counts.items())
-    print(f"sweep: run {plan.source_run}, {sum(plan.counts.values())} labeled failures ({labeled}); the baseline retrieved up to {plan.baseline_k} chunks")
+    print(f"sweep: {sum(plan.counts.values())} labeled failures among the tune cases ({labeled}); the baseline retrieved up to {plan.baseline_k} chunks")
     if plan.unlabeled:
-        print(f"warning: {plan.unlabeled} failures have no label and do not guide the search; run `contexteval diagnose` to include them")
+        print(f"warning: {plan.unlabeled} tune failures have no label and do not guide the search; run `contexteval diagnose` to include them")
     for kind, n, reason in plan.unfixable:
         noun = "failure" if n == 1 else "failures"
         print(f"  no setting can fix {n} {kind.value} {noun}: {reason}")
@@ -404,10 +408,6 @@ def _print_plan(plan: _sweep.Plan, spec: str) -> None:
     shown = plan.candidates[: plan.max_settings]
     names = ", ".join(f"{r.setting.name} ({r.weight})" for r in shown)
     print(f"candidates, heaviest first ({len(shown)} of {len(plan.candidates)}; the number is how many failures ask for it): {names}")
-    split = plan.split
-    print(f"split: {len(split.tune)} tune cases, {len(split.holdout)} holdout cases (seed {split.seed})")
-    if not split.holdout:
-        print("warning: no holdout cases, so the recommendation is not confirmed on cases the search did not see")
     if plan.window_note:
         print(plan.window_note)
     tune, held = len(split.tune), len(split.holdout)
@@ -434,7 +434,7 @@ def cmd_sweep(args: argparse.Namespace) -> int:
             raise UserError(str(e)) from None
         _print_plan(plan, spec)
         if not plan.counts:
-            print(f"run {source.id} has no labeled failure to fix; nothing to sweep")
+            print(f"run {source.id}: the tune cases hold no labeled failure to fix; nothing to sweep")
             return 0
         if not plan.candidates:
             print("Keep the current settings. No setting addresses the labels seen, for the reasons above.")
