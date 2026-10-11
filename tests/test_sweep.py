@@ -17,6 +17,7 @@ from contexteval._sweep import FailureKind, Fixable, Unfixable
 from contexteval.types import (
     Answered,
     CaseId,
+    Chunk,
     Evidence,
     ExperimentId,
     ExperimentRow,
@@ -31,6 +32,7 @@ from contexteval.types import (
     NotContext,
     ReplayOutcome,
     ReplayStep,
+    RetrievalEvent,
     RunId,
     TestCase,
     TestOutcome,
@@ -156,6 +158,42 @@ def test_split_is_deterministic_by_seed_and_keeps_failures_on_both_sides() -> No
     assert len(first.holdout) == 6  # round(0.3 * 6) failures + round(0.3 * 14) passes
     assert len(failed & set(first.holdout)) == 2 and len(failed & set(first.tune)) == 4
     assert first.tune == tuple(sorted(first.tune)) and first.holdout == tuple(sorted(first.holdout))
+
+
+def _baseline_trace(case: TestCase, passed: bool) -> Trace:
+    chunks = tuple(Chunk(f"chunk {i} for {case.question}", f"doc{i}", 0.5, i) for i in range(K))
+    return Trace(
+        question=case.question,
+        outcome=Answered("right" if passed else "wrong"),
+        retrievals=(RetrievalEvent("retriever:search", case.question, {"limit": K}, chunks, chunks, 1.0),),
+        llm_calls=(),
+        metrics=Metrics(0, 0, 1.0, None),
+        test=TestOutcome(case.id, passed, "substring"),
+        in_prompt=(),
+    )
+
+
+def test_holdout_labels_do_not_choose_the_candidates(store: Store) -> None:
+    """Review Q2. Defect: the labels are counted over every case before the split, so a failure
+    that lands in the holdout still proposes candidates, and the holdout is no longer unseen by
+    the search. Only the tune cases' labels count, and so do only their unlabeled failures."""
+    cases = _cases(8)
+    store.upsert_cases("t", cases)
+    failed = {c.id for c in cases[:6]}
+    split = _sweep.split_cases(cases, failed, holdout=0.5, seed=0)
+    held_failures = [c for c in cases if c.id in failed and c.id in split.holdout]
+    assert len(held_failures) == 3
+    run = store.new_run("baseline", "app:answer", BASELINE)
+    for case in cases:
+        trace_id = store.add_trace(run, _baseline_trace(case, case.id not in failed))
+        if case.id in failed and case.id in split.tune:
+            store.save_diagnosis(trace_id, Missing("not_retrieved", True, RERUN))
+        elif case in held_failures[:2]:
+            store.save_diagnosis(trace_id, Ignored(RERUN, ((0, 2),)))
+    plan, _ = _sweep.plan_sweep(store, store.run(run), rounds=2, max_settings=6, holdout=0.5, seed=0, tolerance=None)
+    assert plan.split == split
+    assert plan.counts == {FailureKind.NOT_RETRIEVED: 3} and plan.unlabeled == 0
+    assert [r.setting for r in plan.candidates] == [Setting(top_k=8), Setting(top_k=12)]
 
 
 def test_split_with_no_holdout_keeps_every_case_for_tuning() -> None:
