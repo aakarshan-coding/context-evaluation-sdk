@@ -140,6 +140,19 @@ P0 and P1 (branch `p1-capture`). Where the code departs from the sketch, and why
 - The P3/P4 test sketches (`test_acceptance.py`, `test_diagnose_table.py`) carry a module-level skip marker naming the phase instead of failing on `NotImplementedError`.
 - The pinecone codec synthesizes injected matches as `type(matches[0])(id=, score=, values=, metadata=)` and falls back to a small attribute-and-item object when that constructor refuses the kwargs.
 
+P2 (branch `p2-runs`).
+
+- The demo retrieves `TOP_K = 4`, not 3. The not_retrieved gold ranks 5th for its question, inside the 5-to-10 band, so `top_k=10` retrieves it. `tests/test_demo.py` asserts every planted rank directly, plus the replay outcomes each label needs (inject, gold to top, only gold) through `_runner.execute` with the real gold transforms. A corpus edit that would change a P3 label fails there first.
+- `Planted.expected` is `Label | None`. `None` marks a healthy case that passes at baseline (`passes_baseline`). PLANTED holds six failure cases and two healthy ones. The irrelevant case's distractor is a chunk tagged `[FORUM]`. `planted.write_jsonl` and `python -m contexteval.demo.planted` write the import file.
+- `fake_llm.evaluate(rule, question, chunks, state_file)` holds the rule match so tests can call it without HTTP. With no project around the cwd, the flaky state file falls back to the system temp directory instead of creating a `.contexteval/` the user never asked for. The transport resolves the default state file per request, so a cached client follows the cwd's project.
+- `app.collection()` is a per-process `lru_cache` over an ephemeral client. It uses a fixed collection name and `upsert`, so several ephemeral clients in one process share one collection without conflicts.
+- Providers take an optional `client` (an SDK client) so tests inject a mock transport. The default OpenAI model is `gpt-4.1-mini`. `AnthropicProvider` keeps `claude-haiku-4-5` as its default because current Claude models (Haiku 5.5, Sonnet 5.5) return a 400 on non-default sampling parameters. For those models temperature is omitted. For older models it is sent as `extra_body={"temperature": 0}`, because anthropic 1.x removed `temperature` from `messages.create`'s signature. `PRICES` covers gpt-4.1-mini, gpt-4.1-nano, gpt-4o-mini, claude-haiku-4-5, claude-haiku-5-5, claude-sonnet-4-6, and claude-sonnet-5-5.
+- `_runner.execute` re-raises `InterventionNotApplicable` instead of storing it as a crash, per graft 3. Every other exception still becomes `Crashed`.
+- The sketch's `run_suite` name is kept. `_runner.estimate_grading` is new. It is the `run` command's estimate, and it assumes that every case needs one LLM grade (worst case). The app's own calls are reported from the last baseline run when one exists, because the app model is unknown before the run.
+- `build-tests --import` makes no LLM calls, so it prints no estimate and asks for no confirmation. The import's test set is the file stem. Generated cases go to the `synthetic` test set. `import_tests` also reads `.csv` files.
+- `confirm` treats EOF or an unreadable stdin as "no" and exits 2, so a script that omits `--yes` never blocks.
+- `run_experiment` is still `NotImplementedError` (P4).
+
 ## Open questions and risks
 
 - Should the flaky rerun also run before the missing confirmation? The sketch runs it first for every ground-truth case, reading plan item 3's "before replay" literally. The other reading skips it for missing, which saves one call per missing case.
