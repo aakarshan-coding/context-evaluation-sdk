@@ -17,10 +17,10 @@ v1 is done when all of these hold:
 
 Each item was a gap in the design notes. The choice and reason are recorded here.
 
-1. **Gold evidence across chunkings.** The user's vector store chunks documents its own way, so chunk IDs from test generation cannot match. Each test case stores an `evidence` passage, quoted verbatim from the source document. A chunk or prompt "contains gold" when it contains the normalized evidence text, or at least 80% of the evidence tokens. The token rule handles evidence split across a chunk boundary.
+1. **Gold evidence across chunkings.** The user's vector store chunks documents its own way, so chunk IDs from test generation cannot match. Each test case stores an `evidence` passage, quoted verbatim from the source document. A chunk or prompt "contains gold" when it contains the normalized evidence text, or at least 80% of the evidence tokens inside a sliding window about 1.5 times the evidence length. The token rule handles evidence split across a chunk boundary. The window stops a long prompt from matching on scattered common words (amended in docs/architecture.md).
 2. **Grading answers.** A grader decides pass or fail. Fast path: the normalized expected answer appears in the answer. Otherwise an LLM grader judges agreement at temperature 0.
 3. **Nondeterminism.** Before replay, the diagnoser re-runs the baseline once. If it now passes, the label is `flaky` and replay stops. Replays never change the user's LLM settings.
-4. **Labels.** `missing` (with cause `not_retrieved` or `dropped`), `irrelevant`, `ignored`, `not_context`, `flaky`. Traces without ground truth get a judge label with `source=judge`.
+4. **Labels.** `missing` (with cause `not_retrieved` or `dropped`), `irrelevant`, `ignored`, `not_context`, `flaky`. Traces without ground truth get a judge label with `source=judge`. The judge may also return `no_failure` (amended in docs/architecture.md).
 5. **Replay decision table.** Only for failures where gold was in the prompt.
    - Gold moved to the top, other chunks kept, now passes: `ignored`. This is the least invasive fix, so it wins.
    - Else, only gold chunks kept, now passes: `irrelevant`.
