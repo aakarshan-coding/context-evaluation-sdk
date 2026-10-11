@@ -223,6 +223,12 @@ def judge(trace: Trace, provider: Provider) -> Judged:
 # --- a run ----------------------------------------------------------------------
 
 
+# How diagnose_run treats one pending trace. Skipped paths are counted, never diagnosed:
+# a crash has no answer to explain, and an empty production answer (a streamed response the
+# hooks could not read) would have the judge label text that was never captured.
+PendingPath = Literal["replay", "judge", "crashed", "no_answer"]
+
+
 @dataclass(frozen=True)
 class Pending:
     """One trace still to diagnose. `case` is None for production traces; a case without
@@ -232,12 +238,13 @@ class Pending:
     case: TestCase | None
 
     @property
-    def evidence(self) -> Evidence | None:
-        return self.case.evidence if self.case is not None else None
-
-    @property
-    def crashed(self) -> bool:
-        return isinstance(self.stored.trace.outcome, Crashed)
+    def path(self) -> PendingPath:
+        outcome = self.stored.trace.outcome
+        if isinstance(outcome, Crashed):
+            return "crashed"
+        if self.case is not None and self.case.evidence is not None:
+            return "replay"
+        return "judge" if outcome.text.strip() else "no_answer"
 
 
 def pending(store: Store, run: RunId, *, force: bool = False) -> list[Pending]:
@@ -256,8 +263,8 @@ def pending(store: Store, run: RunId, *, force: bool = False) -> list[Pending]:
 def estimate_diagnosis(provider: Provider, todo: Sequence[Pending]) -> Estimate:
     """SDK calls only (the app's own calls are reported separately): one judge call per
     judge-path trace, and worst case one grade per replay for ground-truth cases."""
-    judged = [_judge_request(p.stored.trace) for p in todo if not p.crashed and p.evidence is None]
-    cases = [p.case for p in todo if not p.crashed and p.case is not None and p.case.evidence is not None]
+    judged = [_judge_request(p.stored.trace) for p in todo if p.path == "judge"]
+    cases = [p.case for p in todo if p.path == "replay" and p.case is not None]
     total = estimate(provider.model, [r.system + r.user for r in judged], _JUDGE_OUTPUT_TOKENS)
     return total + estimate_grading(provider, cases * MAX_REPLAYS)
 
@@ -267,6 +274,7 @@ class DiagnoseReport:
     diagnosed: int
     skipped_existing: int
     skipped_crashed: int  # crashed traces are listed as failures but not diagnosed
+    skipped_no_answer: int  # judge-path traces with an empty answer (streamed responses)
 
 
 OnDiagnosis = Callable[[StoredTrace, Diagnosis], None]
@@ -284,6 +292,7 @@ def diagnose_run(
 ) -> DiagnoseReport:
     """For each failed trace in `run` (all traces for production runs):
     - skip if already diagnosed and not force (idempotent reruns resume where a crash stopped)
+    - skip and count crashed traces and judge-path traces with no answer text
     - no case / no evidence -> judge
     - else locate_gold, build the Replay closure over (app, case, grade), diagnose_case
     - save_diagnosis per trace as it completes
@@ -292,11 +301,12 @@ def diagnose_run(
     info = store.run(run)
     todo = pending(store, run, force=force)
     candidates = store.traces(run, failed_only=info.kind != "production")
-    skipped_existing = len(candidates) - len(todo)
-    diagnosed = skipped_crashed = 0
+    skipped = {"crashed": 0, "no_answer": 0}
+    diagnosed = 0
     for p in todo:
-        if p.crashed:
-            skipped_crashed += 1
+        path = p.path
+        if path == "crashed" or path == "no_answer":
+            skipped[path] += 1
             continue
         if p.case is None or p.case.evidence is None:
             diagnosis: Diagnosis = judge(p.stored.trace, provider)
@@ -309,4 +319,4 @@ def diagnose_run(
         store.save_diagnosis(p.stored.id, diagnosis)
         on_diagnosis(p.stored, diagnosis)
         diagnosed += 1
-    return DiagnoseReport(diagnosed, skipped_existing, skipped_crashed)
+    return DiagnoseReport(diagnosed, len(candidates) - len(todo), skipped["crashed"], skipped["no_answer"])

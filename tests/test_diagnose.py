@@ -259,3 +259,20 @@ def test_locate_gold_names_the_ladder_steps_that_would_change_nothing() -> None:
     assert alone.unchanged == {ReplayStep.GOLD_TO_TOP, ReplayStep.ONLY_GOLD}
     second = locate_gold(GOLD, _event_trace(CASE.question, [OFF_TOPIC, GOLD.text], [OFF_TOPIC, GOLD.text], [OFF_TOPIC, GOLD.text]))
     assert second.unchanged == frozenset()
+
+
+def test_diagnose_run_skips_production_traces_with_no_answer_text(store: Store) -> None:
+    """Review Y4. A streamed production response is stored with an empty answer. Defect: the
+    judge is paid to label an answer that was never captured, and its verdict reads as a finding
+    about the app. Such traces are skipped and counted, and the estimate leaves them out."""
+    run = store.new_run("production", None, BASELINE)
+    store.add_trace(run, _trace([OFF_TOPIC], [OFF_TOPIC], answer=""))
+    store.add_trace(run, _trace([GOLD.text], [GOLD.text], answer="7 am to 9 pm"))
+    provider = FakeProvider()
+    todo = _diagnose.pending(store, run)
+    assert _diagnose.estimate_diagnosis(provider, todo).calls == 1
+
+    report = diagnose_run(store, run, None, make_grader(provider), provider)
+    assert (report.diagnosed, report.skipped_no_answer) == (1, 1)
+    assert len(provider.requests) == 1
+    assert [s.diagnosis is None for s in store.traces(run)] == [True, False]

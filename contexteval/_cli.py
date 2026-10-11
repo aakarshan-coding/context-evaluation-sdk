@@ -285,7 +285,7 @@ def cmd_diagnose(args: argparse.Namespace) -> int:
             if spec is None:
                 raise UserError(f"run {run.id} has no app recorded; pass one with `contexteval init --app`")
             app = _runner.load_app(spec)
-            ground_truth = sum(p.evidence is not None and not p.crashed for p in todo)
+            ground_truth = sum(p.path == "replay" for p in todo)
             print(f"app: up to {ground_truth * _diagnose.MAX_REPLAYS} replay calls to {spec} ({ground_truth} failures with evidence)")
         confirm(_diagnose.estimate_diagnosis(provider, todo), args.yes)
         print(f"run {run.id}:")
@@ -297,7 +297,7 @@ def cmd_diagnose(args: argparse.Namespace) -> int:
             raise UserError(f"{e} (diagnoses so far are saved; rerun to resume)") from None
         print(
             f"diagnosed {report.diagnosed}, skipped {report.skipped_existing} already labeled, "
-            f"skipped {report.skipped_crashed} crashed"
+            f"skipped {report.skipped_crashed} crashed, skipped {report.skipped_no_answer} with no answer text"
         )
         return 0
     finally:
