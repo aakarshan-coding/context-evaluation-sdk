@@ -86,11 +86,42 @@ def li_retriever() -> Any:
     return VectorStoreIndex(nodes=nodes, embed_model=HashEmbedModel()).as_retriever(similarity_top_k=2)
 
 
+@pytest.fixture
+def chroma_col() -> Any:
+    """A raw chromadb collection holding DOCS, so a hooked `Collection.query` sits under a retriever."""
+    client = chromadb.EphemeralClient(settings=chromadb.Settings(anonymized_telemetry=False))
+    col = client.create_collection(f"docs_{uuid.uuid4().hex}", embedding_function=HashEmbedding())
+    col.add(ids=list(DOCS), documents=list(DOCS.values()))
+    return col
+
+
 class FixedLC(LCBaseRetriever):
     """A LangChain retriever with no top_k knob of any kind."""
 
     def _get_relevant_documents(self, query: str, *, run_manager: CallbackManagerForRetrieverRun) -> list[Document]:
         return [Document(page_content=DOCS["d1"], id="d1")]
+
+
+class ChromaLC(LCBaseRetriever):
+    """The common custom-retriever shape: a BaseRetriever subclass that queries chromadb itself. Its
+    `n` is not a knob contexteval knows; the hooked `Collection.query` underneath is."""
+
+    col: Any
+    n: int = 2
+
+    def _get_relevant_documents(self, query: str, *, run_manager: CallbackManagerForRetrieverRun) -> list[Document]:
+        rows = self.col.query(query_texts=[query], n_results=self.n)
+        return [Document(page_content=t, id=i) for t, i in zip(rows["documents"][0], rows["ids"][0])]
+
+
+class WrapperLC(LCBaseRetriever):
+    """A wrapper in the shape of ContextualCompressionRetriever or MultiQueryRetriever: no knob of
+    its own, delegating to a `base_retriever` whose `invoke` is hooked too."""
+
+    base_retriever: LCBaseRetriever
+
+    def _get_relevant_documents(self, query: str, *, run_manager: CallbackManagerForRetrieverRun) -> list[Document]:
+        return self.base_retriever.invoke(query, config={"callbacks": run_manager.get_child()})[::-1]
 
 
 class BoomLC(LCBaseRetriever):
@@ -174,9 +205,73 @@ def test_knob_is_restored_when_the_retriever_raises(hooks: None) -> None:
     assert _hooks._knobs == {}
 
 
+def test_custom_langchain_retriever_over_hooked_chroma_takes_top_k_from_the_inner_call(hooks: None, chroma_col: Any) -> None:
+    """Review P1. Defect: since `BaseRetriever.invoke` is hooked, a custom retriever with no knob
+    of its own owns the event and refuses top_k, although the hooked chromadb call it makes
+    underneath could apply it (and did under 0.2.0). top_k ownership passes to the outermost
+    hooked layer that can apply it; the outermost still records the one event, with the knob
+    that was actually set."""
+    retriever = ChromaLC(col=chroma_col)
+    with capture.active_run(QUESTION, Intervention(top_k=4)) as run:
+        docs = retriever.invoke(QUESTION)
+    assert len(docs) == 4 and run.not_applicable is None
+    (ev,) = run.retrievals
+    assert ev.source == "langchain" and len(ev.retrieved) == 4 and ev.params["n_results"] == 4
+    with capture.active_run(QUESTION) as run:
+        assert len(retriever.invoke(QUESTION)) == 2
+    (ev,) = run.retrievals
+    assert "n_results" not in ev.params
+
+
+def test_wrapper_retriever_hands_top_k_to_its_base_retriever(hooks: None, lc_retriever: Any) -> None:
+    """Review P1. Defect: a wrapper retriever (compression, multi-query) holding a `base_retriever`
+    refuses top_k because the wrapper has no `search_kwargs`, while the base retriever's hooked
+    `invoke` underneath has the knob. The base applies and restores it; the wrapper records one
+    event with `k` as applied."""
+    users_kwargs = lc_retriever.search_kwargs
+    wrapper = WrapperLC(base_retriever=lc_retriever)
+    with capture.active_run(QUESTION, Intervention(top_k=4)) as run:
+        docs = wrapper.invoke(QUESTION)
+    assert len(docs) == 4 and run.not_applicable is None
+    (ev,) = run.retrievals
+    assert ev.source == "langchain" and len(ev.retrieved) == 4 and ev.params["k"] == 4
+    assert [c.text for c in ev.retrieved] == [d.page_content for d in docs]
+    assert lc_retriever.search_kwargs is users_kwargs and users_kwargs == {"k": 2}
+    assert _hooks._knobs == {}
+
+
+def test_per_call_k_is_overridden_and_the_event_records_the_applied_value(hooks: None, lc_retriever: Any) -> None:
+    """Review P2. Defect: `VectorStoreRetriever` merges call kwargs over `search_kwargs`, so an app
+    calling `invoke(q, k=1)` under top_k=4 still retrieves 1 document while the event claims
+    `k: 4`. The codec sees the bound call arguments and overrides the per-call k as well."""
+    with capture.active_run(QUESTION, Intervention(top_k=4)) as run:
+        docs = lc_retriever.invoke(QUESTION, k=1)
+    assert len(docs) == 4 and run.not_applicable is None
+    (ev,) = run.retrievals
+    assert len(ev.retrieved) == 4 and ev.params["k"] == 4
+    with capture.active_run(QUESTION) as run:
+        assert len(lc_retriever.invoke(QUESTION, k=1)) == 1
+    assert run.retrievals[0].params["kwargs"] == {"k": 1}
+
+
+def test_decorated_function_without_a_knob_takes_top_k_from_the_hooked_store_inside(hooks: None, chroma_col: Any) -> None:
+    """Review P1, the same handoff for `@retriever(top_k=None)`: the function has no parameter to
+    set, but the hooked chromadb call inside has `n_results`. Defect: refused before the call."""
+
+    @retriever(top_k=None)
+    def search(query: str) -> list[str]:
+        return list(chroma_col.query(query_texts=[query], n_results=2)["documents"][0])
+
+    with capture.active_run(QUESTION, Intervention(top_k=3)) as run:
+        hits = search(QUESTION)
+    assert len(hits) == 3
+    assert [(e.source, len(e.retrieved), e.params["n_results"]) for e in run.retrievals] == [("retriever:search", 3, 3)]
+
+
 def test_retriever_without_a_top_k_knob_refuses_a_top_k_intervention(hooks: None) -> None:
     """Graft 3. Defect: a top_k experiment on a framework retriever with no knob silently runs the
-    baseline and the experiment table shows a fake no-change row."""
+    baseline and the experiment table shows a fake no-change row. The refusal comes once the
+    call has finished with no layer, inner or outer, having applied the value."""
     with capture.active_run(QUESTION, Intervention(top_k=5)) as run:
         with pytest.raises(InterventionNotApplicable, match="langchain: top_k=5 .* no search_kwargs or k"):
             FixedLC().invoke(QUESTION)
