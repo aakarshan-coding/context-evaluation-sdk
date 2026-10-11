@@ -6,6 +6,7 @@
     contexteval run [module:function] [--test-set NAME] [--yes]
     contexteval diagnose [--run ID] [--force] [--yes]
     contexteval experiment [module:function] KNOB=v1,v2 ... [--yes]
+    contexteval sweep [module:function] [--rounds N] [--max-settings N] [--holdout F] [--seed S] [--yes]
     contexteval ui [--port 8765] [--no-open]
 
 Every command finds the project by walking up from cwd to a .contexteval/ directory, except
@@ -25,7 +26,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Callable, Sequence
 
-from . import _diagnose, _runner, _testset
+from . import _diagnose, _runner, _sweep, _testset
 from ._intervention import InterventionNotApplicable, Setting
 from ._llm import Estimate, Provider, ProviderError, make_provider
 from ._store import PROJECT_DIR_NAME, Store, StoredTrace, find_project
@@ -359,6 +360,97 @@ def cmd_experiment(args: argparse.Namespace) -> int:
         store.close()
 
 
+def _fraction(value: str) -> float:
+    """Boundary check for --holdout: a share of the cases, 0 (none held out) up to but not 1."""
+    try:
+        f = float(value)
+    except ValueError:
+        f = -1.0
+    if not 0 <= f < 1:
+        raise argparse.ArgumentTypeError(f"--holdout must be a fraction from 0 up to but not including 1, got {value!r}")
+    return f
+
+
+def _positive(value: str) -> int:
+    try:
+        n = int(value)
+    except ValueError:
+        n = 0
+    if n < 1:
+        raise argparse.ArgumentTypeError(f"expected a positive integer, got {value!r}")
+    return n
+
+
+def _print_plan(plan: _sweep.Plan, spec: str) -> None:
+    labeled = ", ".join(f"{kind.value} {n}" for kind, n in plan.counts.items())
+    print(f"sweep: run {plan.source_run}, {sum(plan.counts.values())} labeled failures ({labeled}); the baseline retrieved up to {plan.baseline_k} chunks")
+    if plan.unlabeled:
+        print(f"warning: {plan.unlabeled} failures have no label and do not guide the search; run `contexteval diagnose` to include them")
+    for kind, n, reason in plan.unfixable:
+        noun = "failure" if n == 1 else "failures"
+        print(f"  no setting can fix {n} {kind.value} {noun}: {reason}")
+    if not plan.candidates:
+        return
+    shown = plan.candidates[: plan.max_settings]
+    names = ", ".join(f"{r.setting.name} ({r.weight})" for r in shown)
+    print(f"candidates, heaviest first ({len(shown)} of {len(plan.candidates)}; the number is how many failures ask for it): {names}")
+    split = plan.split
+    print(f"split: {len(split.tune)} tune cases, {len(split.holdout)} holdout cases (seed {split.seed})")
+    if not split.holdout:
+        print("warning: no holdout cases, so the recommendation is not confirmed on cases the search did not see")
+    tune, held = len(split.tune), len(split.holdout)
+    print(
+        f"app: up to {plan.worst_case_app_calls} calls to {spec} "
+        f"({tune} tune cases x (1 baseline + {plan.round_size} settings x {plan.rounds} rounds) + {held} holdout cases x 2, worst case)"
+    )
+
+
+def cmd_sweep(args: argparse.Namespace) -> int:
+    project = require_project()
+    config = load_config(project)
+    spec = args.app or config.app
+    if spec is None:
+        raise UserError("no app given; pass MODULE:FUNCTION or run `contexteval run MODULE:FUNCTION` first")
+    store = Store.open(project)
+    try:
+        source = store.latest_run("baseline")
+        if source is None:
+            raise UserError("no baseline run yet; run `contexteval run` and `contexteval diagnose` first")
+        try:
+            plan, cases = _sweep.plan_sweep(store, source, rounds=args.rounds, max_settings=args.max_settings, holdout=args.holdout, seed=args.seed)
+        except _sweep.SweepNotPossible as e:
+            raise UserError(str(e)) from None
+        _print_plan(plan, spec)
+        if not plan.counts:
+            print(f"run {source.id} has no labeled failure to fix; nothing to sweep")
+            return 0
+        if not plan.candidates:
+            print("Keep the current settings. No setting addresses the labels seen, for the reasons above.")
+            return 0
+        provider = _provider(config)
+        app = _runner.load_app(spec, pinecone_text_key=config.pinecone_text_key)
+        graded = [cases[c] for c in plan.split.tune] * (1 + plan.round_size * plan.rounds) + [cases[c] for c in plan.split.holdout] * 2
+        confirm(_runner.estimate_grading(provider, graded), args.yes)
+        try:
+            experiment, report = _sweep.run_sweep(store, spec, app, cases, _runner.make_grader(provider), plan)
+        except ProviderError as e:
+            raise UserError(f"{e} (the sweep's finished runs are stored as an experiment)") from None
+        except InterventionNotApplicable as e:
+            raise UserError(f"the app's retrieval cannot take a candidate setting: {e}") from None
+        table = {row.run_id: row for row in store.experiment_table(experiment)}
+        print(f"experiment {experiment} (sweep)")
+        for number, round_runs in enumerate(report.rounds, 1):
+            print(f"round {number}, {len(plan.split.tune)} tune cases")
+            print(format_experiment_table([table[report.baseline_run], *(table[r] for r in round_runs)]))
+        if report.holdout_runs:
+            print(f"holdout, {len(plan.split.holdout)} cases")
+            print(format_experiment_table([table[r] for r in report.holdout_runs]))
+        print(_sweep.recommendation_line(report, list(table.values())))
+        return 0
+    finally:
+        store.close()
+
+
 def format_experiment_table(rows: Sequence[ExperimentRow]) -> str:
     header = ("setting", "accuracy", "passed", "mean input tokens", "mean latency ms", "total cost")
     body = [
@@ -437,6 +529,15 @@ def _args_experiment(p: argparse.ArgumentParser) -> None:
     p.add_argument("--yes", action="store_true")
 
 
+def _args_sweep(p: argparse.ArgumentParser) -> None:
+    p.add_argument("app", nargs="?", metavar="MODULE:FUNCTION")
+    p.add_argument("--rounds", type=_positive, default=_sweep.DEFAULT_ROUNDS, metavar="N", help=f"search rounds; later rounds combine winners (default {_sweep.DEFAULT_ROUNDS})")
+    p.add_argument("--max-settings", type=_positive, default=_sweep.DEFAULT_MAX_SETTINGS, metavar="N", help=f"settings tried per round (default {_sweep.DEFAULT_MAX_SETTINGS})")
+    p.add_argument("--holdout", type=_fraction, default=_sweep.DEFAULT_HOLDOUT, metavar="F", help=f"share of cases kept to confirm the winner (default {_sweep.DEFAULT_HOLDOUT}; 0 for a tiny set)")
+    p.add_argument("--seed", type=int, default=0, metavar="S", help="seed of the tune/holdout split (default 0)")
+    p.add_argument("--yes", action="store_true")
+
+
 def _args_ui(p: argparse.ArgumentParser) -> None:
     p.add_argument("--port", type=int, default=8765)
     p.add_argument("--no-open", action="store_true")
@@ -455,6 +556,7 @@ COMMANDS: dict[str, Command] = {
     "run": Command(cmd_run, "run every test case through your answer() and grade it", _args_run),
     "diagnose": Command(cmd_diagnose, "label each failure of a run", _args_diagnose),
     "experiment": Command(cmd_experiment, "run a settings grid and compare", _args_experiment),
+    "sweep": Command(cmd_sweep, "pick settings from the latest diagnosis, try them, and recommend one", _args_sweep),
     "ui": Command(cmd_ui, "serve the local dashboard", _args_ui),
 }
 

@@ -10,8 +10,8 @@ import pytest
 
 from contexteval import _cli, _sweep
 from contexteval._intervention import BASELINE, GoldToTop, InjectEvidence, OnlyGold, Order, Setting
-from contexteval._sweep import FailureKind, Fixable, Unfixable
 from contexteval._store import Store
+from contexteval._sweep import FailureKind, Fixable, Unfixable
 from contexteval.types import (
     CaseId,
     Evidence,
@@ -25,6 +25,7 @@ from contexteval.types import (
     NotContext,
     ReplayOutcome,
     ReplayStep,
+    RunId,
     TestCase,
 )
 
@@ -157,3 +158,275 @@ def test_split_with_no_holdout_keeps_every_case_for_tuning() -> None:
     assert none.holdout == () and set(none.tune) == {c.id for c in cases}
     tiny = _sweep.split_cases(cases[:1], {cases[0].id}, holdout=0.3, seed=1)
     assert tiny.holdout == () and tiny.tune == (cases[0].id,)
+
+
+# --- the sweep through the CLI -------------------------------------------------------
+
+EASY = [f"easy question {i}?" for i in range(4)]
+HARD = [f"hard question {i}?" for i in range(6)]
+ALL = EASY + HARD
+APP_SOURCE = '''
+"""Scripted app for the sweep tests. Retrieves `limit` chunks that never hold the evidence, so
+every hard case is missing/not_retrieved. With exactly 4 chunks, a question is answered right
+only when pass_at_4.json lists it; with any other count, easy questions are right and hard ones wrong."""
+import json
+from pathlib import Path
+
+import contexteval
+
+HARD = %r
+
+
+@contexteval.retriever(top_k="limit")
+def search(query: str, limit: int = 2) -> list[str]:
+    return [f"chunk {i} about {query}" for i in range(limit)]
+
+
+def answer(question: str) -> str:
+    hits = search(question)
+    if len(hits) == 4:
+        allowed = json.loads(Path("pass_at_4.json").read_text(encoding="utf-8"))
+        return "right" if question in allowed else "wrong"
+    return "wrong" if question in HARD else "right"
+'''
+
+
+def _write_cases(project: Path, questions: list[str]) -> None:
+    lines = [json.dumps({"question": q, "expected_answer": "right", "evidence": f"the fact behind {q}"}) for q in questions]
+    (project / "cases.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _scripted_project(project: Path, module: str, pass_at_4: list[str], questions: list[str] = ALL) -> str:
+    """init, import the cases, run, diagnose. Returns the app spec. `module` is unique per test
+    because the CLI imports it from cwd and Python caches it for the process."""
+    (project / f"{module}.py").write_text(APP_SOURCE % HARD, encoding="utf-8")
+    (project / "pass_at_4.json").write_text(json.dumps(pass_at_4), encoding="utf-8")
+    _write_cases(project, questions)
+    assert _cli.main(["init", "--provider", "fake"]) == 0
+    assert _cli.main(["build-tests", "--import", "cases.jsonl"]) == 0
+    assert _cli.main(["run", f"{module}:answer", "--yes"]) == 0
+    assert _cli.main(["diagnose", "--yes"]) == 0
+    return f"{module}:answer"
+
+
+def _sweep_runs(store: Store) -> tuple[_sweep.SweepReport, dict[int, tuple[Setting, int]]]:
+    """The latest sweep's report and, per run id, its setting and trace count."""
+    info = store.experiments()[0]
+    assert info.kind == "sweep" and info.report is not None
+    report = _sweep.SweepReport.from_json(info.report)
+    runs = {r.run.id: (r.run.setting, r.traces) for r in store.runs() if r.experiment_id == info.id}
+    return report, runs
+
+
+def test_demo_sweep_recommends_a_larger_top_k_and_names_the_dropped_case_as_unfixable(project: Path, hooks: None, capsys: pytest.CaptureFixture[str]) -> None:
+    """Through `_cli.main` on the planted demo. Defects: the planted not_retrieved case does not
+    lead to a top_k candidate, the recommended setting does not carry the larger top_k that fixes
+    it, the dropped case is offered a setting instead of the reason none can help, --holdout 0 is
+    refused or not warned about, or the sweep is stored as a manual experiment."""
+    pytest.importorskip("chromadb")
+    from contexteval.demo import planted
+
+    assert _cli.main(["init", "--provider", "fake"]) == 0
+    assert _cli.main(["build-tests", "--import", str(planted.write_jsonl(project / planted.IMPORT_FILE))]) == 0
+    assert _cli.main(["run", "contexteval.demo.app:answer", "--yes"]) == 0
+    assert _cli.main(["diagnose", "--yes"]) == 0
+    capsys.readouterr()
+    assert _cli.main(["sweep", "--holdout", "0", "--yes"]) == 0
+    out = capsys.readouterr().out
+    assert "no setting can fix 1 missing/dropped failure: retrieval found the gold chunk and your own code removed it" in out
+    assert "no setting can fix 1 not_context failure" in out and "no setting can fix 1 flaky failure" in out
+    assert "warning: no holdout cases" in out
+    assert "candidates, heaviest first" in out and "top_k=8 (1)" in out and "top_k=12 (1)" in out
+    final = out.rstrip().splitlines()[-1]
+    assert final.startswith("Set ") and "top_k=8" in final and "(no holdout cases, so this is unconfirmed)" in final
+
+    store = Store.open(project)
+    try:
+        report, runs = _sweep_runs(store)
+        assert report.recommended is not None and report.holdout_runs is None and report.split.holdout == ()
+        recommended, traces = runs[report.recommended]
+        assert recommended.top_k == 8 and traces == len(planted.PLANTED)
+        assert report.counts[FailureKind.NOT_RETRIEVED] == 1 and report.counts[FailureKind.DROPPED] == 1
+        for setting, _ in runs.values():
+            assert not any(isinstance(t, GOLD_TRANSFORMS) for t in setting.intervention().transforms)
+        (not_retrieved,) = [p for p in planted.PLANTED if p.cause == "not_retrieved"]
+        passed = {s.trace.test.case_id: s.trace.test.passed for s in store.traces(report.recommended) if s.trace.test}
+        baseline = {s.trace.test.case_id: s.trace.test.passed for s in store.traces(report.baseline_run) if s.trace.test}
+        assert passed[not_retrieved.case.id] is True and baseline[not_retrieved.case.id] is False
+    finally:
+        store.close()
+
+
+def test_a_setting_that_wins_on_tune_but_loses_on_holdout_is_not_recommended(project: Path, hooks: None, capsys: pytest.CaptureFixture[str]) -> None:
+    """Overfitting guard. Defect: the sweep recommends the tune winner without the holdout check,
+    or recommends it when the holdout rows show it losing. Under top_k=4 the scripted app passes
+    exactly the tune cases, which the test learns from the same seeded split the sweep uses, and
+    fails every holdout case, including the ones the baseline passed."""
+    _scripted_project(project, "sweep_app_overfit", [])
+    store = Store.open(project)
+    try:
+        cases = store.cases()
+    finally:
+        store.close()
+    hard_ids = {c.id for c in cases if c.question in HARD}
+    split = _sweep.split_cases(cases, hard_ids, holdout=0.5, seed=3)
+    tune = [c.question for c in cases if c.id in set(split.tune)]
+    assert len(tune) == 5 and len(set(tune) & set(HARD)) == 3
+    (project / "pass_at_4.json").write_text(json.dumps(tune), encoding="utf-8")
+    capsys.readouterr()
+    assert _cli.main(["sweep", "--holdout", "0.5", "--seed", "3", "--yes"]) == 0
+    out = capsys.readouterr().out
+    final = out.rstrip().splitlines()[-1]
+    assert final.startswith("Keep the current settings. top_k=4 won on the tune cases (40% -> 100%) but lost on the holdout cases (40% -> 0%)")
+    assert "holdout, 5 cases" in out
+
+    store = Store.open(project)
+    try:
+        report, runs = _sweep_runs(store)
+        assert report.recommended is None and report.holdout_runs is not None
+        assert [runs[r][0] for r in report.holdout_runs] == [BASELINE, Setting(top_k=4)]
+        assert all(runs[r][1] == 5 for r in report.holdout_runs)
+        assert set(report.split.tune) == set(split.tune) and set(report.split.holdout) == set(split.holdout)
+    finally:
+        store.close()
+
+
+def test_recommendation_states_the_change_and_the_numbers_in_plain_words(project: Path, hooks: None, capsys: pytest.CaptureFixture[str]) -> None:
+    """The user-facing contract for the final line. Defect: a recommendation that names the run
+    id or the row instead of the knob to set, or that leaves out the holdout accuracy or the
+    cost. The scripted app passes every case under top_k=4, on both splits."""
+    _scripted_project(project, "sweep_app_apply", ALL)
+    capsys.readouterr()
+    assert _cli.main(["sweep", "--holdout", "0.5", "--seed", "1", "--yes"]) == 0
+    out = capsys.readouterr().out
+    final = out.rstrip().splitlines()[-1]
+    assert final.startswith("Set top_k=4. Accuracy 40% -> 100% (holdout 40% -> 100%). Input token use is unknown; mean latency ")
+    assert final.endswith(" ms.")
+    assert "round 1, 5 tune cases" in out and "holdout, 5 cases" in out
+    assert "round 2" not in out  # both candidates set top_k, so there is nothing to combine
+    store = Store.open(project)
+    try:
+        report, runs = _sweep_runs(store)
+        assert report.recommended is not None and runs[report.recommended][0] == Setting(top_k=4)
+        assert [runs[r][0] for r in report.rounds[0]] == [Setting(top_k=4), Setting(top_k=6)] and len(report.rounds) == 1
+    finally:
+        store.close()
+
+
+def test_max_settings_caps_the_runs_per_round(project: Path, hooks: None, capsys: pytest.CaptureFixture[str]) -> None:
+    """Defect: --max-settings ignored, so a sweep the user capped to stay inside a budget runs
+    every candidate anyway."""
+    _scripted_project(project, "sweep_app_cap", ALL)
+    capsys.readouterr()
+    assert _cli.main(["sweep", "--max-settings", "1", "--holdout", "0", "--yes"]) == 0
+    out = capsys.readouterr().out
+    assert "candidates, heaviest first (1 of 2" in out
+    store = Store.open(project)
+    try:
+        report, runs = _sweep_runs(store)
+        assert [runs[r][0] for r in report.rounds[0]] == [Setting(top_k=4)] and len(report.rounds) == 1
+        assert len(runs) == 2  # the baseline and the one candidate
+    finally:
+        store.close()
+
+
+def test_estimate_counts_the_worst_case(project: Path, hooks: None, capsys: pytest.CaptureFixture[str]) -> None:
+    """Defect: a cost estimate below what the sweep can run (a round-2 combination or the holdout
+    runs left out), so the user confirms a smaller bill than the one they may get."""
+    spec = _scripted_project(project, "sweep_app_estimate", ALL)
+    store = Store.open(project)
+    try:
+        source = store.latest_run("baseline")
+        assert source is not None
+        plan, _ = _sweep.plan_sweep(store, source, rounds=3, max_settings=5, holdout=0.3, seed=0)
+        assert len(plan.candidates) == 2 and plan.round_size == 2
+        assert len(plan.split.tune) == 7 and len(plan.split.holdout) == 3
+        assert plan.worst_case_runs == [7] * (1 + 2 * 3) + [3, 3]
+        assert plan.worst_case_app_calls == 55
+        capsys.readouterr()
+        assert _cli.main(["sweep", "--rounds", "3", "--max-settings", "5", "--yes"]) == 0
+        out = capsys.readouterr().out
+        app_line, estimate_line = [ln for ln in out.splitlines() if ln.startswith(("app:", "estimate:"))]
+        assert app_line == f"app: up to 55 calls to {spec} (7 tune cases x (1 baseline + 2 settings x 3 rounds) + 3 holdout cases x 2, worst case)"
+        assert estimate_line.startswith("estimate: 55 LLM calls")
+        assert out.index(app_line) < out.index("experiment ")
+        _, runs = _sweep_runs(store)
+        actual = sum(traces for _, traces in runs.values())
+        assert actual == 7 * 3 + 3 * 2 and actual <= plan.worst_case_app_calls
+    finally:
+        store.close()
+
+
+def test_sweep_user_errors_and_nothing_to_do(project: Path, hooks: None, capsys: pytest.CaptureFixture[str]) -> None:
+    """Boundary: no baseline run, failures that were never diagnosed, a bad --holdout, and a run
+    that passed every case are one-line messages, never a traceback, and never an app call."""
+    assert _cli.main(["init", "--provider", "fake"]) == 0
+    assert _cli.main(["sweep", "some_app:answer", "--yes"]) == 1
+    (project / "sweep_app_errors.py").write_text(APP_SOURCE % HARD, encoding="utf-8")
+    (project / "pass_at_4.json").write_text("[]", encoding="utf-8")
+    _write_cases(project, EASY + HARD[:1])
+    assert _cli.main(["build-tests", "--import", "cases.jsonl"]) == 0
+    assert _cli.main(["run", "sweep_app_errors:answer", "--yes"]) == 0
+    assert _cli.main(["sweep", "--yes"]) == 1
+    err = capsys.readouterr().err
+    assert "no baseline run yet" in err and "none is labeled; run `contexteval diagnose` first" in err
+    with pytest.raises(SystemExit):
+        _cli.main(["sweep", "--holdout", "1.0", "--yes"])
+    with pytest.raises(SystemExit):
+        _cli.main(["sweep", "--rounds", "0", "--yes"])
+    (project / "pass_at_4.json").write_text(json.dumps(ALL), encoding="utf-8")
+    assert _cli.main(["diagnose", "--yes"]) == 0
+    capsys.readouterr()
+    assert _cli.main(["sweep", "--holdout", "0", "--yes"]) == 0
+    assert "Set top_k=4." in capsys.readouterr().out
+    store = Store.open(project)
+    try:
+        assert len([e for e in store.experiments() if e.kind == "sweep"]) == 1
+    finally:
+        store.close()
+
+
+def test_sweep_with_no_failures_or_only_unfixable_ones_runs_nothing(project: Path, hooks: None, capsys: pytest.CaptureFixture[str]) -> None:
+    """Defect: a sweep that starts an experiment and calls the app when the baseline passed every
+    case, or when every label is one no setting can fix."""
+    _scripted_project(project, "sweep_app_clean", [], EASY)
+    capsys.readouterr()
+    assert _cli.main(["sweep", "--yes"]) == 0
+    assert "nothing to sweep" in capsys.readouterr().out
+    store = Store.open(project)
+    try:
+        source = store.latest_run("baseline")
+        assert source is not None
+        (trace,) = store.traces(source.id)[:1]
+        store.save_diagnosis(trace.id, Flaky((ReplayOutcome(ReplayStep.BASELINE_RERUN, True, "right"),)))
+        store._conn.execute("UPDATE traces SET passed = 0 WHERE id = ?", (trace.id,))
+        store._conn.commit()
+    finally:
+        store.close()
+    assert _cli.main(["sweep", "--yes"]) == 0
+    out = capsys.readouterr().out
+    assert "no setting can fix 1 flaky failure" in out and out.rstrip().endswith("Keep the current settings. No setting addresses the labels seen, for the reasons above.")
+    store = Store.open(project)
+    try:
+        assert store.experiments() == []
+    finally:
+        store.close()
+
+
+def test_sweep_report_round_trips_through_json() -> None:
+    """Defect: a stored report that loses the holdout runs, the recommendation, or the split, so
+    the dashboard cannot mark the recommended row of an older sweep."""
+    report = _sweep.SweepReport(
+        source_run=RunId(1),
+        baseline_k=4,
+        counts={FailureKind.NOT_RETRIEVED: 2, FailureKind.FLAKY: 1},
+        split=_sweep.Split(5, 0.3, (CaseId("a"), CaseId("b")), (CaseId("c"),)),
+        baseline_run=RunId(2),
+        rounds=((RunId(3), RunId(4)), (RunId(5),)),
+        holdout_runs=(RunId(6), RunId(7)),
+        recommended=RunId(5),
+        reason="",
+    )
+    assert _sweep.SweepReport.from_json(json.loads(json.dumps(report.to_json()))) == report
+    kept = _sweep.SweepReport(report.source_run, 4, {}, report.split, report.baseline_run, (), None, None, "nothing beat the baseline")
+    assert _sweep.SweepReport.from_json(kept.to_json()) == kept
