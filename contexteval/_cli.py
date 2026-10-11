@@ -22,10 +22,11 @@ from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
 from typing import Callable, Sequence
 
-from . import _runner, _testset
+from . import _diagnose, _runner, _testset
 from ._intervention import Setting
 from ._llm import Estimate, Provider, ProviderError, make_provider
-from ._store import PROJECT_DIR_NAME, Store, find_project
+from ._store import PROJECT_DIR_NAME, Store, StoredTrace, find_project
+from .types import Diagnosis, RunId, explain, label_of
 
 CONFIG_FILE = "config.json"
 PROVIDERS = ("openai", "anthropic", "fake")
@@ -197,8 +198,54 @@ def cmd_run(args: argparse.Namespace) -> int:
         store.close()
 
 
+def _print_diagnosis(stored: StoredTrace, diagnosis: Diagnosis) -> None:
+    print(f"  {label_of(diagnosis).value:<12} {stored.trace.question}")
+    print(f"               {explain(diagnosis)}")
+
+
 def cmd_diagnose(args: argparse.Namespace) -> int:
-    raise NotImplementedError
+    project = require_project()
+    config = load_config(project)
+    store = Store.open(project)
+    try:
+        if args.run is not None:
+            try:
+                run = store.run(RunId(args.run))
+            except KeyError:
+                raise UserError(f"no run {args.run}; `contexteval ui` lists runs") from None
+        else:
+            latest = store.latest_run("baseline")
+            if latest is None:
+                raise UserError("no baseline run yet; run `contexteval run` first")
+            run = latest
+        todo = _diagnose.pending(store, run.id, force=args.force)
+        if not todo:
+            print(f"run {run.id}: nothing to diagnose; every failure is labeled (use --force to redo)")
+            return 0
+        provider = _provider(config)
+        app = None
+        if run.kind != "production":
+            spec = run.app or config.app
+            if spec is None:
+                raise UserError(f"run {run.id} has no app recorded; pass one with `contexteval init --app`")
+            app = _runner.load_app(spec)
+            ground_truth = sum(p.evidence is not None and not p.crashed for p in todo)
+            print(f"app: up to {ground_truth * _diagnose.MAX_REPLAYS} replay calls to {spec} ({ground_truth} failures with evidence)")
+        confirm(_diagnose.estimate_diagnosis(provider, todo), args.yes)
+        print(f"run {run.id}:")
+        try:
+            report = _diagnose.diagnose_run(
+                store, run.id, app, _runner.make_grader(provider), provider, force=args.force, on_diagnosis=_print_diagnosis
+            )
+        except (ProviderError, _diagnose.JudgeReplyError) as e:
+            raise UserError(f"{e} (diagnoses so far are saved; rerun to resume)") from None
+        print(
+            f"diagnosed {report.diagnosed}, skipped {report.skipped_existing} already labeled, "
+            f"skipped {report.skipped_crashed} crashed"
+        )
+        return 0
+    finally:
+        store.close()
 
 
 def cmd_experiment(args: argparse.Namespace) -> int:
