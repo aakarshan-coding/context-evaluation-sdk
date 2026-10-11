@@ -3,30 +3,38 @@ recommendation, through `_cli.main` where the user would see it."""
 
 from __future__ import annotations
 
+import itertools
 import json
 from pathlib import Path
+from typing import Callable, Sequence
 
 import pytest
 
 from contexteval import _cli, _sweep
-from contexteval._intervention import BASELINE, GoldToTop, InjectEvidence, OnlyGold, Order, Setting
+from contexteval._intervention import BASELINE, GoldToTop, InjectEvidence, InterventionNotApplicable, OnlyGold, Order, Setting
 from contexteval._store import Store
 from contexteval._sweep import FailureKind, Fixable, Unfixable
 from contexteval.types import (
+    Answered,
     CaseId,
     Evidence,
+    ExperimentId,
+    ExperimentRow,
     Flaky,
     Ignored,
     Irrelevant,
     Judged,
     JudgeVerdict,
     Label,
+    Metrics,
     Missing,
     NotContext,
     ReplayOutcome,
     ReplayStep,
     RunId,
     TestCase,
+    TestOutcome,
+    Trace,
 )
 
 GOLD_TRANSFORMS = (InjectEvidence, GoldToTop, OnlyGold)
@@ -216,6 +224,134 @@ def _sweep_runs(store: Store) -> tuple[_sweep.SweepReport, dict[int, tuple[Setti
     report = _sweep.SweepReport.from_json(info.report)
     runs = {r.run.id: (r.run.setting, r.traces) for r in store.runs() if r.experiment_id == info.id}
     return report, runs
+
+
+# --- the decision, with no app ----------------------------------------------------------
+
+_ROW_IDS = itertools.count(100)
+
+
+def _row(setting: Setting, passed: int, tokens: float = 0.0, latency: float = 1.0, cases: int = 8) -> ExperimentRow:
+    return ExperimentRow(RunId(next(_ROW_IDS)), setting.name, cases, passed, tokens, latency, None)
+
+
+def _plan(counts: dict[FailureKind, int], tune: Sequence[CaseId], holdout: Sequence[CaseId] = ()) -> _sweep.Plan:
+    return _sweep.Plan(
+        source_run=RunId(1),
+        baseline_k=K,
+        counts=counts,
+        unlabeled=0,
+        candidates=_sweep.rank_candidates(counts, K),
+        split=_sweep.Split(0, 0.3 if holdout else 0.0, tuple(tune), tuple(holdout)),
+        rounds=2,
+        max_settings=6,
+        tolerance=None,
+    )
+
+
+def _scripted_runner(
+    store: Store,
+    passes: Callable[[Setting, CaseId], bool],
+    tokens: Callable[[Setting], int] = lambda setting: 0,
+    refuse: Callable[[Setting], str | None] = lambda setting: None,
+    calls: list[Setting] | None = None,
+) -> _sweep.Runner:
+    """A Runner with no app. Stores one trace per case, passing when `passes` says so and
+    carrying `tokens` input tokens; raises InterventionNotApplicable before any trace when
+    `refuse` gives a reason. Every attempted setting is appended to `calls`."""
+
+    def run(experiment: ExperimentId, setting: Setting, cases: Sequence[TestCase]) -> RunId:
+        if calls is not None:
+            calls.append(setting)
+        reason = refuse(setting)
+        if reason is not None:
+            raise InterventionNotApplicable(reason)
+        run_id = store.new_run("experiment", "app:answer", setting, experiment)
+        for case in cases:
+            ok = passes(setting, case.id)
+            trace = Trace(
+                question=case.question,
+                outcome=Answered("right" if ok else "wrong"),
+                retrievals=(),
+                llm_calls=(),
+                metrics=Metrics(tokens(setting), 0, 1.0, None),
+                test=TestOutcome(case.id, ok, "substring"),
+                in_prompt=(),
+            )
+            store.add_trace(run_id, trace)
+        return run_id
+
+    return run
+
+
+def test_decide_is_a_pure_function_over_the_tune_and_holdout_rows() -> None:
+    """Review Q9. Defect: the recommendation rule lives in run_sweep's control flow (a `beats`
+    check, a `choose` call, the holdout comparison, the passed-over lookup) and cannot be tested
+    without runs; or one of its outcomes is wrong: a cheaper near-tie not taken under a window or
+    taken under window 0, a holdout loss recommended, a tie with the baseline recommended, or the
+    setting a recommendation passed over left out."""
+    Decision = _sweep.Decision
+    a, b, c = Setting(top_k=8), Setting(top_k=12), Setting(rerank="lexical")
+    table = {BASELINE: _row(BASELINE, 3, 100), a: _row(a, 5, 200), b: _row(b, 5, 300), c: _row(c, 4, 100)}
+    assert _sweep.decide(table, 0, None) == Decision(a, None, "")
+    assert _sweep.decide(table, 1, None) == Decision(c, a, "")
+    confirmed = {BASELINE: _row(BASELINE, 2, cases=3), a: _row(a, 3, cases=3)}
+    assert _sweep.decide(table, 0, confirmed) == Decision(a, None, "")
+    lost = {BASELINE: _row(BASELINE, 2, cases=3), a: _row(a, 1, cases=3)}
+    assert _sweep.decide(table, 0, lost) == Decision(
+        None, None, "top_k=8 won on the tune cases (38% -> 62%) but lost on the holdout cases (67% -> 33%), so it fits the tune cases rather than the app"
+    )
+    tied = {BASELINE: _row(BASELINE, 3, 100), a: _row(a, 3, 50), c: _row(c, 2, 100)}
+    assert _sweep.decide(tied, 2, None) == Decision(None, None, "no candidate beat the baseline on the tune cases (the best, top_k=8, passed 38% against 38%)")
+    assert _sweep.decide({BASELINE: _row(BASELINE, 3)}, 0, None) == Decision(None, None, "no candidate ran")
+    assert not hasattr(_sweep, "beats")
+
+
+def test_round_two_never_builds_on_a_setting_that_only_tied_the_baseline(store: Store) -> None:
+    """Review Q3. Defect: round 2 takes its base from the cheapest setting at the top pass count,
+    so a candidate that passed exactly the baseline's cases at fewer tokens is combined with every
+    other knob for a second round the user pays for, while the final pick says nothing beat the
+    baseline. Both use one rule: no setting beats the baseline, the search stops."""
+    cases = _cases(8)
+    store.upsert_cases("t", cases)
+    counts = {FailureKind.NOT_RETRIEVED: 1, FailureKind.IGNORED: 1}
+    plan = _plan(counts, [c.id for c in cases])
+    assert [r.setting.name for r in plan.candidates] == ["top_k=8", "top_k=12", "order=ends", "order=reverse", "compress=2"]
+    calls: list[Setting] = []
+    run = _scripted_runner(store, lambda setting, case_id: case_id < CaseId("c04"), lambda setting: 50 if setting == Setting(top_k=8) else 100, calls=calls)
+    experiment, report = _sweep.run_sweep(store, {c.id: c for c in cases}, plan, run)
+    assert calls == [BASELINE, *(r.setting for r in plan.candidates)]
+    assert len(report.rounds) == 1 and report.recommended is None and report.holdout_runs is None
+    assert report.reason == "no candidate beat the baseline on the tune cases (the best, top_k=8, passed 50% against 50%)"
+    assert _sweep.winner({s: _row(s, 4, t) for s, t in [(BASELINE, 100), (Setting(top_k=8), 50)]}, 2) is None
+
+
+def test_near_tie_prefers_more_passes_before_lower_latency() -> None:
+    """Review Q4. Defect: the near-tie key ranks latency before passes, so among contenders with
+    equal input tokens a setting that passes two fewer cases wins on 2 ms of latency."""
+    ends, rev = Setting(order=Order.ENDS), Setting(order=Order.REVERSE)
+    rows = {ends: _row(ends, 34, 500.0, 101.0, 40), rev: _row(rev, 32, 500.0, 99.0, 40)}
+    assert _sweep.choose(rows, 30, 2) == ends
+    rows[rev] = _row(rev, 32, 400.0, 99.0, 40)
+    assert _sweep.choose(rows, 30, 2) == rev
+
+
+def test_window_is_zero_when_the_source_run_recorded_no_input_tokens(project: Path, hooks: None, capsys: pytest.CaptureFixture[str]) -> None:
+    """Review Q4. Defect: a near-tie window on an app whose input tokens are unknown (no hooked
+    LLM call, so every row reads 0 tokens): the sweep prints a window it cannot apply and credits
+    --tolerance with a choice tokens never made. The window is 0 and the plan says why."""
+    _scripted_project(project, "sweep_app_no_tokens", EASY + HARD[:1])
+    capsys.readouterr()
+    assert _cli.main(["sweep", "--holdout", "0", "--tolerance", "1", "--yes"]) == 0
+    out = capsys.readouterr().out
+    assert "near-tie window: 0 (run 1 recorded no input tokens, so accuracy alone decides)" in out
+    assert "near-tie window: 1" not in out
+    store = Store.open(project)
+    try:
+        report, runs = _sweep_runs(store)
+        assert report.recommended is not None and runs[report.recommended][0] == Setting(top_k=4) and report.passed_over is None
+    finally:
+        store.close()
 
 
 def test_demo_sweep_recommends_a_larger_top_k_and_names_the_dropped_case_as_unfixable(project: Path, hooks: None, capsys: pytest.CaptureFixture[str]) -> None:
