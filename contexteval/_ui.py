@@ -16,6 +16,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib import resources
 from typing import Any, Callable
 
+from . import _sweep
 from . import _text as text
 from ._store import ExperimentInfo, RunSummary, Store, StoredTrace
 from .types import (
@@ -175,9 +176,13 @@ def _trace_detail_json(st: StoredTrace, store: Store) -> Json:
     }
 
 
-def _row_json(row: ExperimentRow) -> Json:
+def _row_json(row: ExperimentRow, split: str | None, recommended: bool) -> Json:
+    """`split` is "tune" or "holdout" for a sweep row and None for a hand-run grid's row."""
     return {
+        "run_id": row.run_id,
         "setting": row.setting_name,
+        "split": split,
+        "recommended": recommended,
         "cases": row.cases,
         "passed": row.passed,
         "accuracy": row.accuracy,
@@ -188,7 +193,19 @@ def _row_json(row: ExperimentRow) -> Json:
 
 
 def _experiment_json(store: Store, info: ExperimentInfo) -> Json:
-    return {"id": info.id, "created_at": info.created_at, "rows": [_row_json(r) for r in store.experiment_table(info.id)]}
+    rows = store.experiment_table(info.id)
+    report = _sweep.SweepReport.from_json(info.report) if info.report is not None else None
+    split: dict[RunId, str] = {}
+    if report is not None:
+        split.update({r: "tune" for r in (report.baseline_run, *(r for round_ in report.rounds for r in round_))})
+        split.update({r: "holdout" for r in report.holdout_runs or ()})
+    return {
+        "id": info.id,
+        "kind": info.kind,
+        "created_at": info.created_at,
+        "recommendation": _sweep.recommendation_line(report, rows) if report is not None else None,
+        "rows": [_row_json(r, split.get(r.run_id), report is not None and r.run_id == report.recommended) for r in rows],
+    }
 
 
 # --- handlers ----------------------------------------------------------------

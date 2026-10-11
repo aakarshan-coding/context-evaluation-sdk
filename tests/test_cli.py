@@ -16,7 +16,7 @@ from contexteval._llm import Estimate
 from contexteval._store import PROJECT_DIR_NAME, Store
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-COMMANDS = ["init", "build-tests", "run", "diagnose", "experiment", "ui"]
+COMMANDS = ["init", "build-tests", "run", "diagnose", "experiment", "sweep", "ui"]
 
 
 def test_python_m_help_lists_all_six_commands() -> None:

@@ -127,6 +127,7 @@ th:first-child, td:first-child { text-align: left; white-space: normal; min-widt
 th { white-space: normal; }
 th { font-size: 12px; color: var(--muted); font-weight: 600; }
 tr.best td { font-weight: 600; }
+.recommendation { font-weight: 600; margin-top: 0.75rem; }
 .bar { display: inline-block; height: 8px; border-radius: 4px; background: var(--accent); vertical-align: middle; margin-right: 6px; }
 .metrics { font-size: 13px; color: var(--muted); display: flex; flex-wrap: wrap; gap: 4px 14px; }
 .error { color: var(--fail); }
@@ -395,11 +396,12 @@ async function loadExperiments() {
     return;
   }
   const picker = el("select", { "aria-label": "Experiment" },
-    experiments.map((x) => el("option", { value: x.id, text: `#${x.id} ${x.created_at}` })));
+    experiments.map((x) => el("option", { value: x.id, text: `#${x.id} ${x.created_at}${x.kind === "sweep" ? " (sweep)" : ""}` })));
   const tableBox = el("div", { className: "table-wrap" });
   const render = () => {
     const x = experiments.find((e) => String(e.id) === picker.value);
-    clear(tableBox).append(experimentTable(x.rows));
+    clear(tableBox).append(experimentTable(x.rows, x.kind === "sweep"));
+    if (x.recommendation) tableBox.append(el("p", { className: "recommendation", text: x.recommendation }));
   };
   picker.addEventListener("change", render);
   if (experiments.length > 1) box.append(el("p", {}, el("label", { className: "muted" }, "Experiment ", picker)));
@@ -407,12 +409,13 @@ async function loadExperiments() {
   render();
 }
 
-function experimentTable(rows) {
+// A sweep marks the row it recommends; a hand-run grid marks the most accurate row.
+function experimentTable(rows, sweep) {
   const best = Math.max(...rows.map((r) => r.accuracy));
   return el("table", {},
     el("thead", {}, el("tr", {}, ["Setting", "Accuracy", "Passed", "Mean input tokens", "Mean latency", "Total cost"].map((h) => el("th", { scope: "col", text: h })))),
-    el("tbody", {}, rows.map((r) => el("tr", { className: r.accuracy === best && rows.length > 1 ? "best" : null },
-      el("td", { text: r.setting }),
+    el("tbody", {}, rows.map((r) => el("tr", { className: (sweep ? r.recommended : r.accuracy === best && rows.length > 1) ? "best" : null },
+      el("td", { text: r.split ? `${r.setting} (${r.split})` : r.setting }),
       el("td", {}, el("span", { className: "bar", style: `width:${Math.round(r.accuracy * 48)}px` }), fmt(r.accuracy * 100, 0) + "%"),
       el("td", { text: `${r.passed}/${r.cases}` }),
       el("td", { text: fmt(r.mean_input_tokens, 0) }),

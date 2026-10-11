@@ -19,7 +19,7 @@ from typing import Any, Iterator
 import pytest
 
 from contexteval import _cli, _ui
-from contexteval._intervention import BASELINE, Setting
+from contexteval._intervention import BASELINE, Order, Setting
 from contexteval._store import Store
 from contexteval.types import (
     Answered,
@@ -272,6 +272,57 @@ def test_experiments_endpoint_serves_experiment_table_rows(served: Served) -> No
     assert exp["rows"][1]["mean_input_tokens"] == 40
     assert exp["rows"][1]["total_cost_usd"] == pytest.approx(0.0004)
     assert _json(f"{served.url}/api/experiments/{served.seed.experiment}") == exp
+    assert exp["kind"] == "manual" and exp["recommendation"] is None
+    assert [(r["split"], r["recommended"]) for r in exp["rows"]] == [(None, False), (None, False)]
+
+
+def test_experiments_endpoint_marks_a_sweeps_recommended_row_and_its_splits(served: Served) -> None:
+    """v2 sweep. Defect: a sweep listed as a plain experiment, so the page marks its most accurate
+    tune row (which may be the one that lost on holdout) instead of the recommended row, shows no
+    recommendation, or cannot tell its tune rows from its holdout rows."""
+    from contexteval._sweep import FailureKind, Split, SweepReport
+
+    store = Store.open(Path.cwd())
+    try:
+        sweep = store.new_experiment("sweep")
+        runs = {}
+        for name, setting, outcomes in [
+            ("base", BASELINE, (False, True)),
+            ("wide", Setting(top_k=10), (True, True)),
+            ("ends", Setting(order=Order.ENDS), (True, True)),
+            ("hold_base", BASELINE, (True,)),
+            ("hold_wide", Setting(top_k=10), (True,)),
+        ]:
+            run = store.new_run("experiment", "app:answer", setting, experiment=sweep)
+            for case, passed in zip((REFUND, SHIPPING), outcomes):
+                store.add_trace(run, _trace(case, passed, "a", (OTHER, SCRIPT, GOLD), ((0, 0),)))
+            runs[name] = run
+        report = SweepReport(
+            source_run=served.seed.base,
+            baseline_k=4,
+            counts={FailureKind.NOT_RETRIEVED: 1},
+            split=Split(0, 0.3, (REFUND.id, SHIPPING.id), (REFUND.id,)),
+            baseline_run=runs["base"],
+            rounds=((runs["wide"], runs["ends"]),),
+            holdout_runs=(runs["hold_base"], runs["hold_wide"]),
+            recommended=runs["wide"],
+            reason="",
+        )
+        store.save_experiment_report(sweep, report.to_json())
+    finally:
+        store.close()
+    exp = _json(f"{served.url}/api/experiments/{sweep}")
+    assert exp["kind"] == "sweep"
+    assert exp["recommendation"] == "Set top_k=10. Accuracy 50% -> 100% (holdout 100% -> 100%). Uses about the same input tokens; mean latency 210 ms -> 210 ms."
+    assert [(r["setting"], r["split"], r["recommended"]) for r in exp["rows"]] == [
+        ("baseline", "tune", False),
+        ("top_k=10", "tune", True),
+        ("order=ends", "tune", False),
+        ("baseline", "holdout", False),
+        ("top_k=10", "holdout", False),
+    ]
+    listed = _json(served.url + "/api/experiments")["experiments"]
+    assert [(e["id"], e["kind"]) for e in listed] == [(sweep, "sweep"), (served.seed.experiment, "manual")]
 
 
 @pytest.mark.parametrize("path", ["/api/runs/999/traces", "/api/traces/999", "/api/experiments/999", "/api/nope", "/api/traces/abc"])
