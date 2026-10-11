@@ -120,7 +120,16 @@ def cmd_experiment(args: argparse.Namespace) -> int:
 
 
 def cmd_ui(args: argparse.Namespace) -> int:
-    raise NotImplementedError
+    from . import _ui
+
+    store = Store.open(require_project())
+    try:
+        _ui.serve(store, port=args.port, open_browser=not args.no_open)
+    except OSError as e:
+        raise UserError(f"cannot serve on port {args.port}: {e}") from None
+    finally:
+        store.close()
+    return 0
 
 
 def _args_init(p: argparse.ArgumentParser) -> None:
