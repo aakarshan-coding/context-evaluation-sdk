@@ -214,9 +214,16 @@ _process = _Process()
 
 @dataclass(frozen=True)
 class InstallReport:
-    """library name -> status. Printed by `contexteval run` and returned by init()."""
+    """library name -> status, returned by init(). `failed` means hooking that library raised;
+    it was logged once and the library runs unhooked. `error` is set when init() itself could
+    not finish (no project database); then nothing was installed and hooks pass through."""
 
-    statuses: dict[str, Literal["installed", "already", "not_installed", "incompatible"]]
+    statuses: dict[str, Literal["installed", "already", "not_installed", "incompatible", "failed"]]
+    error: str | None = None
+
+
+def mode() -> Mode:
+    return _process.mode
 
 
 def set_mode(mode: Mode, make_sink: Callable[[], Sink] | None = None) -> None:

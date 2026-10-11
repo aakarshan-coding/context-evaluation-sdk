@@ -30,7 +30,7 @@ from ._intervention import InterventionNotApplicable
 from ._store import Store, find_project
 from .types import Chunk
 
-Status = Literal["installed", "already", "not_installed", "incompatible"]
+Status = Literal["installed", "already", "not_installed", "incompatible", "failed"]
 
 INJECTED_ID = "contexteval:injected"
 
@@ -324,7 +324,7 @@ HOOKS: tuple[HookSpec, ...] = (
 )
 
 # Worse statuses win when a library has several specs.
-_SEVERITY: dict[Status, int] = {"already": 0, "installed": 1, "not_installed": 2, "incompatible": 3}
+_SEVERITY: dict[Status, int] = {"already": 0, "installed": 1, "not_installed": 2, "incompatible": 3, "failed": 4}
 
 # (owner, method name, original) for every patched method, in install order.
 _patched: list[tuple[type, str, Callable[..., Any]]] = []
@@ -342,11 +342,17 @@ def _resolve(target: str) -> tuple[type, str] | None:
 
 
 def _install_spec(spec: HookSpec) -> Status:
-    for target in spec.targets:
-        resolved = _resolve(target)
-        if resolved is not None:
-            return patch_method(resolved[0], resolved[1], spec.handler)
-    return "incompatible" if importlib.util.find_spec(spec.library) is not None else "not_installed"
+    """Never raises: a library whose import has a failing side effect, or whose target cannot be
+    wrapped, is reported as failed and left alone, and the other libraries still get hooked."""
+    try:
+        for target in spec.targets:
+            resolved = _resolve(target)
+            if resolved is not None:
+                return patch_method(resolved[0], resolved[1], spec.handler)
+        return "incompatible" if importlib.util.find_spec(spec.library) is not None else "not_installed"
+    except Exception as e:
+        capture._log_once(f"install:{spec.library}", f"contexteval could not hook {spec.library}; it runs unhooked", e)
+        return "failed"
 
 
 def install_all(specs: tuple[HookSpec, ...] = HOOKS) -> InstallReport:
@@ -371,7 +377,12 @@ def patch_method(owner: type, name: str, handler: Handler) -> Status:
         return "incompatible"
     if hasattr(current, "__contexteval_original__"):
         return "already"
-    setattr(owner, name, _wrap(current, handler))
+    try:
+        wrapper = _wrap(current, handler)
+    except Exception as e:
+        capture._log_once(f"install:{owner.__name__}.{name}", f"contexteval could not wrap {owner.__name__}.{name}; it runs unhooked", e)
+        return "failed"
+    setattr(owner, name, wrapper)
     _patched.append((owner, name, current))
     return "installed"
 
@@ -421,7 +432,18 @@ def install(mode: Literal["cli", "production"], project_dir: Path | None = None,
 def init(project_dir: str | Path | None = None, *, pinecone_text_key: str = "text") -> InstallReport:
     """Public one-liner. Finds or creates .contexteval/ (walking up from cwd) and installs hooks
     in production mode. `pinecone_text_key` names the metadata field holding chunk text
-    (architecture graft 7)."""
-    root = Path(project_dir) if project_dir is not None else (find_project(Path.cwd()) or Path.cwd())
-    Store.open(root).close()
-    return install("production", root, pinecone_text_key)
+    (architecture graft 7).
+
+    Never raises into the app. A project that cannot hold the database (unwritable path, a
+    schema from another build) is logged once and reported in InstallReport.error; nothing is
+    hooked and the app runs as if init() had not been called. Under `contexteval run` the CLI
+    already installed, so the database is not touched here.
+    """
+    try:
+        root = Path(project_dir) if project_dir is not None else (find_project(Path.cwd()) or Path.cwd())
+        if capture.mode() is Mode.OFF:
+            Store.open(root).close()
+        return install("production", root, pinecone_text_key)
+    except Exception as e:
+        capture._log_once("init", "contexteval.init() failed; production capture is off", e)
+        return InstallReport({}, error=f"{type(e).__name__}: {e}")

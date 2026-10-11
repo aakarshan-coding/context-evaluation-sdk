@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import sqlite3
+import sys
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -364,6 +366,78 @@ def test_init_after_cli_install_keeps_cli_mode(hooks: None, project: Path, chrom
         assert store.latest_run("production") is None
     finally:
         store.close()
+
+
+# --- init() never raises (review X1) -----------------------------------------------------
+
+
+@pytest.fixture
+def clean_hooks() -> Iterator[None]:
+    yield
+    _hooks.uninstall_all()
+    capture.reset_process()
+
+
+def _assert_init_failed_safely(report: capture.InstallReport, expected: str) -> None:
+    assert report.statuses == {} and report.error is not None and expected in report.error
+    assert capture._process.mode is capture.Mode.OFF
+
+    @capture.retriever
+    def search(query: str, top_k: int = 3) -> list[str]:
+        return ["a"]
+
+    assert search("q") == ["a"] and capture._ambient.get() is None
+
+
+def test_init_reports_a_schema_mismatch_instead_of_raising(tmp_path: Path, clean_hooks: None) -> None:
+    """Review X1. Defect: a database written by another build raised RuntimeError out of init()
+    into the user's app at startup."""
+    import contexteval
+
+    (tmp_path / ".contexteval").mkdir()
+    conn = sqlite3.connect(str(tmp_path / ".contexteval" / "contexteval.db"))
+    conn.execute("PRAGMA user_version=2")
+    conn.commit()
+    conn.close()
+    _assert_init_failed_safely(contexteval.init(tmp_path), "schema version 2")
+
+
+def test_init_reports_an_unwritable_project_dir_instead_of_raising(tmp_path: Path, clean_hooks: None) -> None:
+    """Review X1. Defect: a project path that cannot be created raised OSError out of init()."""
+    import contexteval
+
+    (tmp_path / "afile").write_text("x", encoding="utf-8")
+    _assert_init_failed_safely(contexteval.init(tmp_path / "afile" / "sub"), "Error")
+
+
+def test_init_survives_a_library_whose_import_raises(tmp_path: Path, project: Path, monkeypatch: pytest.MonkeyPatch, clean_hooks: None, caplog: pytest.LogCaptureFixture) -> None:
+    """Review X1. Defect: a non-ImportError side effect while importing a hooked library (a
+    broken optional dependency) propagated out of init(); every other library must still be
+    hooked and the broken one reported as failed."""
+    import contexteval
+
+    (tmp_path / "boomlib.py").write_text("raise RuntimeError('lib import side effect failed')\n", encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.delitem(sys.modules, "boomlib", raising=False)
+    monkeypatch.setattr(_hooks, "HOOKS", (*_hooks.HOOKS, _hooks.HookSpec("boomlib", ("boomlib:Index.query",), _hooks.ChromaCodec())))
+    report = contexteval.init(project)
+    assert report.error is None
+    assert report.statuses["boomlib"] == "failed" and report.statuses["chromadb"] == "installed"
+    assert capture._process.mode is capture.Mode.PRODUCTION
+    assert caplog.text.count("lib import side effect failed") == 1
+
+
+def test_patch_method_reports_a_method_without_a_readable_signature(clean_hooks: None) -> None:
+    """Review X1. Defect: inspect.signature raising on an odd target escaped install() and init()."""
+
+    class Odd:
+        def query(self, q: str) -> list[str]:
+            return [q]
+
+    Odd.query.__signature__ = 42  # type: ignore[attr-defined]
+    original = Odd.__dict__["query"]
+    assert _hooks.patch_method(Odd, "query", _hooks.ChromaCodec()) == "failed"
+    assert Odd.__dict__["query"] is original
 
 
 # --- install mechanics ------------------------------------------------------------------
