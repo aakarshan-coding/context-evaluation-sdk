@@ -124,7 +124,21 @@ The base is opus because it is the only candidate sound on all three load-bearin
 
 ## Implementation reconciliation
 
-None yet.
+P0 and P1 (branch `p1-capture`). Where the code departs from the sketch, and why.
+
+- `install()` and `init()` live in `_hooks`, not `_capture`. The sketch kept `init` in `_capture` with a lazy import of `_hooks`. Moving both makes the import graph a line (`types <- _text <- _intervention <- _capture <- _hooks <- __init__`), and `init(pinecone_text_key=)` (graft 7) is library knowledge anyway. `_capture` keeps `InstallReport`, `Mode`, `set_mode(mode, make_sink)`, and a `reset_process()` test seam. The sink factory runs only when the mode actually escalates, so a user `init()` under `contexteval run` opens no database.
+- `InterventionNotApplicable` is defined in `_intervention` and exported from the package root. It propagates through the user's own retrieval call, so app code may need to name it.
+- `Trace.in_prompt` is a required constructor field. `_capture.finalize_trace(run, outcome, latency_ms, test)` is the one place that fills it (via `_text.in_prompt_pairs`) along with `Metrics`. The runner (P2) and the production sink both call it.
+- `@retriever` takes `text=` as a key, attribute, or callable, and `rebuild=` for building injected items (graft 4). Items that are neither `str` nor `Mapping`, and empty results, raise `InterventionNotApplicable` on injection unless `rebuild` is given. The sketch's `copy.copy(result[0])` is gone.
+- Chroma multi-query calls: `decode` reads row 0 and `encode` raises `InterventionNotApplicable`. The sketch said "recorded per row"; one event per call keeps `source_index` meaningful.
+- Production traces take their question from the first retrieval's query text, or `""` when the call had none. The LLM adapter exposes only the flattened prompt.
+- `Store` gained `close()`, `find_project()`, and `PROJECT_DIR_NAME`; the connection uses `check_same_thread=False` because the production sink flushes from whichever thread made the LLM call.
+- `_cli.COMMANDS` maps names to `Command(run, help, add_arguments)` rather than bare callables, so the parser is generated from the same table that dispatches. `save_config` and `require_project` were added.
+- `_llm.cost_usd` is implemented (finalize needs it). `PRICES` still holds only `fake`, so app-call cost is `None` until P6 fills the table.
+- `demo/app.HashEmbedding` is implemented early because the hook tests need an offline embedding. chromadb 1.x requires `name()`, `get_config()`, `build_from_config()` and an explicit `__init__` on custom embedding functions.
+- anthropic 1.x ships its own `httpx2`; the anthropic hook test uses `httpx2.MockTransport`. The openai test uses `httpx.MockTransport` as planned.
+- The P3/P4 test sketches (`test_acceptance.py`, `test_diagnose_table.py`) carry a module-level skip marker naming the phase instead of failing on `NotImplementedError`.
+- The pinecone codec synthesizes injected matches as `type(matches[0])(id=, score=, values=, metadata=)` and falls back to a small attribute-and-item object when that constructor refuses the kwargs.
 
 ## Open questions and risks
 
