@@ -111,12 +111,19 @@ def test_trace_round_trip_graded_and_crashed(store: Store) -> None:
     assert store.trace(ids[-1] + 50) is None  # type: ignore[operator]
 
 
-def test_trace_schema_rejects_graded_without_case(store: Store) -> None:
-    """Defect: a passed flag stored for a production trace, which the UI would then count."""
+@pytest.mark.parametrize("case_id,passed", [(None, 1), ("abc123", None)], ids=["passed-without-case", "case-without-passed"])
+def test_trace_schema_rejects_graded_without_case(store: Store, case_id: str | None, passed: int | None) -> None:
+    """Defect: a passed flag stored for a production trace, which the UI would then count, or a
+    case trace with no pass flag. Review Y8: a raw insert, because add_trace cannot build either
+    row and a missing case id trips the foreign key before the CHECK is ever reached."""
+    store.upsert_cases("synthetic", [CASE])
     rid = store.new_run("production", None, BASELINE)
-    bad = _trace(test=TestOutcome(CaseId("missing-case"), True, "substring"))
-    with pytest.raises(sqlite3.IntegrityError):
-        store.add_trace(rid, bad)
+    with pytest.raises(sqlite3.IntegrityError, match="CHECK constraint failed"):
+        store._conn.execute(
+            "INSERT INTO traces (run_id, case_id, question, answer, passed, retrievals, llm_calls, in_prompt,"
+            " input_tokens, output_tokens, latency_ms) VALUES (?, ?, 'q', 'a', ?, '[]', '[]', '[]', 0, 0, 0.0)",
+            (rid, case_id, passed),
+        )
 
 
 REPLAYS = (ReplayOutcome(ReplayStep.BASELINE_RERUN, False, "wrong"), ReplayOutcome(ReplayStep.GOLD_TO_TOP, True, "right"))
