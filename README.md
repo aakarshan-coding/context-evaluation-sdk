@@ -16,13 +16,23 @@ You do not change your app. contexteval hooks chromadb, pinecone, OpenAI, and An
 
 contexteval needs Python 3.10 or later. The core package has no dependencies.
 
-From a checkout of this repository, install the package with the demo extras:
+Once contexteval is published on PyPI, install it with the demo extras:
 
 ```bash
+pip install "contexteval[demo]"
+```
+
+Until then, install from source:
+
+```bash
+git clone https://github.com/aakarshan-coding/context-evaluation-sdk.git
+cd context-evaluation-sdk
 pip install ".[demo]"
 ```
 
-The extras are `openai`, `anthropic`, `chroma`, `pinecone`, and `demo` (chromadb plus openai). Install the ones your app uses, for example `pip install ".[openai,chroma]"`.
+The extras are `openai`, `anthropic`, `chroma`, `pinecone`, and `demo` (chromadb plus openai). Install the ones your app uses, for example `pip install "contexteval[openai,chroma]"`, or `pip install ".[openai,chroma]"` from source.
+
+Release steps for maintainers are in [docs/RELEASING.md](https://github.com/aakarshan-coding/context-evaluation-sdk/blob/main/docs/RELEASING.md).
 
 ## Quickstart
 
