@@ -7,8 +7,8 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass
-from typing import Callable
 from pathlib import Path
+from typing import Callable
 
 from . import _text as text
 from ._llm import Estimate, LLMRequest, Provider, Task, estimate
