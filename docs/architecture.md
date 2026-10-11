@@ -153,6 +153,19 @@ P2 (branch `p2-runs`).
 - `confirm` treats EOF or an unreadable stdin as "no" and exits 2, so a script that omits `--yes` never blocks.
 - `run_experiment` is still `NotImplementedError` (P4).
 
+P3 (branch `p3-diagnose`).
+
+- `locate_gold` returns a `GoldMap(location, gold, other)`, not a bare `GoldLocation`. `gold` and `other` are the in-prompt delivered chunk refs with and without the evidence. They are the data graft 1 asks `Ignored.gold_at` and `Irrelevant.removed` to carry, and computing them in the same pass that decides the location keeps one function reading the trace. `diagnose_case(gold: GoldMap, replay)` takes the record. The table test builds it directly.
+- `LADDER` rows are `(ReplayStep, Builder)` where `Builder = Callable[[Replays, GoldMap], Diagnosis]`, instead of `(ReplayStep, type[Ignored] | type[Irrelevant])`. The two variants take different evidence fields, so a bare class could not be called uniformly. The row order is unchanged and `test_ladder_prefers_the_least_invasive_fix` pins it.
+- `make_replay` takes the run's own `Intervention` as `base` and applies the replay transform after it. `diagnose_run` passes `run.setting.intervention()`, so diagnosing an experiment run reruns under that setting rather than silently under baseline. For a baseline run this is the no-op intervention.
+- Replay cost is 2 to 3 app calls (`MAX_REPLAYS = 1 + len(LADDER)`), not the sketch's "2 to 4". The CLI reports `up to N replay calls` from that constant.
+- The judge reply is parsed by `parse_verdict`, which accepts the JSON object inside a code fence or surrounding prose and raises `JudgeReplyError` for anything without a known verdict. `cmd_diagnose` turns that and `ProviderError` into a `UserError` that says the diagnoses so far are saved, because `diagnose_run` commits per trace and the next run resumes.
+- `pending(store, run, force)` is the one list of traces to diagnose. The estimate and the loop both read it, so the cost prompt and the work agree. The estimate counts one judge call per judge-path trace and, worst case, one grade per replay for ground-truth cases; app calls are reported on a separate line, as `run` does.
+- `diagnose_run` takes an `on_diagnosis` callback so the CLI prints each label as it is saved. `DiagnoseReport` keeps the three counts from the sketch.
+- `diagnose_run` with `app=None` on a run that holds a ground-truth case raises `ValueError` instead of falling back to the judge, so a CLI wiring mistake cannot relabel a baseline run with judge verdicts.
+- `FakeProvider` already answered `Task.JUDGE` with `no_failure`; nothing was added there. Tests that need another verdict pass a handler.
+- The P4 acceptance test keeps its own skip marker; the module-level skip is gone.
+
 ## Open questions and risks
 
 - Should the flaky rerun also run before the missing confirmation? The sketch runs it first for every ground-truth case, reading plan item 3's "before replay" literally. The other reading skips it for missing, which saves one call per missing case.
