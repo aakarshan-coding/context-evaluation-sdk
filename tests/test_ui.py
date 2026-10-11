@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
+import subprocess
 import threading
 import urllib.error
 import urllib.request
@@ -437,3 +439,72 @@ def test_gold_marks_follow_the_shared_gold_rule(store: Store) -> None:
     assert [c["gold"] for c in detail["retrievals"][0]["delivered"]] == [False, True, True]
     assert [c["gold"] for c in detail["retrievals"][0]["retrieved"]] == [False, True, True]
     assert [c["gold"] for c in detail["llm_calls"]] == [True, False]
+
+
+def test_handler_error_is_a_json_500(served: Served, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Review Y6. Defect: an exception inside a handler (a locked or corrupt database) escapes
+    do_GET, the server drops the connection, and the page shows a network error with no reason."""
+
+    def broken(self: Store) -> None:
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(Store, "runs", broken)
+    status, content_type, body = _get(served.url + "/api/runs")
+    assert (status, content_type) == (500, "application/json")
+    assert "database is locked" in json.loads(body)["error"]
+    assert _json(served.url + "/api/experiments")["experiments"]
+
+
+# Runs the page's own script in node against the live server, with just enough DOM to build
+# elements, then prints the badge text of each row in the failure list.
+_PAGE_HARNESS = r"""
+const fs = require("fs");
+const [htmlPath, base, runId] = process.argv.slice(2);
+const script = fs.readFileSync(htmlPath, "utf8").match(/<script>([\s\S]*)<\/script>/)[1];
+class Node {}
+class El extends Node {
+  constructor(tag) { super(); this.tag = tag; this.children = []; this.dataset = {}; this.textContent = ""; this.checked = true; this.value = ""; }
+  append(...c) { this.children.push(...c); }
+  replaceChildren() { this.children = []; }
+  setAttribute(k, v) { if (k.startsWith("data-")) this.dataset[k.slice(5)] = v; }
+  addEventListener() {}
+  scrollIntoView() {}
+  get parentElement() { return new El("div"); }
+}
+class Text extends Node { constructor(t) { super(); this.textContent = t; this.children = []; } }
+const ids = {};
+globalThis.Node = Node;
+globalThis.document = {
+  createElement: (t) => new El(t), createTextNode: (t) => new Text(t),
+  getElementById: (id) => (ids[id] ??= new El(id)), querySelectorAll: () => [],
+};
+globalThis.location = { hash: "#run=" + runId };
+globalThis.history = { replaceState() {} };
+globalThis.matchMedia = () => ({ matches: false });
+const realFetch = fetch;
+globalThis.fetch = (path, opts) => realFetch(base + path, opts);
+(0, eval)(script);
+const started = Date.now();
+const timer = setInterval(() => {
+  const rows = (ids.failures || { children: [] }).children;
+  if (!rows.length && Date.now() - started < 5000) return;
+  clearInterval(timer);
+  console.log(JSON.stringify(rows.map((li) => li.children[0].children[0].children[0].textContent)));
+}, 50);
+"""
+
+
+def test_list_shows_the_judge_label_for_judged_production_traces(served: Served, tmp_path: Path) -> None:
+    """Review Y6. Defect: the failure list shows "ungraded" for a production trace the judge has
+    labeled, because the list only shows a diagnosis badge for graded failures."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is not installed")
+    harness = tmp_path / "harness.js"
+    harness.write_text(_PAGE_HARNESS, encoding="utf-8")
+    page = resources.files("contexteval").joinpath("ui.html")
+    out = subprocess.run(
+        [node, str(harness), str(page), served.url, str(served.seed.production)],
+        stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60, check=True,
+    )
+    assert json.loads(out.stdout) == ["judge: no failure"]

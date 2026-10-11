@@ -240,6 +240,8 @@ def dispatch(store: Store, path: str) -> tuple[int, Json]:
                 return 200, handler(store, *(int(g) for g in match.groups()))
             except NotFound as e:
                 return 404, {"error": str(e)}
+            except Exception as e:  # boundary: the page shows the reason instead of a dropped connection
+                return 500, {"error": f"{type(e).__name__}: {e}"}
     return 404, {"error": f"no route {path}"}
 
 
