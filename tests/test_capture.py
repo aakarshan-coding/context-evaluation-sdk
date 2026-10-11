@@ -5,11 +5,13 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from types import SimpleNamespace
+from typing import Any, Iterator
 
 import pytest
 
 from contexteval import _capture as capture
-from contexteval import retriever
+from contexteval import _hooks, retriever
 from contexteval._intervention import NO_INTERVENTION, InjectEvidence, Intervention, InterventionNotApplicable
 from contexteval._llm import cost_usd
 from contexteval._runner import execute
@@ -19,6 +21,94 @@ from contexteval.types import Answered, Evidence, LLMCall
 @dataclass
 class Doc:
     text: str
+
+
+class FakeLLM:
+    """Stand-in for openai Completions, hooked with the real OpenAIChatAdapter."""
+
+    def create(self, *, messages: list[dict[str, str]], model: str = "gpt-4.1-mini") -> Any:
+        if "fail" in messages[-1]["content"]:
+            raise RuntimeError("upstream 500")
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="ans"))], usage=None)
+
+
+@retriever
+def search(query: str, top_k: int = 3) -> list[dict[str, str]]:
+    return [{"text": f"doc {i} for {query}"} for i in range(top_k)]
+
+
+@pytest.fixture
+def llm() -> Iterator[FakeLLM]:
+    assert _hooks.patch_method(FakeLLM, "create", _hooks.OpenAIChatAdapter()) == "installed"
+    try:
+        yield FakeLLM()
+    finally:
+        _hooks.uninstall_all()
+        capture.reset_process()
+
+
+@pytest.fixture
+def flushed() -> Iterator[list[capture.ActiveRun]]:
+    """Production mode whose sink appends each closed buffer instead of writing it."""
+    runs: list[capture.ActiveRun] = []
+    capture.set_mode(capture.Mode.PRODUCTION, lambda: runs.append)
+    try:
+        yield runs
+    finally:
+        capture.reset_process()
+
+
+def _ask(llm: FakeLLM, question: str, context: str = "") -> Any:
+    return llm.create(messages=[{"role": "user", "content": f"{context}\n\nQ: {question}"}])
+
+
+def test_production_buffer_does_not_bleed_across_requests(llm: FakeLLM, flushed: list[capture.ActiveRun]) -> None:
+    """Review X2. Defect: a request that retrieves and never reaches an LLM (cache hit) leaves its
+    event in the buffer, and the next request's trace inherits it with the wrong question. A
+    retrieval the prompt shows no sign of, while another one is in the prompt, belongs to an
+    earlier request; when nothing retrieved is in the prompt, the recent retrievals still count."""
+    search("request A, answered from cache")
+    hits = search("request B")
+    _ask(llm, "request B", "\n".join(h["text"] for h in hits))
+    assert len(flushed) == 1
+    assert flushed[0].question == "request B"
+    assert [e.query for e in flushed[0].retrievals] == ["request B"]
+
+    search("request C, every chunk filtered out")
+    _ask(llm, "request C")
+    assert flushed[1].question == "request C, every chunk filtered out"
+    assert len(flushed[1].retrievals) == 1
+
+
+def test_production_buffer_is_cleared_when_the_llm_call_fails(llm: FakeLLM, flushed: list[capture.ActiveRun]) -> None:
+    """Review X2. Defect: an LLM call that raises leaves the buffered retrievals for the next
+    call, which then reports another request's context."""
+    search("request D")
+    with pytest.raises(RuntimeError, match="upstream 500"):
+        _ask(llm, "request D fail")
+    _ask(llm, "request E, no retrieval")
+    assert len(flushed) == 1 and flushed[0].retrievals == []
+
+
+def test_production_buffer_is_bounded(llm: FakeLLM, flushed: list[capture.ActiveRun]) -> None:
+    """Review X2. Defect: an app whose LLM is not hooked buffers every retrieval forever."""
+    for i in range(capture.AMBIENT_MAX_EVENTS * 4):
+        search(f"request {i}")
+    _ask(llm, "finally")
+    assert len(flushed[0].retrievals) == capture.AMBIENT_MAX_EVENTS
+    assert flushed[0].retrievals[-1].query == f"request {capture.AMBIENT_MAX_EVENTS * 4 - 1}"
+
+
+def test_production_buffer_drops_events_older_than_the_window(llm: FakeLLM, flushed: list[capture.ActiveRun], monkeypatch: pytest.MonkeyPatch) -> None:
+    """Review X2. Defect: a retrieval from minutes ago is attributed to the LLM call that finally
+    happens on the same worker thread."""
+    now = [1000.0]
+    monkeypatch.setattr(capture, "perf_counter", lambda: now[0])
+    search("long ago")
+    now[0] += capture.AMBIENT_MAX_AGE_S + 1
+    search("just now")
+    _ask(llm, "just now")
+    assert [e.query for e in flushed[0].retrievals] == ["just now"]
 
 
 def test_intervention_not_applicable_survives_the_apps_own_except(hooks: None) -> None:

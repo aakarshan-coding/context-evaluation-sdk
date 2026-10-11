@@ -25,6 +25,7 @@ import functools
 import inspect
 import logging
 import threading
+from collections import deque
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -61,14 +62,57 @@ class ActiveRun:
     # raised error, so runner.execute re-raises this after answer() returns (graft 3).
     not_applicable: InterventionNotApplicable | None = None
 
+    def record(self, event: RetrievalEvent) -> None:
+        self.retrievals.append(event)
 
-def _refuse(run: ActiveRun, error: InterventionNotApplicable) -> InterventionNotApplicable:
-    run.not_applicable = error
+
+AMBIENT_MAX_EVENTS = 32  # retrievals kept per context between LLM calls
+AMBIENT_MAX_AGE_S = 60.0  # a retrieval older than this at LLM time belongs to an earlier request
+
+
+@dataclass
+class _Ambient:
+    """Production buffer for one context: the retrievals since the last hooked LLM call.
+
+    Production has no runner to mark request boundaries, so the buffer is bounded (an app whose
+    LLM is not hooked never drains it) and each event is stamped, so a request that never
+    reached an LLM cannot hand its retrievals to the next request on the same worker thread.
+    """
+
+    question = ""
+    intervention = NO_INTERVENTION
+    events: deque[tuple[float, RetrievalEvent]] = field(default_factory=lambda: deque(maxlen=AMBIENT_MAX_EVENTS))
+
+    def record(self, event: RetrievalEvent) -> None:
+        self.events.append((perf_counter(), event))
+
+    def close(self, call: LLMCall, now: float) -> ActiveRun:
+        """Pair the LLM call with the retrievals it consumed. Events older than AMBIENT_MAX_AGE_S
+        are stale. When any recent event shows in the prompt (its query or a delivered chunk),
+        the recent events that do not are another request's; when none shows, the app put no
+        retrieved text in the prompt and every recent event stays, so a filtered-out context is
+        still visible."""
+        recent = [e for t, e in self.events if now - t <= AMBIENT_MAX_AGE_S]
+        consumed = [e for e in recent if _in_prompt(e, call.prompt)]
+        kept = consumed or recent
+        question = next((e.query for e in kept if e.query), "")
+        return ActiveRun(question=question, intervention=NO_INTERVENTION, retrievals=kept, llm_calls=[call])
+
+
+def _in_prompt(event: RetrievalEvent, prompt: str) -> bool:
+    if event.query and text.chunk_in_prompt(event.query, prompt):
+        return True
+    return bool(text.in_prompt_pairs((event,), prompt))
+
+
+def _refuse(run: ActiveRun | _Ambient, error: InterventionNotApplicable) -> InterventionNotApplicable:
+    if isinstance(run, ActiveRun):
+        run.not_applicable = error
     return error
 
 
 _active: ContextVar[ActiveRun | None] = ContextVar("contexteval_active", default=None)
-_ambient: ContextVar[ActiveRun | None] = ContextVar("contexteval_ambient", default=None)
+_ambient: ContextVar[_Ambient | None] = ContextVar("contexteval_ambient", default=None)
 _suppressed: ContextVar[bool] = ContextVar("contexteval_suppressed", default=False)
 
 
@@ -195,12 +239,10 @@ def production_sink(project_dir: Path) -> Sink:
 
 
 def _ambient_trace(run: ActiveRun) -> Trace:
-    """Production traces have no runner: the question is the first retrieval's query, the
-    answer is the LLM call's text, and latency is the sum of the hooked calls."""
-    question = next((e.query for e in run.retrievals if e.query), "")
+    """Production traces have no runner: the answer is the LLM call's text and latency is the
+    sum of the hooked calls. The question was chosen when the buffer closed."""
     answer = run.llm_calls[-1].answer if run.llm_calls else None
     latency = sum(e.latency_ms for e in run.retrievals) + sum(c.latency_ms for c in run.llm_calls)
-    run.question = question
     return finalize_trace(run, Answered(answer or ""), latency)
 
 
@@ -210,18 +252,18 @@ def _log_once(key: str, message: str, error: BaseException) -> None:
         log.warning("%s: %s: %s", message, type(error).__name__, error)
 
 
-def _current_run() -> tuple[ActiveRun | None, bool]:
-    """(run to record into, whether it is the production buffer). None means pass through."""
+def _current_run() -> ActiveRun | _Ambient | None:
+    """Where this hook records: the active run, the production buffer, or nowhere (pass through)."""
     run = _active.get() or _process.current
     if run is not None:
-        return run, False
+        return run
     if _process.mode is not Mode.PRODUCTION:
-        return None, False
+        return None
     buffer = _ambient.get()
     if buffer is None:
-        buffer = ActiveRun(question="", intervention=NO_INTERVENTION)
+        buffer = _Ambient()
         _ambient.set(buffer)
-    return buffer, True
+    return buffer
 
 
 # --- the two intercepts every hook calls ------------------------------------
@@ -279,7 +321,7 @@ def intercept_retrieval(codec: RetrievalCodec[R], call: Callable[[inspect.BoundA
     """Shared body of every retrieval hook and the @retriever decorator."""
     if _suppressed.get():
         return call(args)
-    run, _ = _current_run()
+    run = _current_run()
     if run is None:
         return call(args)
     iv = run.intervention
@@ -319,7 +361,7 @@ def intercept_retrieval(codec: RetrievalCodec[R], call: Callable[[inspect.BoundA
             raise _refuse(run, InterventionNotApplicable(f"{codec.source}: cannot rebuild the result after the intervention")) from e
 
     try:
-        run.retrievals.append(
+        run.record(
             RetrievalEvent(
                 source=codec.source,
                 query=query,
@@ -337,12 +379,15 @@ def intercept_retrieval(codec: RetrievalCodec[R], call: Callable[[inspect.BoundA
 def intercept_llm(adapter: LLMAdapter, call: Callable[[inspect.BoundArguments], Any], args: inspect.BoundArguments) -> Any:
     """Record only. v1 never changes the prompt (non-retrieval prompt text is read-only).
     In production mode with no active run, the LLM call closes the ambient buffer: one call,
-    one stored trace."""
+    one stored trace. The buffer leaves the context before the call, so a call that raises
+    cannot hand its retrievals to the next one."""
     if _suppressed.get():
         return call(args)
-    run, ambient = _current_run()
+    run = _current_run()
     if run is None:
         return call(args)
+    if isinstance(run, _Ambient):
+        _ambient.set(None)
 
     try:
         prompt, model = adapter.prompt_text(args), adapter.model(args)
@@ -359,26 +404,25 @@ def intercept_llm(adapter: LLMAdapter, call: Callable[[inspect.BoundArguments], 
     except Exception as e:
         _log_once(f"parse:{adapter.provider}", f"contexteval could not read the {adapter.provider} response", e)
         answer, input_tokens, output_tokens = None, None, None
-    run.llm_calls.append(
-        LLMCall(
-            provider=adapter.provider,
-            model=model,
-            prompt=prompt,
-            answer=answer,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-            latency_ms=latency_ms,
-        )
+    llm_call = LLMCall(
+        provider=adapter.provider,
+        model=model,
+        prompt=prompt,
+        answer=answer,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        latency_ms=latency_ms,
     )
 
-    if ambient:
-        _ambient.set(None)
-        sink = _process.sink
-        if sink is not None:
-            try:
-                sink(run)
-            except Exception as e:
-                _log_once("sink", "contexteval could not store a production trace", e)
+    if isinstance(run, ActiveRun):
+        run.llm_calls.append(llm_call)
+        return response
+    sink = _process.sink
+    if sink is not None:
+        try:
+            sink(run.close(llm_call, t0))
+        except Exception as e:
+            _log_once("sink", "contexteval could not store a production trace", e)
     return response
 
 
