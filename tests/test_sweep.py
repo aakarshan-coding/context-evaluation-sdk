@@ -327,6 +327,102 @@ def test_round_two_never_builds_on_a_setting_that_only_tied_the_baseline(store: 
     assert _sweep.winner({s: _row(s, 4, t) for s, t in [(BASELINE, 100), (Setting(top_k=8), 50)]}, 2) is None
 
 
+def test_a_candidate_the_app_cannot_take_is_skipped_with_its_knob_and_the_sweep_goes_on(store: Store) -> None:
+    """Review Q1. Defect: InterventionNotApplicable from one candidate (a top_k change on a
+    retriever with no top_k knob) aborts the whole sweep with no report, although the other knobs
+    could still be tried. The candidate is skipped with its reason, later candidates on the same
+    knob are skipped without a run, the report records each, and the sweep still recommends."""
+    cases = _cases(8)
+    store.upsert_cases("t", cases)
+    counts = {FailureKind.NOT_RETRIEVED: 1, FailureKind.IGNORED: 1}
+    plan = _plan(counts, [c.id for c in cases])
+    ends = Setting(order=Order.ENDS)
+    calls: list[Setting] = []
+    run = _scripted_runner(
+        store,
+        lambda setting, case_id: case_id < (CaseId("c05") if setting.order is Order.ENDS else CaseId("c04")),
+        refuse=lambda setting: f"search: top_k={setting.top_k} requested but this site has no top_k parameter" if setting.top_k else None,
+        calls=calls,
+    )
+    experiment, report = _sweep.run_sweep(store, {c.id: c for c in cases}, plan, run)
+    assert calls == [BASELINE, Setting(top_k=8), ends, Setting(order=Order.REVERSE), Setting(compress=2), Setting(order=Order.ENDS, compress=2)]
+    assert report.not_applicable == {
+        "top_k=8": "search: top_k=8 requested but this site has no top_k parameter",
+        "top_k=12": "sets top_k, which top_k=8 showed the app's retrieval cannot take",
+    }
+    settings = {r.run.id: r.run.setting for r in store.runs()}
+    assert report.recommended is not None and settings[report.recommended] == ends and report.reason == ""
+    assert [[settings[r] for r in round_] for round_ in report.rounds] == [[ends, Setting(order=Order.REVERSE), Setting(compress=2)], [Setting(order=Order.ENDS, compress=2)]]
+    assert _sweep.SweepReport.from_json(store.experiment(experiment).report or {}) == report
+
+
+def test_sweep_over_an_app_with_no_top_k_knob_ends_with_a_line_and_a_report(project: Path, hooks: None, capsys: pytest.CaptureFixture[str]) -> None:
+    """Review Q1, the reviewers' probe through the CLI. Defect: `@contexteval.retriever` with no
+    top_k parameter makes `contexteval sweep` exit 1 on the first candidate with no report stored,
+    so the dashboard shows a sweep with rows and no outcome. It exits 0, prints each candidate it
+    could not run, and ends with a recommendation line that says why nothing is recommended."""
+    (project / "sweep_app_noknob.py").write_text(
+        "import contexteval\nHARD = %r\n\n@contexteval.retriever\ndef search(query: str) -> list[str]:\n    return [f'chunk {i} about {query}' for i in range(2)]\n\n"
+        "def answer(question: str) -> str:\n    search(question)\n    return 'wrong' if question in HARD else 'right'\n" % HARD,
+        encoding="utf-8",
+    )
+    _write_cases(project, ALL)
+    assert _cli.main(["init", "--provider", "fake"]) == 0
+    assert _cli.main(["build-tests", "--import", "cases.jsonl"]) == 0
+    assert _cli.main(["run", "sweep_app_noknob:answer", "--yes"]) == 0
+    assert _cli.main(["diagnose", "--yes"]) == 0
+    capsys.readouterr()
+    assert _cli.main(["sweep", "--holdout", "0", "--yes"]) == 0
+    out, err = capsys.readouterr()
+    assert err == ""
+    assert "not applicable: top_k=4: " in out and "has no top_k parameter" in out
+    assert "not applicable: top_k=6: sets top_k, which top_k=4 showed the app's retrieval cannot take" in out
+    assert _final(out).startswith("Keep the current settings. no candidate could run; top_k=4: ") and "top_k=6" in _final(out)
+    store = Store.open(project)
+    try:
+        report, runs = _sweep_runs(store)
+        assert report.recommended is None and report.rounds == () and set(report.not_applicable) == {"top_k=4", "top_k=6"}
+        assert report.baseline_run is not None and runs[report.baseline_run] == (BASELINE, len(ALL))
+    finally:
+        store.close()
+
+
+def test_report_is_saved_when_the_sweep_stops_early(store: Store) -> None:
+    """Review Q1. Defect: a provider error or Ctrl-C halfway through the rounds leaves the sweep
+    experiment with rows and no report, so neither the CLI nor the dashboard can say what
+    happened. The report is saved whatever stops the sweep, with the finished runs and the reason,
+    even when the baseline run itself did not finish."""
+    cases = _cases(4)
+    store.upsert_cases("t", cases)
+    plan = _plan({FailureKind.NOT_RETRIEVED: 1}, [c.id for c in cases])
+    assert [r.setting for r in plan.candidates] == [Setting(top_k=8), Setting(top_k=12)]
+
+    def failing(victim: Setting) -> _sweep.Runner:
+        inner = _scripted_runner(store, lambda setting, case_id: True)
+
+        def run(experiment: ExperimentId, setting: Setting, on: Sequence[TestCase]) -> RunId:
+            if setting == victim:
+                raise RuntimeError("provider down")
+            return inner(experiment, setting, on)
+
+        return run
+
+    with pytest.raises(RuntimeError, match="provider down"):
+        _sweep.run_sweep(store, {c.id: c for c in cases}, plan, failing(Setting(top_k=12)))
+    with pytest.raises(RuntimeError, match="provider down"):
+        _sweep.run_sweep(store, {c.id: c for c in cases}, plan, failing(BASELINE))
+    later, earlier = store.experiments()
+    settings = {r.run.id: r.run.setting for r in store.runs()}
+    assert earlier.report is not None and later.report is not None
+    halfway = _sweep.SweepReport.from_json(earlier.report)
+    assert halfway.reason == "the sweep stopped early: RuntimeError: provider down" and halfway.recommended is None
+    assert halfway.baseline_run is not None and settings[halfway.baseline_run] == BASELINE
+    assert [[settings[r] for r in round_] for round_ in halfway.rounds] == [[Setting(top_k=8)]]
+    at_start = _sweep.SweepReport.from_json(later.report)
+    assert at_start.baseline_run is None and at_start.rounds == () and at_start.reason == halfway.reason
+    assert _sweep.recommendation_line(at_start, []) == "Keep the current settings. the sweep stopped early: RuntimeError: provider down."
+
+
 def test_near_tie_prefers_more_passes_before_lower_latency() -> None:
     """Review Q4. Defect: the near-tie key ranks latency before passes, so among contenders with
     equal input tokens a setting that passes two fewer cases wins on 2 ms of latency."""
