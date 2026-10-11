@@ -245,10 +245,12 @@ _process = _Process()
 @dataclass(frozen=True)
 class InstallReport:
     """library name -> status, returned by init(). `failed` means hooking that library raised;
-    it was logged once and the library runs unhooked. `error` is set when init() itself could
-    not finish (no project database); then nothing was installed and hooks pass through."""
+    it was logged once and the library runs unhooked. `not_imported` means init() left a
+    framework alone because the app had not imported it yet (import it before init()). `error`
+    is set when init() itself could not finish (no project database); then nothing was
+    installed and hooks pass through."""
 
-    statuses: dict[str, Literal["installed", "already", "not_installed", "incompatible", "failed"]]
+    statuses: dict[str, Literal["installed", "already", "not_imported", "not_installed", "incompatible", "failed"]]
     error: str | None = None
 
 

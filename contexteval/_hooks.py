@@ -22,6 +22,7 @@ import copy
 import importlib
 import importlib.util
 import inspect
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Literal, Mapping, Union
@@ -32,7 +33,7 @@ from ._intervention import InterventionNotApplicable
 from ._store import Store, find_project
 from .types import Chunk
 
-Status = Literal["installed", "already", "not_installed", "incompatible", "failed"]
+Status = Literal["installed", "already", "not_imported", "not_installed", "incompatible", "failed"]
 
 INJECTED_ID = "contexteval:injected"
 
@@ -429,6 +430,11 @@ class HookSpec:
     library: str  # import name, the InstallReport key
     targets: tuple[str, ...]  # "module:Owner.method" candidates, first importable wins (version drift)
     handler: Handler
+    # Production hooks this library only when the app has imported it by init() time. For the
+    # frameworks, whose import costs seconds: an app that uses one has imported it already, and
+    # an app that uses neither should not pay for them. The CLI installs before the app module
+    # loads, so it imports and hooks every library it can.
+    only_if_imported: bool = False
 
 
 HOOKS: tuple[HookSpec, ...] = (
@@ -441,14 +447,14 @@ HOOKS: tuple[HookSpec, ...] = (
     HookSpec("openai", ("openai.resources.responses:AsyncResponses.create",), OpenAIResponsesAdapter()),
     HookSpec("anthropic", ("anthropic.resources.messages:Messages.create",), AnthropicMessagesAdapter()),
     HookSpec("anthropic", ("anthropic.resources.messages:AsyncMessages.create",), AnthropicMessagesAdapter()),
-    HookSpec("langchain_core", ("langchain_core.retrievers:BaseRetriever.invoke",), LangChainRetrieverCodec()),
-    HookSpec("langchain_core", ("langchain_core.retrievers:BaseRetriever.ainvoke",), LangChainRetrieverCodec()),
-    HookSpec("llama_index", ("llama_index.core.base.base_retriever:BaseRetriever.retrieve",), LlamaIndexRetrieverCodec()),
-    HookSpec("llama_index", ("llama_index.core.base.base_retriever:BaseRetriever.aretrieve",), LlamaIndexRetrieverCodec()),
+    HookSpec("langchain_core", ("langchain_core.retrievers:BaseRetriever.invoke",), LangChainRetrieverCodec(), only_if_imported=True),
+    HookSpec("langchain_core", ("langchain_core.retrievers:BaseRetriever.ainvoke",), LangChainRetrieverCodec(), only_if_imported=True),
+    HookSpec("llama_index", ("llama_index.core.base.base_retriever:BaseRetriever.retrieve",), LlamaIndexRetrieverCodec(), only_if_imported=True),
+    HookSpec("llama_index", ("llama_index.core.base.base_retriever:BaseRetriever.aretrieve",), LlamaIndexRetrieverCodec(), only_if_imported=True),
 )
 
 # Worse statuses win when a library has several specs.
-_SEVERITY: dict[Status, int] = {"already": 0, "installed": 1, "not_installed": 2, "incompatible": 3, "failed": 4}
+_SEVERITY: dict[Status, int] = {"already": 0, "installed": 1, "not_imported": 2, "not_installed": 3, "incompatible": 4, "failed": 5}
 
 # (owner, method name, original) for every patched method, in install order.
 _patched: list[tuple[type, str, Callable[..., Any]]] = []
@@ -465,9 +471,11 @@ def _resolve(target: str) -> tuple[type, str] | None:
     return (owner, method) if isinstance(owner, type) else None
 
 
-def _install_spec(spec: HookSpec) -> Status:
+def _install_spec(spec: HookSpec, production: bool) -> Status:
     """Never raises: a library whose import has a failing side effect, or whose target cannot be
     wrapped, is reported as failed and left alone, and the other libraries still get hooked."""
+    if production and spec.only_if_imported and spec.library not in sys.modules:
+        return "not_imported"
     try:
         for target in spec.targets:
             resolved = _resolve(target)
@@ -479,11 +487,11 @@ def _install_spec(spec: HookSpec) -> Status:
         return "failed"
 
 
-def install_all(specs: tuple[HookSpec, ...] = HOOKS) -> InstallReport:
+def install_all(specs: tuple[HookSpec, ...] = HOOKS, *, production: bool = False) -> InstallReport:
     """Patch every spec whose library imports. A library's status is its worst spec status."""
     statuses: dict[str, Status] = {}
     for spec in specs:
-        status = _install_spec(spec)
+        status = _install_spec(spec, production)
         previous = statuses.get(spec.library)
         if previous is None or _SEVERITY[status] > _SEVERITY[previous]:
             statuses[spec.library] = status
@@ -523,10 +531,11 @@ def uninstall_all() -> None:
 
 
 def install(mode: Literal["cli", "production"], project_dir: Path | None = None, pinecone_text_key: str | None = None) -> InstallReport:
-    """Idempotent. Patches every library in HOOKS that is importable, then sets the process mode
-    (which only escalates from OFF, see capture.set_mode). A pinecone text key given here
-    applies to calls from now on, whether or not the hooks were already in place."""
-    report = install_all(HOOKS)
+    """Idempotent. Patches every library in HOOKS that is importable (in production, a framework
+    only when the app imported it already), then sets the process mode (which only escalates
+    from OFF, see capture.set_mode). A pinecone text key given here applies to calls from now
+    on, whether or not the hooks were already in place."""
+    report = install_all(HOOKS, production=mode == "production")
     capture.set_pinecone_text_key(pinecone_text_key)
     if mode == "production":
         root = project_dir or Path.cwd()
