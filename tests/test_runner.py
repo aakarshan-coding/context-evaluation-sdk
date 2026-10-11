@@ -71,7 +71,7 @@ def test_baseline_run_stores_one_graded_trace_per_planted_case(project: Path, st
         assert t.test is not None and t.test.case_id == p.case.id
         assert t.test.passed is p.passes_baseline, p.case.question
         assert len(t.retrievals) == 1 and len(t.retrievals[0].retrieved) == demo_app.TOP_K
-        assert len(t.llm_calls) == 1 and t.llm_calls[0].model == demo_app.MODEL
+        assert len(t.llm_calls) == 1 and t.llm_calls[0].model == demo_app.FAKE_MODEL
         assert isinstance(t.outcome, Answered)
     assert (summary.cases, summary.passed, summary.crashed) == (len(planted.PLANTED), sum(p.passes_baseline for p in planted.PLANTED), 0)
     assert store.run(summary.run).app == "contexteval.demo.app:answer"

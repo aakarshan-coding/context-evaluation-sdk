@@ -31,6 +31,7 @@ from .._store import PROJECT_DIR_NAME, find_project
 TOP_K = 4
 ARCHIVED_MARKER = "[ARCHIVED]"
 MODEL = "gpt-4.1-mini"
+FAKE_MODEL = "contexteval-fake"  # unpriced, so fake runs show no cost
 CHUNK_OPEN = "<chunk>"
 CHUNK_CLOSE = "</chunk>"
 CORPUS_DIR = Path(__file__).parent / "corpus"
@@ -129,8 +130,12 @@ def parse_prompt(prompt: str) -> tuple[str, list[str]]:
 def answer(question: str) -> str:
     res = collection().query(query_texts=[question], n_results=TOP_K)
     chunks = [d for d in res["documents"][0] if ARCHIVED_MARKER not in d]
-    resp = _client().chat.completions.create(model=MODEL, messages=[{"role": "user", "content": build_prompt(question, chunks)}])
+    resp = _client().chat.completions.create(model=_model(), messages=[{"role": "user", "content": build_prompt(question, chunks)}])
     return resp.choices[0].message.content
+
+
+def _model() -> str:
+    return MODEL if os.environ.get("CONTEXTEVAL_DEMO_LLM", "fake") == "openai" else FAKE_MODEL
 
 
 def _client() -> Any:
