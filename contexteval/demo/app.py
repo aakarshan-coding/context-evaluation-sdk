@@ -18,6 +18,7 @@ from __future__ import annotations
 import functools
 import os
 import re
+import tempfile
 import zlib
 from pathlib import Path
 from typing import Any
@@ -25,6 +26,7 @@ from typing import Any
 from chromadb.api.types import EmbeddingFunction
 
 from .. import _text as text
+from .._store import PROJECT_DIR_NAME, find_project
 
 TOP_K = 4
 ARCHIVED_MARKER = "[ARCHIVED]"
@@ -81,12 +83,28 @@ def corpus_chunks() -> dict[str, str]:
     return chunks
 
 
-@functools.lru_cache(maxsize=None)
+def data_dir() -> Path:
+    """Where the demo keeps state: <project>/.contexteval for the project around the cwd, else
+    a temp directory, so the demo never creates a project the user did not ask for."""
+    project = find_project(Path.cwd())
+    if project is None:
+        return Path(tempfile.gettempdir()) / "contexteval_demo"
+    return project / PROJECT_DIR_NAME
+
+
 def collection() -> Any:
-    """Ephemeral chromadb client (telemetry off), built once per process from corpus/*.md."""
+    """The demo collection, indexed from corpus/*.md into data_dir()/demo_chroma."""
+    return _collection_at(str(data_dir() / "demo_chroma"))
+
+
+@functools.lru_cache(maxsize=None)
+def _collection_at(path: str) -> Any:
+    # Persistent, not ephemeral: chromadb 1.5's in-memory client drops an older collection's
+    # vector index once enough other collections are opened in the process (count() still
+    # reports every row, queries return none). A persisted index is reloaded instead.
     import chromadb
 
-    client = chromadb.EphemeralClient(settings=chromadb.Settings(anonymized_telemetry=False))
+    client = chromadb.PersistentClient(path=path, settings=chromadb.Settings(anonymized_telemetry=False))
     col = client.get_or_create_collection(COLLECTION_NAME, embedding_function=HashEmbedding())
     chunks = corpus_chunks()
     col.upsert(ids=list(chunks), documents=list(chunks.values()))

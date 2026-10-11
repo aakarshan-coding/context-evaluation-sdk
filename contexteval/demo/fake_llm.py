@@ -23,13 +23,11 @@ from __future__ import annotations
 
 import json
 import os
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Union
 
 from .. import _text as text
-from .._store import PROJECT_DIR_NAME, find_project
 from ..types import Evidence, never
 
 STATE_FILE_NAME = "demo_fake_state.json"
@@ -121,11 +119,10 @@ def respond(prompt: str, state_file: Path) -> str:
 
 
 def default_state_file() -> Path:
-    """<project>/.contexteval/demo_fake_state.json for the project around the cwd, else a temp file."""
-    project = find_project(Path.cwd())
-    if project is None:
-        return Path(tempfile.gettempdir()) / f"contexteval_{STATE_FILE_NAME}"
-    return project / PROJECT_DIR_NAME / STATE_FILE_NAME
+    """<project>/.contexteval/demo_fake_state.json for the project around the cwd."""
+    from .app import data_dir
+
+    return data_dir() / STATE_FILE_NAME
 
 
 def transport(state_file: Path | None = None) -> Any:

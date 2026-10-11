@@ -38,7 +38,7 @@ def _ranks(p: planted.Planted) -> tuple[list[int], list[str]]:
 
 
 @pytest.mark.parametrize("p", planted.PLANTED, ids=lambda p: p.expected.value + (f"-{p.cause}" if p.cause else "") if p.expected else "healthy")
-def test_planted_gold_ranks(p: planted.Planted) -> None:
+def test_planted_gold_ranks(p: planted.Planted, project: Path) -> None:
     """Defect: a corpus or question edit moves a gold chunk, so a planted case stops exercising
     its failure (for example the not_retrieved gold entering the top 4, or leaving the top 10,
     which breaks the P4 top_k=10 experiment)."""
