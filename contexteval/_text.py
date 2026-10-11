@@ -26,6 +26,12 @@ def tokens(text: str) -> list[str]:
     return normalize(text).split()
 
 
+def _has_token_run(haystack: str, needle: str) -> bool:
+    """Both normalized. True when `needle` is a run of whole tokens in `haystack`, so "cat" is
+    not found in "concatenate" and "4" is not found in "14"."""
+    return bool(needle) and f" {needle} " in f" {haystack} "
+
+
 def _max_window_overlap(have: Sequence[str], need: Counter[str], window: int) -> int:
     """Largest multiset overlap between `need` and any `window` consecutive tokens of `have`."""
     in_window: Counter[str] = Counter()
@@ -54,7 +60,7 @@ def contains_evidence(text: str, evidence: Evidence) -> bool:
     if not ev:
         return False
     text_norm = normalize(text)
-    if " ".join(ev) in text_norm:
+    if _has_token_run(text_norm, " ".join(ev)):
         return True
     window = math.ceil(len(ev) * EVIDENCE_WINDOW_FACTOR)
     overlap = _max_window_overlap(text_norm.split(), Counter(ev), window)
@@ -62,26 +68,23 @@ def contains_evidence(text: str, evidence: Evidence) -> bool:
 
 
 def chunk_in_prompt(chunk_text: str, prompt: str) -> bool:
-    chunk = normalize(chunk_text)
-    return bool(chunk) and chunk in normalize(prompt)
+    return _has_token_run(normalize(prompt), normalize(chunk_text))
 
 
 def in_prompt_pairs(retrievals: Sequence[RetrievalEvent], prompt: str) -> tuple[ChunkRef, ...]:
     """(retrieval index, delivered chunk index) for every delivered chunk found in the prompt."""
     prompt_norm = normalize(prompt)
-    pairs = []
-    for r, event in enumerate(retrievals):
-        for c, chunk in enumerate(event.delivered):
-            chunk_norm = normalize(chunk.text)
-            if chunk_norm and chunk_norm in prompt_norm:
-                pairs.append((r, c))
-    return tuple(pairs)
+    return tuple(
+        (r, c)
+        for r, event in enumerate(retrievals)
+        for c, chunk in enumerate(event.delivered)
+        if _has_token_run(prompt_norm, normalize(chunk.text))
+    )
 
 
 def answer_matches(expected: str, answer: str) -> bool:
-    """Grader fast path (plan item 2)."""
-    exp = normalize(expected)
-    return bool(exp) and exp in normalize(answer)
+    """Grader fast path (plan item 2): the expected answer's tokens appear as a run in the answer."""
+    return _has_token_run(normalize(answer), normalize(expected))
 
 
 def lexical_score(query: str, text: str) -> float:
