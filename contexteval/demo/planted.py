@@ -27,6 +27,7 @@ class Planted:
     expected: Label | None  # None: a healthy case that passes at baseline
     cause: Literal["not_retrieved", "dropped"] | None = None  # set iff expected is MISSING
     confirmed: bool | None = None  # expected Missing.confirmed
+    split: bool = False  # the evidence spans two paragraphs, so the demo's one-paragraph chunks split it (split_gold)
 
     @property
     def passes_baseline(self) -> bool:
@@ -83,6 +84,16 @@ _FLAKY = _case(
     "Boulder, Colorado",
     "Trailhead Gear is headquartered in Boulder, Colorado, and was founded in 1987 by two climbing guides.",
 )
+# The evidence is two consecutive paragraphs of corpus/fitting.md. The demo chunks one paragraph
+# per chunk, so each half is one chunk and neither holds 80% of the evidence; the fake model needs
+# the whole evidence in one chunk, which only a chunking that packs the two paragraphs gives it.
+_SPLIT = _planted(
+    "How much does a custom boot fitting cost if I buy the boots from you?",
+    "waived",
+    "A custom boot fitting will cost you 60 dollars and takes ninety minutes. The boot fitting cost is waived if you buy the boots from us.",
+    NeedsEvidence,
+    "The 60 dollar fitting cost is waived if you buy the boots from us.",
+)
 _HEALTHY_RETURNS = _planted(
     "Within how many days of delivery can unused items be returned?",
     "45 days",
@@ -104,6 +115,7 @@ PLANTED: tuple[Planted, ...] = (
     Planted(*_IGNORED, Label.IGNORED),
     Planted(*_IRRELEVANT, Label.IRRELEVANT),
     Planted(_NOT_CONTEXT, AlwaysWrong(), Label.NOT_CONTEXT),
+    Planted(*_SPLIT, Label.NOT_CONTEXT, split=True),
     Planted(_FLAKY, FailsFirstCall(answer="Trailhead Gear is based in Boulder, Colorado."), Label.FLAKY),
     Planted(*_HEALTHY_RETURNS, None),
     Planted(*_HEALTHY_SHIPPING, None),

@@ -12,8 +12,13 @@ top before only gold):
     NeedsEvidenceFirst evidence in the FIRST chunk    gold 2nd to 4th         fail   -       pass    -          ignored
     NeedsNoDistractor  evidence present, no marker    gold + marker chunk     fail   -       fail    pass       irrelevant
     AlwaysWrong        never                          gold present            fail   -       fail    fail       not_context
+    NeedsEvidence      evidence in any chunk          gold split over 2 chunks fail  -       skip    fail       not_context, split_gold
     FailsFirstCall     every call after the first     gold present, call 1    pass   -       -       -          flaky
     NeedsEvidence      evidence in any chunk          gold present            (passes at baseline: healthy)
+
+The split row: both halves are gold by the join rule and already sit first, so gold-to-top is
+skipped as unchanged; only-gold keeps both halves, and neither alone holds the evidence. A
+chunking that packs the two paragraphs into one chunk makes the same rule pass.
 
 Unscripted questions (synthetic cases from build-tests) echo the whole context back, so the
 grader's substring fast path passes iff the answer was in context.

@@ -140,9 +140,10 @@ def test_cli_build_tests_from_docs(project: Path, capsys: pytest.CaptureFixture[
     assert _cli.main(["build-tests", str(CORPUS_DIR), "--yes"]) == 0
     out = capsys.readouterr().out
     assert out.count("estimate:") == 2 and "(0 new)" in out
+    docs = len(list(CORPUS_DIR.glob("*.md")))
     store = Store.open(project)
     try:
-        assert len(store.cases("synthetic")) == 8
+        assert len(store.cases("synthetic")) == 2 * docs  # the fake provider writes two cases per document
     finally:
         store.close()
 

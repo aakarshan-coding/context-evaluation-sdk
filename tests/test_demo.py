@@ -16,6 +16,7 @@ openai = pytest.importorskip("openai")
 
 from contexteval import _cli  # noqa: E402
 from contexteval import _text as text  # noqa: E402
+from contexteval._diagnose import GoldLocation, locate_gold  # noqa: E402
 from contexteval._intervention import NO_INTERVENTION, GoldToTop, InjectEvidence, Intervention, OnlyGold  # noqa: E402
 from contexteval._llm import FakeProvider  # noqa: E402
 from contexteval._runner import make_grader, run_case  # noqa: E402
@@ -23,7 +24,7 @@ from contexteval._store import Store  # noqa: E402
 from contexteval.demo import app as demo_app  # noqa: E402
 from contexteval.demo import fake_llm, planted  # noqa: E402
 from contexteval.demo.fake_llm import NeedsEvidenceFirst, NeedsNoDistractor  # noqa: E402
-from contexteval.types import Crashed, Label  # noqa: E402
+from contexteval.types import Chunking, Crashed, Label  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 K = demo_app.TOP_K
@@ -37,12 +38,21 @@ def _ranks(p: planted.Planted) -> tuple[list[int], list[str]]:
     return [i + 1 for i, d in enumerate(docs) if text.contains_evidence(d, p.case.evidence)], docs
 
 
-@pytest.mark.parametrize("p", planted.PLANTED, ids=lambda p: p.expected.value + (f"-{p.cause}" if p.cause else "") if p.expected else "healthy")
+@pytest.mark.parametrize("p", planted.PLANTED, ids=lambda p: (p.expected.value + (f"-{p.cause}" if p.cause else "") + ("-split" if p.split else "")) if p.expected else "healthy")
 def test_planted_gold_ranks(p: planted.Planted, project: Path) -> None:
     """Defect: a corpus or question edit moves a gold chunk, so a planted case stops exercising
     its failure (for example the not_retrieved gold entering the top 4, or leaving the top 10,
-    which breaks the P4 top_k=10 experiment)."""
+    which breaks the P4 top_k=10 experiment; or the split case's halves no longer both in the
+    top 4 and next to each other, so the join rule never fires)."""
     gold, docs = _ranks(p)
+    if p.split:
+        assert p.case.evidence is not None
+        assert gold == [], f"no single chunk should hold the split evidence, found ranks {gold}"
+        halves = [i + 1 for i, d in enumerate(docs) if text.lexical_score(d, p.case.evidence.text) > 0.9]
+        assert len(halves) == 2 and halves[1] == halves[0] + 1 and halves[1] <= K, halves
+        assert text.gold_flags(docs[:K], p.case.evidence) == tuple(i + 1 in halves for i in range(K))
+        assert text.gold_split(docs[:K], p.case.evidence)
+        return
     assert len(gold) == 1, f"exactly one chunk should hold the evidence, found ranks {gold}"
     (rank,) = gold
     if p.cause == "not_retrieved":
@@ -89,6 +99,31 @@ def test_rules_plus_ladder_yield_the_planted_label(p: planted.Planted, project: 
         return
     outcomes = {step: _passes(p, replays[step]) for step in EXPECTED_REPLAYS[p.expected]}
     assert outcomes == EXPECTED_REPLAYS[p.expected]
+
+
+def test_demo_build_keeps_its_own_chunking_by_default_and_a_larger_chunk_size_fixes_the_split_case(project: Path, hooks: None) -> None:
+    """v2 chunking on the demo. Defects: the default chunking no longer one paragraph per chunk
+    (every planted rank would shift), build() returning an app on the app's own index, the split
+    case labeled without the split signal, or no chunking that packs the two fitting paragraphs
+    together and so makes the split case pass. The chunk_size tried is what the sweep proposes:
+    twice the longest chunk at baseline. The other planted labels are unchanged at baseline."""
+    (p,) = [p for p in planted.PLANTED if p.split]
+    assert p.case.evidence is not None
+    for path in sorted(demo_app.CORPUS_DIR.glob("*.md")):
+        paragraphs = [x.strip() for x in path.read_text(encoding="utf-8").split("\n\n") if x.strip() and not x.startswith("#")]
+        assert [demo_app.corpus_chunks()[f"{path.name}#{n}"] for n in range(len(paragraphs))] == paragraphs
+    assert not _passes(p, NO_INTERVENTION)
+    trace = run_case(demo_app.answer, p.case, make_grader(FakeProvider()))
+    gold = locate_gold(p.case.evidence, trace)
+    assert gold.location is GoldLocation.IN_PROMPT and gold.split is True and len(gold.gold) == 2
+    longest = max(len(c) for c in demo_app.corpus_chunks().values())
+    packed = Chunking(chunk_size=2 * longest)
+    assert demo_app.corpus_chunks(packed)["fitting.md#0"].startswith(p.case.evidence.text.split(". ")[0])
+    assert text.contains_evidence(demo_app.corpus_chunks(packed)["fitting.md#0"], p.case.evidence)
+    built = demo_app.build(packed)
+    assert run_case(built, p.case, make_grader(FakeProvider())).test.passed is True  # type: ignore[union-attr]
+    titled = demo_app.corpus_chunks(Chunking(title=True))
+    assert titled["fitting.md#0"] == "Boot fitting\n\n" + demo_app.corpus_chunks()["fitting.md#0"]
 
 
 def test_not_retrieved_case_passes_at_top_k_10(project: Path, hooks: None) -> None:

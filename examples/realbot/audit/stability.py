@@ -17,12 +17,13 @@ project = find_project(Path.cwd())
 store = Store.open(project)
 config = load_config(project)
 grade = make_grader(_provider(config))
-app = load_app("examples.realbot.bot:answer")
+loaded = load_app("examples.realbot.bot:answer")
 for tid in map(int, sys.argv[2:]):
     st = store.trace(tid)
     case = store.case(st.trace.test.case_id)
     gold = locate_gold(case.evidence, st.trace)
-    replay = make_replay(app, case, case.evidence, grade, store.run(st.run_id).setting.intervention())
+    setting = store.run(st.run_id).setting
+    replay = make_replay(loaded.for_chunking(setting.chunking), case, case.evidence, grade, setting.intervention())
     steps = [ReplayStep.BASELINE_RERUN] + ([ReplayStep.INJECT_EVIDENCE] if gold.location.value != "in_prompt" else [ReplayStep.GOLD_TO_TOP, ReplayStep.ONLY_GOLD])
     cells = []
     for step in steps:

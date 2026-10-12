@@ -133,6 +133,9 @@ def test_candidates_are_ranked_by_how_many_failures_carry_their_label() -> None:
     assert _sweep.rank_candidates({FailureKind.DROPPED: 2, FailureKind.FLAKY: 1}, BASE) == []
     split = _sweep.rank_candidates({FailureKind.NOT_CONTEXT: 2, Signal.SPLIT_GOLD: 2}, BASE)
     assert [(r.setting.name, r.weight, r.kinds) for r in split] == [("chunk_size=800", 2, (Signal.SPLIT_GOLD,)), ("overlap=100", 2, (Signal.SPLIT_GOLD,))]
+    # A signal is direct evidence, so at equal weight its candidates outrank a label's and survive --max-settings.
+    tied = [r.setting.name for r in _sweep.rank_candidates({FailureKind.NOT_RETRIEVED: 1, Signal.SPLIT_GOLD: 1}, BASE)]
+    assert tied == ["chunk_size=800", "overlap=100", "top_k=8", "top_k=12"]
 
 
 def test_no_candidate_setting_can_carry_gold() -> None:
@@ -236,7 +239,7 @@ def test_split_gold_proposes_chunking_candidates_only_when_the_app_has_a_builder
     with_builder, _ = _sweep.plan_sweep(store, store.run(run), rounds=2, max_settings=6, holdout=0, seed=0, tolerance=None, builder=True)
     assert with_builder.baseline == _sweep.Baseline(K, longest) and with_builder.split_gold == 1 and with_builder.chunking_pointers == 1
     assert with_builder.counts == {FailureKind.NOT_CONTEXT: 1, FailureKind.NOT_RETRIEVED: 1}
-    assert [r.setting for r in with_builder.candidates] == [Setting(top_k=8), Setting(top_k=12), *chunking] and with_builder.withheld == []
+    assert [r.setting for r in with_builder.candidates] == [*chunking, Setting(top_k=8), Setting(top_k=12)] and with_builder.withheld == []
     assert [(k, n) for k, n, _ in with_builder.unfixable] == [(FailureKind.NOT_CONTEXT, 1)]
 
     without, _ = _sweep.plan_sweep(store, store.run(run), rounds=2, max_settings=6, holdout=0, seed=0, tolerance=None, builder=False)
@@ -541,14 +544,16 @@ def test_window_is_zero_when_the_source_run_recorded_no_input_tokens(project: Pa
         store.close()
 
 
-def test_demo_sweep_recommends_a_larger_top_k_and_names_the_dropped_case_as_unfixable(project: Path, hooks: None, capsys: pytest.CaptureFixture[str]) -> None:
-    """Through `_cli.main` on the planted demo. Defects: the planted not_retrieved case does not
-    lead to a top_k candidate, the recommended setting does not carry the larger top_k that fixes
-    it, the dropped case is offered a setting instead of the reason none can help, --holdout 0 is
-    refused or not warned about, or the sweep is stored as a manual experiment. Also a near-tie
-    window that does not scale with the case count: one case is 12.5 points of 8, and a window of
-    one trades top_k=8 rerank=lexical for rerank=lexical max_chunks=2, which leaves the planted
-    not_retrieved case failing. On 8 tune cases the default window is 0."""
+def test_demo_sweep_tries_the_chunking_the_split_case_asks_for_and_names_the_dropped_case_as_unfixable(project: Path, hooks: None, capsys: pytest.CaptureFixture[str]) -> None:
+    """Through `_cli.main` on the planted demo, which offers build(chunking). Defects: the planted
+    not_retrieved case does not lead to a top_k candidate; the split case does not lead to a
+    chunk_size candidate scaled from the longest baseline chunk, or that candidate is cut by the
+    default --max-settings behind the label candidates of equal weight, or it runs on the demo's
+    own index so the split case still fails under it; a build the app refuses (an overlap on the
+    demo's one-paragraph chunks) stops the sweep instead of being listed as not applicable; the
+    dropped case is offered a setting instead of the reason none can help; --holdout 0 is refused
+    or not warned about; or the sweep is stored as a manual experiment. On 9 tune cases the
+    default near-tie window is 0."""
     pytest.importorskip("chromadb")
     from contexteval.demo import planted
 
@@ -560,26 +565,33 @@ def test_demo_sweep_recommends_a_larger_top_k_and_names_the_dropped_case_as_unfi
     assert _cli.main(["sweep", "--holdout", "0", "--yes"]) == 0
     out = capsys.readouterr().out
     assert "no setting can fix 1 missing/dropped failure: retrieval found the gold chunk and your own code removed it" in out
-    assert "no setting can fix 1 not_context failure" in out and "no setting can fix 1 flaky failure" in out
-    assert "warning: no holdout cases" in out
-    assert "candidates, heaviest first" in out and "top_k=8 (1)" in out and "top_k=12 (1)" in out
+    assert "no setting can fix 2 not_context failures" in out and "no setting can fix 1 flaky failure" in out
+    assert "; 1 with the evidence split across two adjacent chunks; the baseline retrieved up to 4 chunks of up to " in out
+    assert "warning: no holdout cases" in out and "chunking:" not in out
     assert "near-tie window" not in out
-    final = out.rstrip().splitlines()[-1]
-    assert final.startswith("Set ") and "top_k=8" in final and "(no holdout cases, so this is unconfirmed)" in final
-
     store = Store.open(project)
     try:
         report, runs = _sweep_runs(store)
+        source = store.traces(report.source_run)
+        longest = max(len(c.text) for s in source for e in s.trace.retrievals for c in e.delivered)
+        candidates = out.split("candidates, heaviest first")[1].splitlines()[0]
+        assert f"chunk_size={2 * longest} (1)" in candidates and f"overlap={round(longest / 4)} (1)" in candidates
+        assert "title=on (2)" in candidates and "top_k=8 (1)" in candidates and "top_k=12 (1)" in candidates
+        assert f"not applicable: overlap={round(longest / 4)}: build(overlap={round(longest / 4)}) raised ValueError: overlap" in out
+        final = out.rstrip().splitlines()[-1]
+        assert final.startswith("Set ") and f"chunk_size={2 * longest}" in final and "(no holdout cases, so this is unconfirmed)" in final
+
         assert report.recommended is not None and report.holdout_runs is None and report.split.holdout == ()
         recommended, traces = runs[report.recommended]
-        assert recommended.top_k == 8 and traces == len(planted.PLANTED)
-        assert report.counts[FailureKind.NOT_RETRIEVED] == 1 and report.counts[FailureKind.DROPPED] == 1
+        assert recommended.chunk_size == 2 * longest and traces == len(planted.PLANTED)
+        assert report.counts[FailureKind.NOT_RETRIEVED] == 1 and report.counts[FailureKind.DROPPED] == 1 and report.counts[FailureKind.NOT_CONTEXT] == 2
         for setting, _ in runs.values():
             assert not any(isinstance(t, GOLD_TRANSFORMS) for t in setting.intervention().transforms)
-        (not_retrieved,) = [p for p in planted.PLANTED if p.cause == "not_retrieved"]
+        (split,) = [p for p in planted.PLANTED if p.split]
         passed = {s.trace.test.case_id: s.trace.test.passed for s in store.traces(report.recommended) if s.trace.test}
         baseline = {s.trace.test.case_id: s.trace.test.passed for s in store.traces(report.baseline_run) if s.trace.test}
-        assert passed[not_retrieved.case.id] is True and baseline[not_retrieved.case.id] is False
+        assert passed[split.case.id] is True and baseline[split.case.id] is False
+        assert sum(passed.values()) > sum(baseline.values())
     finally:
         store.close()
 
@@ -862,7 +874,7 @@ def test_sweep_with_a_builder_tries_the_chunking_the_split_signal_asks_for_and_r
     assert _cli.main(["sweep", "--holdout", "0", "--yes"]) == 0
     out = capsys.readouterr().out
     assert "sweep: 2 labeled failures among the tune cases (missing/not_retrieved 1, missing/dropped 1); 1 with the evidence split across two adjacent chunks; the baseline retrieved up to 3 chunks of up to 22 characters" in out
-    assert "candidates, heaviest first (4 of 4; the number is how many failures ask for it): top_k=6 (1), top_k=9 (1), chunk_size=44 (1), overlap=6 (1)" in out
+    assert "candidates, heaviest first (4 of 4; the number is how many failures ask for it): chunk_size=44 (1), overlap=6 (1), top_k=6 (1), top_k=9 (1)" in out
     assert "chunking:" not in out
     final = _final(out)
     # The app records no input tokens, so every row that passes 3 of 4 ties and latency picks

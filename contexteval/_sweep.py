@@ -177,10 +177,13 @@ class Ranked:
 
 
 def rank_candidates(counts: Mapping[Cause, int], base: Baseline) -> list[Ranked]:
-    """Heaviest first; a setting two causes propose carries both counts. Ties keep policy order."""
+    """Heaviest first; a setting two causes propose carries both counts. Among equal weights a
+    signal's candidates come before a label's, because a signal is direct evidence of the cause
+    where a label's candidates are a guess, and then policy order holds; --max-settings cuts
+    from the end."""
     weight: dict[Setting, int] = {}
     kinds: dict[Setting, list[Cause]] = {}
-    for cause in (*FailureKind, *Signal):
+    for cause in (*Signal, *FailureKind):
         n = counts.get(cause, 0)
         if n == 0:
             continue

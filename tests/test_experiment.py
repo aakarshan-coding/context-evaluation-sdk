@@ -306,7 +306,8 @@ def test_missing_case_passes_with_larger_top_k(project: Path, hooks: None, capsy
     capsys.readouterr()
     assert _cli.main(["experiment", "top_k=4,10", "--yes"]) == 0  # app from config
     out = capsys.readouterr().out
-    assert "8 cases x 3 settings" in out and "estimate: 24 LLM calls" in out
+    n = len(planted.PLANTED)
+    assert f"{n} cases x 3 settings" in out and f"estimate: {3 * n} LLM calls" in out
 
     store = Store.open(project)
     try:
