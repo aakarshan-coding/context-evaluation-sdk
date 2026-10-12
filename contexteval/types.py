@@ -9,7 +9,7 @@ Invariants carried by construction:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from enum import Enum
 from typing import Any, Literal, Mapping, NewType, NoReturn, Union
 
@@ -346,6 +346,59 @@ def explain(d: Diagnosis) -> str:
 
 
 # --- experiments ------------------------------------------------------------
+
+
+def knob_text(value: object) -> str:
+    """How a knob value prints in a setting name: `on`/`off` for a flag, an Enum's value, else str."""
+    if isinstance(value, bool):
+        return "on" if value else "off"
+    if isinstance(value, Enum):
+        return str(value.value)
+    return str(value)
+
+
+@dataclass(frozen=True)
+class Chunking:
+    """How an app splits its documents when it builds its index. These are index-time knobs, a
+    separate family from the retrieval-time knobs on `Setting`: contexteval cannot apply them
+    itself, so an app that wants to try them offers `build(chunking) -> answer` next to
+    `answer`. None means the app's own value, so `Chunking()` is the app's own chunking.
+    """
+
+    chunk_size: int | None = None  # characters per chunk; whole paragraphs are packed up to it
+    overlap: int | None = None  # characters carried from the end of one chunk into the next
+    title: bool | None = None  # prefix every chunk with its document's title
+
+    def __post_init__(self) -> None:
+        if self.chunk_size is not None and self.chunk_size < 1:
+            raise ValueError(f"chunk_size must be a positive integer, got {self.chunk_size}")
+        if self.overlap is not None and self.overlap < 0:
+            raise ValueError(f"overlap must be 0 or more, got {self.overlap}")
+        if self.chunk_size is not None and self.overlap is not None and self.overlap >= self.chunk_size:
+            raise ValueError(f"overlap ({self.overlap}) must be smaller than chunk_size ({self.chunk_size})")
+
+    @property
+    def is_default(self) -> bool:
+        return self == Chunking()
+
+    @property
+    def is_complete(self) -> bool:
+        return self.chunk_size is not None and self.overlap is not None and self.title is not None
+
+    def with_defaults(self, *, chunk_size: int, overlap: int = 0, title: bool = False) -> Chunking:
+        """Fill every unset knob with the app's own value, so chunk_text can run. A knob the
+        experiment set is kept."""
+        return Chunking(
+            chunk_size=self.chunk_size if self.chunk_size is not None else chunk_size,
+            overlap=self.overlap if self.overlap is not None else overlap,
+            title=self.title if self.title is not None else title,
+        )
+
+    @property
+    def name(self) -> str:
+        """The set knobs as "chunk_size=800 title=on", or "the app's own chunking"."""
+        parts = [f"{f.name}={knob_text(getattr(self, f.name))}" for f in fields(self) if getattr(self, f.name) is not None]
+        return " ".join(parts) or "the app's own chunking"
 
 
 @dataclass(frozen=True)

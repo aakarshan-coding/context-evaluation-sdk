@@ -7,7 +7,7 @@ import re
 from collections import Counter
 from typing import Sequence
 
-from .types import ChunkRef, Evidence, RetrievalEvent
+from .types import Chunking, ChunkRef, Evidence, RetrievalEvent
 
 EVIDENCE_TOKEN_THRESHOLD = 0.8  # plan item 1
 EVIDENCE_WINDOW_FACTOR = 1.5  # architecture graft 5: token rule holds inside a window this many evidence-lengths wide
@@ -122,3 +122,55 @@ def top_sentences(text: str, query: str, n: int) -> str:
 
 def estimate_tokens(text: str) -> int:
     return max(1, len(text) // CHARS_PER_TOKEN)
+
+
+# --- chunking (index time) ----------------------------------------------------------
+
+_PARAGRAPH_BREAK = re.compile(r"\n\s*\n")
+
+
+def _tail(text: str, n: int) -> str:
+    """The last `n` characters of `text`, widened to the left so it starts on a word."""
+    if n <= 0:
+        return ""
+    if n >= len(text):
+        return text
+    start = len(text) - n
+    boundary = max(text.rfind(" ", 0, start), text.rfind("\n", 0, start))
+    return text[boundary + 1 :].lstrip() if boundary >= 0 else text
+
+
+def chunk_text(text: str, chunking: Chunking, title: str | None = None) -> list[str]:
+    """Split one document into chunks the way the real bot's chunker did, with overlap and an
+    optional title. Apps call it inside `build(chunking)`.
+
+    Paragraphs (runs of text between blank lines) are packed whole into a chunk until the next
+    one would take it past `chunk_size` characters; a paragraph longer than that is its own
+    chunk. With `overlap`, each chunk after the first starts with the last `overlap` characters
+    of the one before it, widened to whole words, and that tail counts toward the size. With
+    `title` on and a title given, every chunk is prefixed with the title and a blank line; the
+    prefix does not count toward the size, so a title experiment keeps the same boundaries.
+
+    Every knob must be set: an unset one would have to be guessed, and a guess would make a
+    `title=on` experiment also change the chunk size.
+    """
+    if not chunking.is_complete:
+        raise ValueError(
+            f"chunk_text needs chunk_size, overlap, and title all set, got {chunking.name}; "
+            "call chunking.with_defaults(chunk_size=..., overlap=..., title=...) with your app's own values first"
+        )
+    assert chunking.chunk_size is not None and chunking.overlap is not None
+    paragraphs = [p.strip() for p in _PARAGRAPH_BREAK.split(text) if p.strip()]
+    chunks: list[str] = []
+    current = ""
+    carried = ""  # the overlap tail `current` started with; a chunk is never the tail alone
+    for paragraph in paragraphs:
+        if current and current != carried and len(current) + 2 + len(paragraph) > chunking.chunk_size:
+            chunks.append(current)
+            carried = _tail(current, chunking.overlap)
+            current = carried
+        current = f"{current}\n\n{paragraph}" if current else paragraph
+    if current:
+        chunks.append(current)
+    prefix = f"{title}\n\n" if chunking.title and title else ""
+    return [prefix + chunk for chunk in chunks]
