@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "contexteval"
-version = "0.2.0"
+version = "0.3.0"
 description = "Find out why your RAG app's answer failed: label each failure as missing, irrelevant, or ignored context, then test the fix."
 readme = "README.md"
 requires-python = ">=3.10"
