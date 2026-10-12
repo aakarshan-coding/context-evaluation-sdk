@@ -108,14 +108,48 @@ CREATE TABLE IF NOT EXISTS diagnoses (
 CREATE INDEX IF NOT EXISTS traces_run ON traces(run_id);
 """
 
-# Schema version -> statements that bring it to the next version. Each runs once, under the
-# version check in Store.open, so an old project opens in place instead of being refused.
-_MIGRATIONS: dict[int, str] = {
-    1: """
-    ALTER TABLE experiments ADD COLUMN kind TEXT NOT NULL DEFAULT 'manual' CHECK (kind IN ('manual','sweep'));
-    ALTER TABLE experiments ADD COLUMN report TEXT;
-    """,
+@dataclass(frozen=True)
+class _AddColumn:
+    """One migration step. It checks the table first, so a step that ran before a crash is a
+    no-op on the rerun instead of "duplicate column name" on every later open."""
+
+    table: str
+    column: str
+    definition: str
+
+    def apply(self, conn: sqlite3.Connection) -> None:
+        columns = {row[1] for row in conn.execute(f"PRAGMA table_info({self.table})")}
+        if self.column not in columns:
+            conn.execute(f"ALTER TABLE {self.table} ADD COLUMN {self.column} {self.definition}")
+
+
+# Schema version -> the steps that bring it to the next version, applied by _migrate in one
+# transaction with the version bump, so an old project opens in place instead of being refused.
+_MIGRATIONS: dict[int, tuple[_AddColumn, ...]] = {
+    1: (
+        _AddColumn("experiments", "kind", "TEXT NOT NULL DEFAULT 'manual' CHECK (kind IN ('manual','sweep'))"),
+        _AddColumn("experiments", "report", "TEXT"),
+    ),
 }
+
+
+def _migrate(conn: sqlite3.Connection, version: int) -> int:
+    """Bring the database from `version` to the next one and return the version it holds after.
+    The steps and the version bump commit together, and the version is re-read under the write
+    lock, so a process that finds another one already past this step applies nothing."""
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        current = conn.execute("PRAGMA user_version").fetchone()[0]
+        if current == version:
+            for step in _MIGRATIONS[version]:
+                step.apply(conn)
+            current = version + 1
+            conn.execute(f"PRAGMA user_version={current}")
+        conn.execute("COMMIT")
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
+    return current
 
 
 def find_project(start: Path) -> Path | None:
@@ -295,10 +329,9 @@ class Store:
         if version not in (0, SCHEMA_VERSION, *_MIGRATIONS):
             conn.close()
             raise RuntimeError(f"{directory / DB_FILE}: schema version {version}, this build reads {SCHEMA_VERSION}")
+        while 0 < version < SCHEMA_VERSION:
+            version = _migrate(conn, version)
         with conn:
-            while 0 < version < SCHEMA_VERSION:
-                conn.executescript(_MIGRATIONS[version])
-                version += 1
             conn.executescript(_SCHEMA)
             conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         return cls(conn)

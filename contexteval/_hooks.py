@@ -22,18 +22,18 @@ import copy
 import importlib
 import importlib.util
 import inspect
-import threading
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Literal, Mapping, Union
 
 from . import _capture as capture
-from ._capture import InstallReport, LLMAdapter, Mode, Restore, RetrievalCodec
+from ._capture import InstallReport, LLMAdapter, Mode, Restore, RetrievalCodec, override_attr
 from ._intervention import InterventionNotApplicable
 from ._store import Store, find_project
 from .types import Chunk
 
-Status = Literal["installed", "already", "not_installed", "incompatible", "failed"]
+Status = Literal["installed", "already", "not_imported", "not_installed", "incompatible", "failed"]
 
 INJECTED_ID = "contexteval:injected"
 
@@ -49,7 +49,7 @@ def _get(obj: Any, key: str, default: Any = None) -> Any:
 
 
 @dataclass(frozen=True)
-class ChromaCodec:
+class ChromaCodec(RetrievalCodec[Any]):
     """chromadb Collection.query(query_texts=[...], n_results=k) -> dict of per-query lists.
 
     v1 intervenes only on single-query calls. Multi-query calls record their first row and
@@ -127,7 +127,7 @@ class _SyntheticMatch:
 
 
 @dataclass(frozen=True)
-class PineconeCodec:
+class PineconeCodec(RetrievalCodec[Any]):
     """pinecone Index.query(vector=..., top_k=k, include_metadata=True) -> matches.
 
     Queries are vectors, so query_text is None and transforms fall back to the run question.
@@ -199,52 +199,23 @@ class PineconeCodec:
 
 # --- framework retrievers (LangChain, LlamaIndex) ----------------------------
 #
-# A framework retriever's top_k is state on the retriever object, so these codecs implement
-# capture.InstanceTopK: the knob is set for one call and put back when the call returns.
-# Their LLM wrappers (ChatOpenAI, llama_index OpenAI, ...) call the official SDKs, which the
-# adapters below already hook, so no LLM rows are needed for them.
-
-_knob_lock = threading.Lock()
-# (id(instance), attribute) -> (the user's value, calls currently overriding it)
-_knobs: dict[tuple[int, str], tuple[Any, int]] = {}
-
-
-def _override_attr(instance: Any, attr: str, value: Any) -> Restore:
-    """Set `instance.attr` for one call and return what puts the user's value back.
-
-    Calls that overlap on one instance (an app that gathers two retrievals for one question)
-    all want the same value, because one run has one intervention: the first one in saves the
-    user's value and the last one out restores it, so no call restores another call's override.
-    Two runs wanting different values on one shared instance are not supported; the runner
-    executes one question at a time (plan item 7)."""
-    key = (id(instance), attr)
-    with _knob_lock:
-        saved, depth = _knobs.get(key, (getattr(instance, attr), 0))
-        _knobs[key] = (saved, depth + 1)
-        setattr(instance, attr, value)
-
-    def restore() -> None:
-        with _knob_lock:
-            saved, depth = _knobs[key]
-            if depth > 1:
-                _knobs[key] = (saved, depth - 1)
-            else:
-                del _knobs[key]
-                setattr(instance, attr, saved)
-
-    return restore
-
+# A framework retriever's top_k is state on the retriever object, so these codecs override
+# RetrievalCodec.override_top_k: the knob is set for one call and put back when the call
+# returns. Their LLM wrappers (ChatOpenAI, llama_index OpenAI, ...) call the official SDKs,
+# which the adapters below already hook, so no LLM rows are needed for them.
 
 @dataclass(frozen=True)
-class LangChainRetrieverCodec:
+class LangChainRetrieverCodec(RetrievalCodec[Any]):
     """langchain_core BaseRetriever.invoke(input, config=None, **kwargs) -> list[Document].
 
     Documents carry page_content, metadata, and an optional id; no score. The top_k knob is
     the retriever's own: `search_kwargs["k"]` on a VectorStoreRetriever (the dict is replaced
-    for the call, never edited in place) or an int `k` field. A retriever with neither refuses
-    a top_k intervention. langchain-chroma reaches the hooked chromadb `Collection.query`
-    underneath; that inner call passes through (capture's outermost rule), so one invoke is
-    one event.
+    for the call, never edited in place) or an int `k` field. VectorStoreRetriever merges the
+    call's kwargs over `search_kwargs`, so a per-call `k` is overridden too. A retriever with
+    no knob leaves top_k to the hooked call underneath it (a base retriever, a chromadb
+    collection) and refuses only when none takes it. langchain-chroma reaches the hooked
+    chromadb `Collection.query` underneath; that inner call records nothing (capture's
+    outermost rule), so one invoke is one event.
     """
 
     source: str = "langchain"
@@ -254,12 +225,16 @@ class LangChainRetrieverCodec:
         query = args.arguments.get("input")
         return query if isinstance(query, str) else None
 
-    def override_top_k(self, instance: Any, top_k: int) -> Restore:
+    def override_top_k(self, args: inspect.BoundArguments, top_k: int) -> Restore | None:
+        instance = args.arguments.get("self")
+        kwargs = args.arguments.get("kwargs")
+        if isinstance(kwargs, dict) and "k" in kwargs:
+            kwargs["k"] = top_k
         search_kwargs = getattr(instance, "search_kwargs", None)
         if isinstance(search_kwargs, Mapping):
-            return _override_attr(instance, "search_kwargs", {**search_kwargs, "k": top_k})
+            return override_attr(instance, "search_kwargs", {**search_kwargs, "k": top_k})
         if isinstance(getattr(instance, "k", None), int):
-            return _override_attr(instance, "k", top_k)
+            return override_attr(instance, "k", top_k)
         raise InterventionNotApplicable(f"langchain: top_k={top_k} requested but {type(instance).__name__} has no search_kwargs or k")
 
     def decode(self, result: Any) -> tuple[Chunk, ...]:
@@ -282,14 +257,14 @@ class LangChainRetrieverCodec:
 
 
 @dataclass(frozen=True)
-class LlamaIndexRetrieverCodec:
+class LlamaIndexRetrieverCodec(RetrievalCodec[Any]):
     """llama_index.core BaseRetriever.retrieve(str_or_query_bundle) -> list[NodeWithScore].
 
     The query is a string or a QueryBundle (query_str). Chunk text is the node's content without
     metadata, so it matches what the node holds, not what a prompt template adds. The top_k
     knob is the retriever's `similarity_top_k` (a property on VectorIndexRetriever); a retriever
-    without one refuses a top_k intervention. An injected chunk is a NodeWithScore over a
-    TextNode at score 1.0, the best similarity, so a sort by score keeps it first.
+    without one leaves top_k to a hooked call underneath. An injected chunk is a NodeWithScore
+    over a TextNode at score 1.0, the best similarity, so a sort by score keeps it first.
     """
 
     source: str = "llamaindex"
@@ -302,10 +277,11 @@ class LlamaIndexRetrieverCodec:
         query_str = getattr(query, "query_str", None)
         return query_str if isinstance(query_str, str) else None
 
-    def override_top_k(self, instance: Any, top_k: int) -> Restore:
+    def override_top_k(self, args: inspect.BoundArguments, top_k: int) -> Restore | None:
+        instance = args.arguments.get("self")
         if not isinstance(getattr(instance, "similarity_top_k", None), int):
             raise InterventionNotApplicable(f"llamaindex: top_k={top_k} requested but {type(instance).__name__} has no similarity_top_k")
-        return _override_attr(instance, "similarity_top_k", top_k)
+        return override_attr(instance, "similarity_top_k", top_k)
 
     def decode(self, result: Any) -> tuple[Chunk, ...]:
         return tuple(
@@ -454,6 +430,11 @@ class HookSpec:
     library: str  # import name, the InstallReport key
     targets: tuple[str, ...]  # "module:Owner.method" candidates, first importable wins (version drift)
     handler: Handler
+    # Production hooks this library only when the app has imported it by init() time. For the
+    # frameworks, whose import costs seconds: an app that uses one has imported it already, and
+    # an app that uses neither should not pay for them. The CLI installs before the app module
+    # loads, so it imports and hooks every library it can.
+    only_if_imported: bool = False
 
 
 HOOKS: tuple[HookSpec, ...] = (
@@ -466,14 +447,14 @@ HOOKS: tuple[HookSpec, ...] = (
     HookSpec("openai", ("openai.resources.responses:AsyncResponses.create",), OpenAIResponsesAdapter()),
     HookSpec("anthropic", ("anthropic.resources.messages:Messages.create",), AnthropicMessagesAdapter()),
     HookSpec("anthropic", ("anthropic.resources.messages:AsyncMessages.create",), AnthropicMessagesAdapter()),
-    HookSpec("langchain_core", ("langchain_core.retrievers:BaseRetriever.invoke",), LangChainRetrieverCodec()),
-    HookSpec("langchain_core", ("langchain_core.retrievers:BaseRetriever.ainvoke",), LangChainRetrieverCodec()),
-    HookSpec("llama_index", ("llama_index.core.base.base_retriever:BaseRetriever.retrieve",), LlamaIndexRetrieverCodec()),
-    HookSpec("llama_index", ("llama_index.core.base.base_retriever:BaseRetriever.aretrieve",), LlamaIndexRetrieverCodec()),
+    HookSpec("langchain_core", ("langchain_core.retrievers:BaseRetriever.invoke",), LangChainRetrieverCodec(), only_if_imported=True),
+    HookSpec("langchain_core", ("langchain_core.retrievers:BaseRetriever.ainvoke",), LangChainRetrieverCodec(), only_if_imported=True),
+    HookSpec("llama_index", ("llama_index.core.base.base_retriever:BaseRetriever.retrieve",), LlamaIndexRetrieverCodec(), only_if_imported=True),
+    HookSpec("llama_index", ("llama_index.core.base.base_retriever:BaseRetriever.aretrieve",), LlamaIndexRetrieverCodec(), only_if_imported=True),
 )
 
 # Worse statuses win when a library has several specs.
-_SEVERITY: dict[Status, int] = {"already": 0, "installed": 1, "not_installed": 2, "incompatible": 3, "failed": 4}
+_SEVERITY: dict[Status, int] = {"already": 0, "installed": 1, "not_imported": 2, "not_installed": 3, "incompatible": 4, "failed": 5}
 
 # (owner, method name, original) for every patched method, in install order.
 _patched: list[tuple[type, str, Callable[..., Any]]] = []
@@ -490,9 +471,11 @@ def _resolve(target: str) -> tuple[type, str] | None:
     return (owner, method) if isinstance(owner, type) else None
 
 
-def _install_spec(spec: HookSpec) -> Status:
+def _install_spec(spec: HookSpec, production: bool) -> Status:
     """Never raises: a library whose import has a failing side effect, or whose target cannot be
     wrapped, is reported as failed and left alone, and the other libraries still get hooked."""
+    if production and spec.only_if_imported and spec.library not in sys.modules:
+        return "not_imported"
     try:
         for target in spec.targets:
             resolved = _resolve(target)
@@ -504,11 +487,11 @@ def _install_spec(spec: HookSpec) -> Status:
         return "failed"
 
 
-def install_all(specs: tuple[HookSpec, ...] = HOOKS) -> InstallReport:
+def install_all(specs: tuple[HookSpec, ...] = HOOKS, *, production: bool = False) -> InstallReport:
     """Patch every spec whose library imports. A library's status is its worst spec status."""
     statuses: dict[str, Status] = {}
     for spec in specs:
-        status = _install_spec(spec)
+        status = _install_spec(spec, production)
         previous = statuses.get(spec.library)
         if previous is None or _SEVERITY[status] > _SEVERITY[previous]:
             statuses[spec.library] = status
@@ -541,16 +524,18 @@ def uninstall_all() -> None:
     while _patched:
         owner, name, original = _patched.pop()
         setattr(owner, name, original)
+    capture.forget_knobs()
 
 
 # --- entry points -----------------------------------------------------------
 
 
 def install(mode: Literal["cli", "production"], project_dir: Path | None = None, pinecone_text_key: str | None = None) -> InstallReport:
-    """Idempotent. Patches every library in HOOKS that is importable, then sets the process mode
-    (which only escalates from OFF, see capture.set_mode). A pinecone text key given here
-    applies to calls from now on, whether or not the hooks were already in place."""
-    report = install_all(HOOKS)
+    """Idempotent. Patches every library in HOOKS that is importable (in production, a framework
+    only when the app imported it already), then sets the process mode (which only escalates
+    from OFF, see capture.set_mode). A pinecone text key given here applies to calls from now
+    on, whether or not the hooks were already in place."""
+    report = install_all(HOOKS, production=mode == "production")
     capture.set_pinecone_text_key(pinecone_text_key)
     if mode == "production":
         root = project_dir or Path.cwd()

@@ -13,11 +13,14 @@ This project follows [Semantic Versioning](https://semver.org/). Each release li
 
 ### Changed
 
-- The project database moves to schema version 2 (experiments carry a kind and a sweep report). A project created by 0.2.0 is upgraded in place the first time any command opens it.
+- The project database moves to schema version 2 (experiments carry a kind and a sweep report). A project created by 0.2.0 is upgraded in place the first time any command opens it. The upgrade is safe to retry: a command interrupted during it leaves a project the next command finishes upgrading.
+- In production, `contexteval.init()` hooks LangChain and LlamaIndex only when your app imported them before the call, so an app that uses neither no longer pays for their imports at startup. Call `init()` after your framework imports. `InstallReport` reports `not_imported` for a framework it left alone.
 
 ### Fixed
 
 - A retrieval that reaches a hooked store from inside another hooked retrieval (langchain-chroma over chromadb, or a `@contexteval.retriever` function that queries chromadb) is recorded once, not twice, and an experiment setting applies to it once.
+- A `top_k` experiment reaches a LangChain or LlamaIndex retriever that has no knob of its own through the hooked call underneath it: a custom `BaseRetriever` that queries chromadb, or a wrapper over a `base_retriever`. The experiment stops with an error only when no layer can apply the value. A per-call `k` passed to `invoke` no longer defeats the experiment, and the recorded event names the knob that was set.
+- A LangChain or LlamaIndex retriever whose knob rejects the experiment's value keeps the user's value afterwards; before, a later experiment could leave it at the overridden value.
 
 ## 0.2.0 (v1.1, 2026-10-11)
 

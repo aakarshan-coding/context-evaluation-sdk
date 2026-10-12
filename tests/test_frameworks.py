@@ -7,10 +7,12 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import os
+import subprocess
 import sys
 import uuid
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, Mapping
 
 import pytest
 
@@ -86,11 +88,42 @@ def li_retriever() -> Any:
     return VectorStoreIndex(nodes=nodes, embed_model=HashEmbedModel()).as_retriever(similarity_top_k=2)
 
 
+@pytest.fixture
+def chroma_col() -> Any:
+    """A raw chromadb collection holding DOCS, so a hooked `Collection.query` sits under a retriever."""
+    client = chromadb.EphemeralClient(settings=chromadb.Settings(anonymized_telemetry=False))
+    col = client.create_collection(f"docs_{uuid.uuid4().hex}", embedding_function=HashEmbedding())
+    col.add(ids=list(DOCS), documents=list(DOCS.values()))
+    return col
+
+
 class FixedLC(LCBaseRetriever):
     """A LangChain retriever with no top_k knob of any kind."""
 
     def _get_relevant_documents(self, query: str, *, run_manager: CallbackManagerForRetrieverRun) -> list[Document]:
         return [Document(page_content=DOCS["d1"], id="d1")]
+
+
+class ChromaLC(LCBaseRetriever):
+    """The common custom-retriever shape: a BaseRetriever subclass that queries chromadb itself. Its
+    `n` is not a knob contexteval knows; the hooked `Collection.query` underneath is."""
+
+    col: Any
+    n: int = 2
+
+    def _get_relevant_documents(self, query: str, *, run_manager: CallbackManagerForRetrieverRun) -> list[Document]:
+        rows = self.col.query(query_texts=[query], n_results=self.n)
+        return [Document(page_content=t, id=i) for t, i in zip(rows["documents"][0], rows["ids"][0])]
+
+
+class WrapperLC(LCBaseRetriever):
+    """A wrapper in the shape of ContextualCompressionRetriever or MultiQueryRetriever: no knob of
+    its own, delegating to a `base_retriever` whose `invoke` is hooked too."""
+
+    base_retriever: LCBaseRetriever
+
+    def _get_relevant_documents(self, query: str, *, run_manager: CallbackManagerForRetrieverRun) -> list[Document]:
+        return self.base_retriever.invoke(query, config={"callbacks": run_manager.get_child()})[::-1]
 
 
 class BoomLC(LCBaseRetriever):
@@ -103,6 +136,27 @@ class BoomLC(LCBaseRetriever):
 class FixedLI(LIBaseRetriever):
     def _retrieve(self, query_bundle: QueryBundle) -> list[NodeWithScore]:
         return [NodeWithScore(node=TextNode(text=DOCS["d1"], id_="d1"), score=0.5)]
+
+
+class CappedLI(LIBaseRetriever):
+    """A LlamaIndex retriever whose similarity_top_k setter rejects values over 10."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._top_k = 2
+
+    @property
+    def similarity_top_k(self) -> int:
+        return self._top_k
+
+    @similarity_top_k.setter
+    def similarity_top_k(self, value: int) -> None:
+        if value > 10:
+            raise ValueError("similarity_top_k must be at most 10")
+        self._top_k = value
+
+    def _retrieve(self, query_bundle: QueryBundle) -> list[NodeWithScore]:
+        return [NodeWithScore(node=TextNode(text=t, id_=k), score=0.5) for k, t in list(DOCS.items())[: self._top_k]]
 
 
 # --- capture ------------------------------------------------------------------------------
@@ -171,12 +225,127 @@ def test_knob_is_restored_when_the_retriever_raises(hooks: None) -> None:
         with pytest.raises(ValueError, match="index is down"):
             boom.invoke(QUESTION)
     assert boom.search_kwargs == {"k": 1}
-    assert _hooks._knobs == {}
+    assert capture._knobs == {}
+
+
+def test_custom_langchain_retriever_over_hooked_chroma_takes_top_k_from_the_inner_call(hooks: None, chroma_col: Any) -> None:
+    """Review P1. Defect: since `BaseRetriever.invoke` is hooked, a custom retriever with no knob
+    of its own owns the event and refuses top_k, although the hooked chromadb call it makes
+    underneath could apply it (and did under 0.2.0). top_k ownership passes to the outermost
+    hooked layer that can apply it; the outermost still records the one event, with the knob
+    that was actually set."""
+    retriever = ChromaLC(col=chroma_col)
+    with capture.active_run(QUESTION, Intervention(top_k=4)) as run:
+        docs = retriever.invoke(QUESTION)
+    assert len(docs) == 4 and run.not_applicable is None
+    (ev,) = run.retrievals
+    assert ev.source == "langchain" and len(ev.retrieved) == 4 and ev.params["n_results"] == 4
+    with capture.active_run(QUESTION) as run:
+        assert len(retriever.invoke(QUESTION)) == 2
+    (ev,) = run.retrievals
+    assert "n_results" not in ev.params
+
+
+def test_wrapper_retriever_hands_top_k_to_its_base_retriever(hooks: None, lc_retriever: Any) -> None:
+    """Review P1. Defect: a wrapper retriever (compression, multi-query) holding a `base_retriever`
+    refuses top_k because the wrapper has no `search_kwargs`, while the base retriever's hooked
+    `invoke` underneath has the knob. The base applies and restores it; the wrapper records one
+    event with `k` as applied."""
+    users_kwargs = lc_retriever.search_kwargs
+    wrapper = WrapperLC(base_retriever=lc_retriever)
+    with capture.active_run(QUESTION, Intervention(top_k=4)) as run:
+        docs = wrapper.invoke(QUESTION)
+    assert len(docs) == 4 and run.not_applicable is None
+    (ev,) = run.retrievals
+    assert ev.source == "langchain" and len(ev.retrieved) == 4 and ev.params["k"] == 4
+    assert [c.text for c in ev.retrieved] == [d.page_content for d in docs]
+    assert lc_retriever.search_kwargs is users_kwargs and users_kwargs == {"k": 2}
+    assert capture._knobs == {}
+
+
+def test_per_call_k_is_overridden_and_the_event_records_the_applied_value(hooks: None, lc_retriever: Any) -> None:
+    """Review P2. Defect: `VectorStoreRetriever` merges call kwargs over `search_kwargs`, so an app
+    calling `invoke(q, k=1)` under top_k=4 still retrieves 1 document while the event claims
+    `k: 4`. The codec sees the bound call arguments and overrides the per-call k as well."""
+    with capture.active_run(QUESTION, Intervention(top_k=4)) as run:
+        docs = lc_retriever.invoke(QUESTION, k=1)
+    assert len(docs) == 4 and run.not_applicable is None
+    (ev,) = run.retrievals
+    assert len(ev.retrieved) == 4 and ev.params["k"] == 4
+    with capture.active_run(QUESTION) as run:
+        assert len(lc_retriever.invoke(QUESTION, k=1)) == 1
+    assert run.retrievals[0].params["kwargs"] == {"k": 1}
+
+
+def test_decorated_function_without_a_knob_takes_top_k_from_the_hooked_store_inside(hooks: None, chroma_col: Any) -> None:
+    """Review P1, the same handoff for `@retriever(top_k=None)`: the function has no parameter to
+    set, but the hooked chromadb call inside has `n_results`. Defect: refused before the call."""
+
+    @retriever(top_k=None)
+    def search(query: str) -> list[str]:
+        return list(chroma_col.query(query_texts=[query], n_results=2)["documents"][0])
+
+    with capture.active_run(QUESTION, Intervention(top_k=3)) as run:
+        hits = search(QUESTION)
+    assert len(hits) == 3
+    assert [(e.source, len(e.retrieved), e.params["n_results"]) for e in run.retrievals] == [("retriever:search", 3, 3)]
+
+
+class _UnreadableConfig(Mapping[str, Any]):
+    """A config whose items() raises, so the params snapshot cannot read it."""
+
+    def __getitem__(self, key: str) -> Any:
+        raise KeyError(key)
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(())
+
+    def __len__(self) -> int:
+        return 0
+
+    def items(self) -> Any:
+        raise RuntimeError("no items for you")
+
+
+def test_snapshot_failure_leaves_no_override_behind(hooks: None, lc_retriever: Any, caplog: pytest.LogCaptureFixture) -> None:
+    """Review P5. Defect: the params snapshot ran after the override and outside the recording
+    error guard, so an argument it could not read raised out of the hook before the call, and
+    the retriever kept the experiment's k for the rest of the process. The snapshot falls back
+    to {} and the call runs; here langchain itself then rejects the config, and the knob is
+    restored on that path too."""
+    users_kwargs = lc_retriever.search_kwargs
+    with capture.active_run(QUESTION, Intervention(top_k=4)):
+        with pytest.raises(RuntimeError, match="no items for you"):
+            lc_retriever.invoke(QUESTION, config=_UnreadableConfig())
+    assert lc_retriever.search_kwargs is users_kwargs and users_kwargs == {"k": 2}
+    assert capture._knobs == {}
+    assert caplog.text.count("could not snapshot") == 1
+    with capture.active_run(QUESTION) as run:
+        assert len(lc_retriever.invoke(QUESTION)) == 2
+    assert run.retrievals[0].params == {"input": QUESTION}
+
+
+def test_failed_knob_setattr_leaves_no_entry_and_a_later_restore_restores(hooks: None) -> None:
+    """Review P4. Defect: the knob entry was recorded before `setattr` ran, so a setter that
+    rejects the experiment's value leaked a depth-1 entry; the next override on that retriever
+    saw depth 2 and its restore only decremented, leaving the user's retriever at the
+    experiment's value for the rest of the process."""
+    retriever = CappedLI()
+    with capture.active_run(QUESTION, Intervention(top_k=20)) as run:
+        with pytest.raises(InterventionNotApplicable, match="llamaindex: cannot set top_k=20"):
+            retriever.retrieve(QUESTION)
+    assert run.not_applicable is not None and retriever.similarity_top_k == 2
+    assert capture._knobs == {}
+    with capture.active_run(QUESTION, Intervention(top_k=5)) as run:
+        assert len(retriever.retrieve(QUESTION)) == 5
+    assert run.retrievals[0].params["similarity_top_k"] == 5
+    assert retriever.similarity_top_k == 2 and capture._knobs == {}
 
 
 def test_retriever_without_a_top_k_knob_refuses_a_top_k_intervention(hooks: None) -> None:
     """Graft 3. Defect: a top_k experiment on a framework retriever with no knob silently runs the
-    baseline and the experiment table shows a fake no-change row."""
+    baseline and the experiment table shows a fake no-change row. The refusal comes once the
+    call has finished with no layer, inner or outer, having applied the value."""
     with capture.active_run(QUESTION, Intervention(top_k=5)) as run:
         with pytest.raises(InterventionNotApplicable, match="langchain: top_k=5 .* no search_kwargs or k"):
             FixedLC().invoke(QUESTION)
@@ -204,7 +373,7 @@ def test_concurrent_overrides_on_one_retriever_restore_the_users_value(hooks: No
     assert [len(docs) for docs in results] == [3, 3]
     assert len(run.retrievals) == 2 and all(len(e.retrieved) == 3 for e in run.retrievals)
     assert lc_retriever.search_kwargs is users_kwargs and users_kwargs == {"k": 2}
-    assert _hooks._knobs == {}
+    assert capture._knobs == {}
 
 
 # --- transforms return the framework's own types --------------------------------------------
@@ -307,6 +476,42 @@ def test_framework_hooks_install_once_and_uninstall_restores() -> None:
         capture.reset_process()
     for (owner, name), original in originals.items():
         assert owner.__dict__[name] is original
+
+
+_INIT_PROBE = """
+import json, sys
+import contexteval
+from contexteval import _hooks
+mode, project, preload = sys.argv[1], sys.argv[2], sys.argv[3]
+if preload:
+    __import__(preload)
+report = _hooks.install("cli") if mode == "cli" else contexteval.init(project)
+frameworks = sorted(m for m in ("langchain_core", "llama_index") if m in sys.modules)
+print(json.dumps({"statuses": report.statuses, "error": report.error, "imported": frameworks}))
+"""
+
+
+def _install_in_a_fresh_process(mode: str, project: Path, preload: str = "") -> dict[str, Any]:
+    env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parent.parent)}
+    run = subprocess.run([sys.executable, "-c", _INIT_PROBE, mode, str(project), preload], capture_output=True, text=True, timeout=120, cwd=project, env=env)
+    assert run.returncode == 0, run.stderr
+    return json.loads(run.stdout.strip().splitlines()[-1])
+
+
+def test_production_init_hooks_a_framework_only_when_the_app_imported_it(tmp_path: Path) -> None:
+    """Review P6. Defect: init() imported LangChain and LlamaIndex on every call (0.7 s and 1.2 s
+    here, 7.7 s and 2.8 s on the reviewer's machine), paid by every app that uses neither. In
+    production a framework is hooked only when the app has imported it by init() time; the
+    CLI installs before the app module loads, so it still hooks everything it can import."""
+    cold = _install_in_a_fresh_process("production", tmp_path)
+    assert cold["error"] is None and cold["statuses"]["chromadb"] == "installed"
+    assert (cold["statuses"]["langchain_core"], cold["statuses"]["llama_index"]) == ("not_imported", "not_imported")
+    assert cold["imported"] == []
+    warm = _install_in_a_fresh_process("production", tmp_path, preload="langchain_core.retrievers")
+    assert (warm["statuses"]["langchain_core"], warm["statuses"]["llama_index"]) == ("installed", "not_imported")
+    cli = _install_in_a_fresh_process("cli", tmp_path)
+    assert (cli["statuses"]["langchain_core"], cli["statuses"]["llama_index"]) == ("installed", "installed")
+    assert cli["imported"] == ["langchain_core", "llama_index"]
 
 
 def test_not_installed_when_a_framework_is_absent(monkeypatch: pytest.MonkeyPatch) -> None:
