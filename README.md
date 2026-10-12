@@ -218,7 +218,7 @@ Every command except `init` finds the project by walking up from the current dir
 | `contexteval run [module:function] [--test-set NAME] [--yes]` | Runs every case through your function and grades each answer. Remembers the app for later commands. |
 | `contexteval diagnose [--run ID] [--samples N] [--force] [--yes]` | Labels each failure of the latest baseline run, or of run `ID`. Each replay step draws up to `N` samples (default 3, odd) and a majority decides. Skips failures that already have a label unless you pass `--force`. |
 | `contexteval experiment [module:function] KNOB=v1,v2 ... [--yes]` | Runs every case under each combination of settings and prints a comparison table. |
-| `contexteval sweep [module:function] [--rounds N] [--max-settings N] [--holdout F] [--seed S] [--tolerance N] [--yes]` | Picks settings from the labels of the latest diagnosed baseline run, tries them on a tune split, confirms the winner on a holdout split, and prints one recommendation. |
+| `contexteval sweep [module:function] [--run ID] [--rounds N] [--max-settings N] [--holdout F] [--seed S] [--tolerance N] [--yes]` | Picks settings from the labels of the newest baseline run with diagnoses, or of run `ID`, tries them on a tune split, confirms the winner on a holdout split, and prints one recommendation. |
 | `contexteval ui [--port 8765] [--no-open]` | Serves the dashboard at `http://127.0.0.1:8765/`. |
 
 Grading checks first whether the expected answer appears in the answer, after normalizing case and punctuation. If it does not, the LLM decides whether the two agree, at temperature 0.
@@ -258,7 +258,7 @@ For example, `contexteval experiment top_k=3,10 rerank=none,lexical` runs five s
 
 ## Sweep
 
-`contexteval sweep` chooses the experiments for you from the labels of the latest diagnosed baseline run. Run it after `contexteval diagnose`.
+`contexteval sweep` chooses the experiments for you from the labels of a baseline run. Run it after `contexteval diagnose`. By default it reads the newest baseline run that has diagnoses, so a `contexteval run` made after `diagnose` does not hide the labels. `--run ID` names the run instead. The first line of the output names the run it read, as in `source: run 1 (the newest baseline run with diagnoses)`.
 
 Each label asks for different settings. The sweep tries the ones the labels you have call for, relative to how many chunks your app retrieved at baseline (k):
 
@@ -273,24 +273,27 @@ Each label asks for different settings. The sweep tries the ones the labels you 
 
 A setting that more failures ask for is tried first. `--max-settings N` caps how many are tried per round (default 6).
 
+If your app's retrieval cannot take a setting, for example a `top_k` on a retriever with no such knob, the sweep skips that setting and every later setting on the same knob, and goes on with the rest. The output lists each one, as in `not applicable: top_k=8: ...`, and the saved report keeps the reasons. The report is saved even when the sweep stops early, for example on a provider error or Ctrl-C, and it says why it stopped.
+
 The search runs in rounds. Round 1 runs the baseline and each setting on its own. Round 2 combines the best setting so far with each round-1 setting that changes a different knob and did not lose to the baseline. `--rounds N` sets the depth (default 2). A round with nothing new to try ends the search early, so a run whose labels are all `missing` stops after round 1.
 
-To keep the sweep from fitting your test set, it splits the cases into a tune set and a holdout set with a fixed seed (`--holdout F`, default 0.3 of the cases, half the failures and half the passes in proportion; `--seed S` changes the split). It chooses on the tune cases, then runs the baseline and the winner on the holdout cases. It recommends the winner only when it beat the baseline on tune and did not lose on holdout. Otherwise it recommends keeping your current settings and says why. `--holdout 0` tunes on every case; use it for a set too small to split, and read the result as unconfirmed.
+To keep the sweep from fitting your test set, it splits the cases into a tune set and a holdout set with a fixed seed (`--holdout F`, default 0.3 of the cases, half the failures and half the passes in proportion; `--seed S` changes the split). The split comes first, and only the tune cases' labels choose the candidates, so the holdout cases stay unseen by the search. It chooses on the tune cases, then runs the baseline and the winner on the holdout cases. It recommends the winner only when it beat the baseline on tune and did not lose on holdout. Otherwise it recommends keeping your current settings and says why. A round ends the search when no setting beat the baseline, so a later round never builds on a setting that only tied it. If `--holdout F` rounds to 0 cases on your set, the sweep stops before any app call and says so, because no winner could be confirmed. `--holdout 0` tunes on every case; use it for a set too small to split, and read the result as unconfirmed.
 
-Among settings that pass about as many tune cases, the sweep prefers the cheaper one. Every setting that beat the baseline and passed within a near-tie window of the most accurate one is a contender. The window is 5% of the tune cases, rounded down, so it is 0 cases on a set under 20, 1 case on 35, and 5 cases on 100. `--tolerance N` sets it to N cases instead. The contender with the fewest mean input tokens wins, then the one with the lowest latency, then the one that passed more. The same rule picks the best setting in every round. When the winner is not the most accurate setting, the recommendation names the one it passed over and what that one costs. When the window is not 0, the sweep prints it before running, as in `near-tie window: 1 case (5% of 35)`. A window of 0, the default on a small set or `--tolerance 0`, picks the most accurate setting, with ties going to the cheaper one.
+Among settings that pass about as many tune cases, the sweep prefers the cheaper one. Every setting that beat the baseline and passed within a near-tie window of the most accurate one is a contender. The window is 5% of the tune cases, rounded down, so it is 0 cases on a set under 20, 1 case on 35, and 5 cases on 100. `--tolerance N` sets it to N cases instead. The contender with the fewest mean input tokens wins, then the one that passed more, then the one with the lowest latency. If the source run recorded no input tokens, no setting is cheaper than another, so the window is 0 and the sweep prints why, as in `near-tie window: 0 (run 1 recorded no input tokens, so accuracy alone decides)`. The same rule picks the best setting in every round. When the winner is not the most accurate setting, the recommendation names the one it passed over and what that one costs. When the window is not 0, the sweep prints it before running, as in `near-tie window: 1 case (5% of 35)`. A window of 0, the default on a small set or `--tolerance 0`, picks the most accurate setting, with ties going to the cheaper one.
 
 Before running, the sweep prints the worst case, every round full plus the two holdout runs, and asks. Every candidate is a plain experiment setting, so the sweep never sees the evidence passages either.
 
 The whole output for the demo (`contexteval sweep --holdout 0 --yes` after `diagnose`):
 
 ```text
-sweep: run 1, 6 labeled failures (not_context 1, flaky 1, irrelevant 1, ignored 1, missing/not_retrieved 1, missing/dropped 1); the baseline retrieved up to 4 chunks
+source: run 1 (the newest baseline run with diagnoses)
+split: 8 tune cases, 0 holdout cases (seed 0); only the tune cases' labels guide the search
+warning: no holdout cases, so the recommendation is not confirmed on cases the search did not see
+sweep: 6 labeled failures among the tune cases (not_context 1, flaky 1, irrelevant 1, ignored 1, missing/not_retrieved 1, missing/dropped 1); the baseline retrieved up to 4 chunks
   no setting can fix 1 not_context failure: the context held the answer and the model still got it wrong; look at the prompt, the model, or the expected answer
   no setting can fix 1 flaky failure: the unchanged app passed on rerun; a setting cannot make the model deterministic
   no setting can fix 1 missing/dropped failure: retrieval found the gold chunk and your own code removed it before the prompt; no retrieval setting changes that filter
 candidates, heaviest first (6 of 7; the number is how many failures ask for it): compress=2 (2), top_k=8 (1), top_k=12 (1), rerank=lexical (1), max_chunks=2 (1), order=ends (1)
-split: 8 tune cases, 0 holdout cases (seed 0)
-warning: no holdout cases, so the recommendation is not confirmed on cases the search did not see
 app: up to 104 calls to contexteval.demo.app:answer (8 tune cases x (1 baseline + 6 settings x 2 rounds) + 0 holdout cases x 2, worst case)
 estimate: 104 LLM calls, ~5824 input and ~208 output tokens, about $0.0000
 experiment 1 (sweep)
@@ -315,6 +318,8 @@ Set top_k=8 rerank=lexical. Accuracy 38% -> 62% (no holdout cases, so this is un
 ```
 
 `top_k=8` retrieves the chunk that ranked 5th, and `rerank=lexical` moves the ignored case's chunk to the top, so `top_k=8 rerank=lexical` passes the most cases. On 8 tune cases the window rounds down to 0, so accuracy decides, and `top_k=8 rerank=lexical` beats `top_k=12 rerank=lexical`, which passes as many cases, on input tokens. With `--tolerance 1` the sweep would take `rerank=lexical max_chunks=2`, which passes one case fewer with 74 input tokens instead of 217 and leaves the planted not_retrieved case failing. The baseline row's latency includes the demo's one-time index warm-up, as the `experiment` table's does.
+
+With the default `--holdout 0.3`, the demo keeps 3 of its 8 cases back. With seed 0 the not_retrieved and irrelevant failures land in the holdout, so the search sees only the ignored failure among the fixable ones. No reorder or compress setting beats the baseline on the 5 tune cases, and the sweep recommends keeping the current settings. This is the holdout doing its job on a set this small, and it is why the demo uses `--holdout 0`.
 
 The sweep is stored as an experiment. The dashboard lists it with its rows and marks the recommended one.
 
