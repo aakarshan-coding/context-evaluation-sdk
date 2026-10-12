@@ -31,6 +31,7 @@ from .types import (
     RunId,
     TestCase,
     never,
+    split_gold_of,
 )
 
 
@@ -43,6 +44,16 @@ class FailureKind(Enum):
     IGNORED = "ignored"
     NOT_CONTEXT = "not_context"
     FLAKY = "flaky"
+
+
+class Signal(Enum):
+    """Evidence on a diagnosis beyond its label. A failure counts once for its kind and once for
+    each signal it carries, so a split-gold `ignored` case asks for both families of fix."""
+
+    SPLIT_GOLD = "split_gold"  # the evidence was found only by joining two adjacent chunks
+
+
+Cause = Union[FailureKind, Signal]
 
 
 def kind_of(d: Diagnosis) -> FailureKind | None:
@@ -78,17 +89,31 @@ def kind_of(d: Diagnosis) -> FailureKind | None:
 
 
 @dataclass(frozen=True)
-class Scaled:
-    """An integer knob set relative to k, the most chunks one retrieval returned in the baseline
-    run: top_k=2k widens retrieval, max_chunks=k/2 narrows the prompt."""
+class Baseline:
+    """What the source run shows of the app's own settings, read from its traces: k, the most
+    chunks one retrieval returned, and chunk_chars, the longest delivered chunk in characters,
+    which stands in for the app's own chunk size, since contexteval never sees the chunker."""
 
-    knob: Literal["top_k", "max_chunks"]
+    k: int
+    chunk_chars: int
+
+
+@dataclass(frozen=True)
+class Scaled:
+    """An integer knob set relative to the baseline: top_k and max_chunks to k (top_k=2k widens
+    retrieval, max_chunks=k/2 narrows the prompt), chunk_size and overlap to chunk_chars."""
+
+    knob: Literal["top_k", "max_chunks", "chunk_size", "overlap"]
     factor: float
 
-    def resolve(self, k: int) -> Setting | None:
-        """None when the value would change nothing: a max_chunks at or above k, or top_k == k."""
-        value = max(1, round(k * self.factor))
-        if (self.knob == "max_chunks" and value >= k) or (self.knob == "top_k" and value == k):
+    def resolve(self, base: Baseline) -> Setting | None:
+        """None when the value would change nothing: a max_chunks at or above k, top_k == k, or a
+        chunking knob when the source run delivered no chunk to measure."""
+        of = base.k if self.knob in ("top_k", "max_chunks") else base.chunk_chars
+        if of == 0:
+            return None
+        value = max(1, round(of * self.factor))
+        if (self.knob == "max_chunks" and value >= of) or (self.knob == "top_k" and value == of):
             return None
         return Setting(**{self.knob: value})  # type: ignore[arg-type]
 
@@ -106,53 +131,62 @@ class Unfixable:
     reason: str  # shown in the report; no setting is tried for this kind
 
 
-# The label-to-candidates policy (design-notes "diagnosis-guided search"). Table order inside a
-# kind is the tie-break between candidates of equal weight.
-POLICY: Mapping[FailureKind, Fixable | Unfixable] = {
+# The cause-to-candidates policy (design-notes "diagnosis-guided search"). Table order inside a
+# cause is the tie-break between candidates of equal weight. Chunking candidates (title=on,
+# chunk_size, overlap) run only when the app offers build(chunking); the plan withholds them
+# otherwise and the CLI says what to add. title=on answers the real-bot audit's cause: a chunk
+# cut from its heading carries no product name, so the model reads it as ignored or irrelevant.
+POLICY: Mapping[Cause, Fixable | Unfixable] = {
     FailureKind.NOT_RETRIEVED: Fixable((Scaled("top_k", 2), Scaled("top_k", 3))),
     FailureKind.DROPPED: Unfixable(
         "retrieval found the gold chunk and your own code removed it before the prompt; "
         "no retrieval setting changes that filter"
     ),
-    FailureKind.IRRELEVANT: Fixable((Setting(rerank="lexical"), Scaled("max_chunks", 0.5), Setting(compress=2))),
-    FailureKind.IGNORED: Fixable((Setting(order=Order.ENDS), Setting(order=Order.REVERSE), Setting(compress=2))),
+    FailureKind.IRRELEVANT: Fixable((Setting(rerank="lexical"), Scaled("max_chunks", 0.5), Setting(compress=2), Setting(title=True))),
+    FailureKind.IGNORED: Fixable((Setting(order=Order.ENDS), Setting(order=Order.REVERSE), Setting(compress=2), Setting(title=True))),
     FailureKind.NOT_CONTEXT: Unfixable(
         "the context held the answer and the model still got it wrong; look at the prompt, the model, or the expected answer"
     ),
     FailureKind.FLAKY: Unfixable("the unchanged app passed on rerun; a setting cannot make the model deterministic"),
+    Signal.SPLIT_GOLD: Fixable((Scaled("chunk_size", 2), Scaled("overlap", 0.25))),
 }
 
 
-def candidates_for(kind: FailureKind, k: int) -> list[Setting]:
-    rule = POLICY[kind]
+def candidates_for(cause: Cause, base: Baseline) -> list[Setting]:
+    rule = POLICY[cause]
     if isinstance(rule, Unfixable):
         return []
     settings = []
     for candidate in rule.candidates:
-        setting = candidate.resolve(k) if isinstance(candidate, Scaled) else candidate
+        setting = candidate.resolve(base) if isinstance(candidate, Scaled) else candidate
         if setting is not None and setting != BASELINE and setting not in settings:
             settings.append(setting)
     return settings
 
 
+def points_at_chunking(cause: Cause, base: Baseline) -> bool:
+    """Whether any candidate for this cause changes the chunking."""
+    return any(not s.chunking.is_default for s in candidates_for(cause, base))
+
+
 @dataclass(frozen=True)
 class Ranked:
     setting: Setting
-    weight: int  # failures whose label proposes this setting
-    kinds: tuple[FailureKind, ...]
+    weight: int  # failures whose label or signal proposes this setting
+    kinds: tuple[Cause, ...]
 
 
-def rank_candidates(counts: Mapping[FailureKind, int], k: int) -> list[Ranked]:
-    """Heaviest first; a setting two labels propose carries both counts. Ties keep policy order."""
+def rank_candidates(counts: Mapping[Cause, int], base: Baseline) -> list[Ranked]:
+    """Heaviest first; a setting two causes propose carries both counts. Ties keep policy order."""
     weight: dict[Setting, int] = {}
-    kinds: dict[Setting, list[FailureKind]] = {}
-    for kind in FailureKind:
-        n = counts.get(kind, 0)
+    kinds: dict[Setting, list[Cause]] = {}
+    for cause in (*FailureKind, *Signal):
+        n = counts.get(cause, 0)
         if n == 0:
             continue
-        for setting in candidates_for(kind, k):
+        for setting in candidates_for(cause, base):
             weight[setting] = weight.get(setting, 0) + n
-            kinds.setdefault(setting, []).append(kind)
+            kinds.setdefault(setting, []).append(cause)
     ranked = [Ranked(s, weight[s], tuple(kinds[s])) for s in weight]
     return sorted(ranked, key=lambda r: -r.weight)
 
@@ -211,15 +245,32 @@ class Plan:
     """What the sweep will run, decided before any app call so the cost prompt and the work agree."""
 
     source_run: RunId
-    baseline_k: int  # the most chunks one retrieval returned in the source run
+    baseline: Baseline  # k and chunk_chars observed in the source run
     counts: dict[FailureKind, int]  # labeled failures per kind
+    split_gold: int  # labeled tune failures whose evidence was split across two adjacent chunks
+    chunking_pointers: int  # labeled tune failures whose kind or signal proposes a chunking candidate
     unlabeled: int  # failures the source run has no diagnosis for
-    candidates: list[Ranked]  # every candidate, heaviest first; a round takes max_settings of them
+    ranked: list[Ranked]  # every candidate the causes propose, heaviest first
+    builder: bool  # the app offers build(chunking); without it chunking candidates are withheld
     split: Split
     rounds: int
     max_settings: int
     tolerance: int | None  # tune cases a cheaper setting may trail the most accurate one by; None for NEAR_TIE_PERCENT of them
     tokens_known: bool  # the source run recorded input tokens; without them no setting is cheaper than another
+
+    @property
+    def baseline_k(self) -> int:
+        return self.baseline.k
+
+    @property
+    def candidates(self) -> list[Ranked]:
+        """The candidates the sweep runs, heaviest first; a round takes max_settings of them."""
+        return [r for r in self.ranked if self.builder or r.setting.chunking.is_default]
+
+    @property
+    def withheld(self) -> list[Ranked]:
+        """Chunking candidates the causes asked for that cannot run without a builder."""
+        return [r for r in self.ranked if not self.builder and not r.setting.chunking.is_default]
 
     @property
     def requested_window(self) -> int:
@@ -300,11 +351,13 @@ def source_run(store: Store, run: RunId | None) -> RunInfo:
     return newest
 
 
-def plan_sweep(store: Store, run: RunInfo, *, rounds: int, max_settings: int, holdout: float, seed: int, tolerance: int | None) -> tuple[Plan, dict[CaseId, TestCase]]:
+def plan_sweep(
+    store: Store, run: RunInfo, *, rounds: int, max_settings: int, holdout: float, seed: int, tolerance: int | None, builder: bool
+) -> tuple[Plan, dict[CaseId, TestCase]]:
     """Read the source run's graded cases, split them, then count the tune cases' labels and
-    decide the candidates. The holdout cases' labels never reach the search, so the holdout stays
-    unseen by it. The cases are the ones the source run ran, so the sweep measures the set it was
-    diagnosed on."""
+    signals and decide the candidates. The holdout cases' labels never reach the search, so the
+    holdout stays unseen by it. The cases are the ones the source run ran, so the sweep measures
+    the set it was diagnosed on. `builder` says whether the app offers build(chunking)."""
     traces = store.traces(run.id)
     cases: dict[CaseId, TestCase] = {}
     labels: dict[CaseId, Diagnosis | None] = {}  # the failed cases and their diagnosis
@@ -319,8 +372,11 @@ def plan_sweep(store: Store, run: RunInfo, *, rounds: int, max_settings: int, ho
     if not cases:
         raise SweepNotPossible(f"run {run.id} has no graded cases")
     split = split_cases(list(cases.values()), labels, holdout, seed)
+    k = max((len(e.retrieved) for s in traces for e in s.trace.retrievals), default=0)
+    chunk_chars = max((len(c.text) for s in traces for e in s.trace.retrievals for c in e.delivered), default=0)
+    base = Baseline(k, chunk_chars)
     counts: dict[FailureKind, int] = {}
-    unlabeled = 0
+    split_gold = unlabeled = pointers = 0
     for case_id in split.tune:
         if case_id not in labels:
             continue
@@ -331,17 +387,22 @@ def plan_sweep(store: Store, run: RunInfo, *, rounds: int, max_settings: int, ho
         kind = kind_of(diagnosis)
         if kind is not None:
             counts[kind] = counts.get(kind, 0) + 1
+        split_gold += split_gold_of(diagnosis)
+        pointers += split_gold_of(diagnosis) or (kind is not None and points_at_chunking(kind, base))
     if unlabeled and not counts:
         raise SweepNotPossible(f"run {run.id} has {unlabeled} failures among the tune cases and none is labeled; run `contexteval diagnose` first")
-    k = max((len(e.retrieved) for s in traces for e in s.trace.retrievals), default=0)
     if labels and k == 0:
         raise SweepNotPossible(f"run {run.id} captured no retrieval, so no setting can reach the app's context")
+    causes: dict[Cause, int] = {**counts, Signal.SPLIT_GOLD: split_gold}
     plan = Plan(
         source_run=run.id,
-        baseline_k=k,
+        baseline=base,
         counts=counts,
+        split_gold=split_gold,
+        chunking_pointers=pointers,
         unlabeled=unlabeled,
-        candidates=rank_candidates(counts, k),
+        ranked=rank_candidates(causes, base),
+        builder=builder,
         split=split,
         rounds=rounds,
         max_settings=max_settings,

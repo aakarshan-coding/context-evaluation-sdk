@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import itertools
 import json
+import sys
 from pathlib import Path
 from typing import Callable, Sequence
 
@@ -13,11 +14,12 @@ import pytest
 from contexteval import _cli, _sweep
 from contexteval._intervention import BASELINE, GoldToTop, InjectEvidence, InterventionNotApplicable, OnlyGold, Order, Setting
 from contexteval._store import Store
-from contexteval._sweep import FailureKind, Fixable, Unfixable
+from contexteval._sweep import FailureKind, Fixable, Signal, Unfixable
 from contexteval.types import (
     Answered,
     CaseId,
     Chunk,
+    Chunking,
     Evidence,
     ExperimentId,
     ExperimentRow,
@@ -42,6 +44,8 @@ from contexteval.types import (
 GOLD_TRANSFORMS = (InjectEvidence, GoldToTop, OnlyGold)
 RERUN = (ReplayOutcome(ReplayStep.BASELINE_RERUN, False, "wrong"),)
 K = 4
+BASE = _sweep.Baseline(k=K, chunk_chars=400)
+CAUSES = (*FailureKind, *Signal)
 
 
 def _knobs(setting: Setting) -> dict[str, object]:
@@ -54,33 +58,43 @@ def _knobs(setting: Setting) -> dict[str, object]:
 def test_policy_maps_each_label_to_its_candidates_and_the_unfixable_to_none() -> None:
     """Defect: a label whose candidates do not address it (a top_k change for an irrelevant case,
     a reorder for a never-retrieved chunk), a fixable label with no candidates, or dropped,
-    not_context, and flaky offered a setting when no setting can change them."""
-    assert set(_sweep.POLICY) == set(FailureKind)
-    resolved = {kind: [_knobs(s) for s in _sweep.candidates_for(kind, K)] for kind in FailureKind}
+    not_context, and flaky offered a setting when no setting can change them. v2 chunking: the
+    real-bot audit's cause (a chunk cut from its heading reads as ignored or irrelevant) asks for
+    title=on under both labels, and a split gold asks for a larger chunk_size and an overlap."""
+    assert set(_sweep.POLICY) == set(CAUSES)
+    resolved = {cause: [_knobs(s) for s in _sweep.candidates_for(cause, BASE)] for cause in CAUSES}
 
     assert resolved[FailureKind.NOT_RETRIEVED] and all(set(c) == {"top_k"} and c["top_k"] > K for c in resolved[FailureKind.NOT_RETRIEVED])  # type: ignore[operator]
     irrelevant = resolved[FailureKind.IRRELEVANT]
     assert {"rerank": "lexical"} in irrelevant
     assert any(set(c) == {"max_chunks"} and c["max_chunks"] < K for c in irrelevant)  # type: ignore[operator]
     assert any(set(c) == {"compress"} for c in irrelevant)
+    assert {"title": True} in irrelevant
     ignored = resolved[FailureKind.IGNORED]
     assert {"order": "ends"} in ignored and {"order": "reverse"} in ignored and any(set(c) == {"compress"} for c in ignored)
+    assert {"title": True} in ignored
+    assert resolved[Signal.SPLIT_GOLD] == [{"chunk_size": 800}, {"overlap": 100}]
 
     for kind in (FailureKind.DROPPED, FailureKind.NOT_CONTEXT, FailureKind.FLAKY):
         rule = _sweep.POLICY[kind]
         assert isinstance(rule, Unfixable) and rule.reason and resolved[kind] == []
     assert "your own code" in _sweep.POLICY[FailureKind.DROPPED].reason  # type: ignore[union-attr]
-    for kind in (FailureKind.NOT_RETRIEVED, FailureKind.IRRELEVANT, FailureKind.IGNORED):
-        assert isinstance(_sweep.POLICY[kind], Fixable)
+    for cause in (FailureKind.NOT_RETRIEVED, FailureKind.IRRELEVANT, FailureKind.IGNORED, Signal.SPLIT_GOLD):
+        assert isinstance(_sweep.POLICY[cause], Fixable)
+    assert {cause for cause in CAUSES if _sweep.points_at_chunking(cause, BASE)} == {FailureKind.IRRELEVANT, FailureKind.IGNORED, Signal.SPLIT_GOLD}
 
 
-def test_relative_candidates_follow_the_observed_baseline_k_and_drop_no_ops() -> None:
+def test_relative_candidates_follow_the_observed_baseline_and_drop_no_ops() -> None:
     """Defect: top_k candidates fixed at 10 whatever the app retrieves (a no-op for an app at
-    k=12), or a max_chunks candidate at or above k, which changes nothing and wastes a run."""
-    assert [_knobs(s)["top_k"] for s in _sweep.candidates_for(FailureKind.NOT_RETRIEVED, 12)] == [24, 36]
-    assert [_knobs(s)["top_k"] for s in _sweep.candidates_for(FailureKind.NOT_RETRIEVED, 1)] == [2, 3]
-    assert all(_knobs(s).get("max_chunks", 0) < 12 for s in _sweep.candidates_for(FailureKind.IRRELEVANT, 12))
-    assert not any("max_chunks" in _knobs(s) for s in _sweep.candidates_for(FailureKind.IRRELEVANT, 1))
+    k=12), a max_chunks candidate at or above k, which changes nothing and wastes a run, a
+    chunk_size fixed at 800 for an app whose chunks are already 1000 characters, or a chunking
+    candidate proposed when the source run delivered no chunk to measure."""
+    assert [_knobs(s)["top_k"] for s in _sweep.candidates_for(FailureKind.NOT_RETRIEVED, _sweep.Baseline(12, 400))] == [24, 36]
+    assert [_knobs(s)["top_k"] for s in _sweep.candidates_for(FailureKind.NOT_RETRIEVED, _sweep.Baseline(1, 400))] == [2, 3]
+    assert all(_knobs(s).get("max_chunks", 0) < 12 for s in _sweep.candidates_for(FailureKind.IRRELEVANT, _sweep.Baseline(12, 400)))
+    assert not any("max_chunks" in _knobs(s) for s in _sweep.candidates_for(FailureKind.IRRELEVANT, _sweep.Baseline(1, 400)))
+    assert [_knobs(s) for s in _sweep.candidates_for(Signal.SPLIT_GOLD, _sweep.Baseline(4, 1000))] == [{"chunk_size": 2000}, {"overlap": 250}]
+    assert _sweep.candidates_for(Signal.SPLIT_GOLD, _sweep.Baseline(4, 0)) == []
 
 
 def test_every_diagnosis_has_a_failure_kind() -> None:
@@ -106,22 +120,26 @@ def test_candidates_are_ranked_by_how_many_failures_carry_their_label() -> None:
     ranks a reorder above the top_k change three missing cases call for, and --max-settings
     then cuts the wrong candidate; or a candidate shared by two labels counted once."""
     counts = {FailureKind.NOT_RETRIEVED: 3, FailureKind.IGNORED: 1, FailureKind.IRRELEVANT: 1, FailureKind.DROPPED: 2}
-    ranked = _sweep.rank_candidates(counts, K)
+    ranked = _sweep.rank_candidates(counts, BASE)
     names = [r.setting.name for r in ranked]
     assert names[:2] == ["top_k=8", "top_k=12"] and [r.weight for r in ranked[:2]] == [3, 3]
     compress = next(r for r in ranked if r.setting.name.startswith("compress="))
     assert compress.weight == 2 and set(compress.kinds) == {FailureKind.IGNORED, FailureKind.IRRELEVANT}
     assert names.index(compress.setting.name) == 2
+    title = next(r for r in ranked if r.setting.name == "title=on")
+    assert title.weight == 2 and set(title.kinds) == {FailureKind.IGNORED, FailureKind.IRRELEVANT} and names.index("title=on") == 3
     assert len(names) == len(set(names))
     assert all(r.weight >= 1 for r in ranked) and ranked == sorted(ranked, key=lambda r: -r.weight)
-    assert _sweep.rank_candidates({FailureKind.DROPPED: 2, FailureKind.FLAKY: 1}, K) == []
+    assert _sweep.rank_candidates({FailureKind.DROPPED: 2, FailureKind.FLAKY: 1}, BASE) == []
+    split = _sweep.rank_candidates({FailureKind.NOT_CONTEXT: 2, Signal.SPLIT_GOLD: 2}, BASE)
+    assert [(r.setting.name, r.weight, r.kinds) for r in split] == [("chunk_size=800", 2, (Signal.SPLIT_GOLD,)), ("overlap=100", 2, (Signal.SPLIT_GOLD,))]
 
 
 def test_no_candidate_setting_can_carry_gold() -> None:
     """Plan item 15 for the sweep. Defect: a candidate built from a Diagnosis or a TestCase that
     reaches the app with evidence in it, so a sweep row wins by peeking at the answer."""
-    counts = {kind: 1 for kind in FailureKind}
-    for ranked in _sweep.rank_candidates(counts, K):
+    counts = {cause: 1 for cause in CAUSES}
+    for ranked in _sweep.rank_candidates(counts, BASE):
         transforms = ranked.setting.intervention().transforms
         assert not any(isinstance(t, GOLD_TRANSFORMS) for t in transforms), ranked.setting.name
     assert all(isinstance(c, (Setting, _sweep.Scaled)) for rule in _sweep.POLICY.values() if isinstance(rule, Fixable) for c in rule.candidates)
@@ -190,10 +208,41 @@ def test_holdout_labels_do_not_choose_the_candidates(store: Store) -> None:
             store.save_diagnosis(trace_id, Missing("not_retrieved", True, RERUN))
         elif case in held_failures[:2]:
             store.save_diagnosis(trace_id, Ignored(RERUN, ((0, 2),)))
-    plan, _ = _sweep.plan_sweep(store, store.run(run), rounds=2, max_settings=6, holdout=0.5, seed=0, tolerance=None)
+    plan, _ = _sweep.plan_sweep(store, store.run(run), rounds=2, max_settings=6, holdout=0.5, seed=0, tolerance=None, builder=True)
     assert plan.split == split
     assert plan.counts == {FailureKind.NOT_RETRIEVED: 3} and plan.unlabeled == 0
     assert [r.setting for r in plan.candidates] == [Setting(top_k=8), Setting(top_k=12)]
+
+
+def test_split_gold_proposes_chunking_candidates_only_when_the_app_has_a_builder(store: Store) -> None:
+    """v2 chunking, the sweep side of the split signal. Defects: a split-gold failure proposes
+    nothing because its label (not_context) is unfixable; chunk_size and overlap scaled from
+    nothing instead of the baseline's longest chunk; a chunking candidate run on an app with no
+    build(chunking), which would fail on the first row; or, without a builder, the plan losing
+    count of how many failures pointed at chunking, so the CLI cannot say what adding build()
+    would buy."""
+    cases = _cases(4)
+    store.upsert_cases("t", cases)
+    run = store.new_run("baseline", "app:answer", BASELINE)
+    for case in cases:
+        trace_id = store.add_trace(run, _baseline_trace(case, passed=case.id > CaseId("c01")))
+        if case.id == CaseId("c00"):
+            store.save_diagnosis(trace_id, NotContext(RERUN, split_gold=True))
+        elif case.id == CaseId("c01"):
+            store.save_diagnosis(trace_id, Missing("not_retrieved", True, RERUN))
+    longest = max(len(c.text) for s in store.traces(run) for e in s.trace.retrievals for c in e.delivered)
+    chunking = [Setting(chunk_size=2 * longest), Setting(overlap=round(longest * 0.25))]
+
+    with_builder, _ = _sweep.plan_sweep(store, store.run(run), rounds=2, max_settings=6, holdout=0, seed=0, tolerance=None, builder=True)
+    assert with_builder.baseline == _sweep.Baseline(K, longest) and with_builder.split_gold == 1 and with_builder.chunking_pointers == 1
+    assert with_builder.counts == {FailureKind.NOT_CONTEXT: 1, FailureKind.NOT_RETRIEVED: 1}
+    assert [r.setting for r in with_builder.candidates] == [Setting(top_k=8), Setting(top_k=12), *chunking] and with_builder.withheld == []
+    assert [(k, n) for k, n, _ in with_builder.unfixable] == [(FailureKind.NOT_CONTEXT, 1)]
+
+    without, _ = _sweep.plan_sweep(store, store.run(run), rounds=2, max_settings=6, holdout=0, seed=0, tolerance=None, builder=False)
+    assert [r.setting for r in without.candidates] == [Setting(top_k=8), Setting(top_k=12)]
+    assert [r.setting for r in without.withheld] == chunking and without.chunking_pointers == 1
+    assert without.worst_case_app_calls < with_builder.worst_case_app_calls
 
 
 def test_split_with_no_holdout_keeps_every_case_for_tuning() -> None:
@@ -276,10 +325,13 @@ def _row(setting: Setting, passed: int, tokens: float = 0.0, latency: float = 1.
 def _plan(counts: dict[FailureKind, int], tune: Sequence[CaseId], holdout: Sequence[CaseId] = ()) -> _sweep.Plan:
     return _sweep.Plan(
         source_run=RunId(1),
-        baseline_k=K,
+        baseline=BASE,
         counts=counts,
+        split_gold=0,
+        chunking_pointers=0,
         unlabeled=0,
-        candidates=_sweep.rank_candidates(counts, K),
+        ranked=_sweep.rank_candidates(counts, BASE),
+        builder=False,  # these plans drive a scripted Runner with no app, so no index can be rebuilt
         split=_sweep.Split(0, 0.3 if holdout else 0.0, tuple(tune), tuple(holdout)),
         rounds=2,
         max_settings=6,
@@ -613,7 +665,7 @@ def test_estimate_counts_the_worst_case(project: Path, hooks: None, capsys: pyte
     try:
         source = store.latest_run("baseline")
         assert source is not None
-        plan, _ = _sweep.plan_sweep(store, source, rounds=3, max_settings=5, holdout=0.3, seed=0, tolerance=1)
+        plan, _ = _sweep.plan_sweep(store, source, rounds=3, max_settings=5, holdout=0.3, seed=0, tolerance=1, builder=False)
         assert len(plan.candidates) == 2 and plan.round_size == 2
         assert len(plan.split.tune) == 7 and len(plan.split.holdout) == 3
         assert [len(run) for run in plan.worst_case_cases] == [7] * (1 + 2 * 3) + [3, 3]
@@ -734,6 +786,121 @@ def test_sweep_with_no_failures_or_only_unfixable_ones_runs_nothing(project: Pat
     store = Store.open(project)
     try:
         assert store.experiments() == []
+    finally:
+        store.close()
+
+
+SPLIT_EVIDENCE = "alpha beta gamma delta epsilon zeta eta theta"
+SPLIT_HALVES = ["alpha beta gamma delta", "epsilon zeta eta theta"]  # 22 characters each
+SPLIT_QUESTION = "the split question?"
+SPLIT_APP_SOURCE = '''
+"""Scripted app whose chunker cut one case's evidence in two. Its own chunks are the two halves;
+build(chunking), when present, merges them for a chunk_size above the app's own 22 characters or
+for any overlap, so a chunking candidate fixes the split case. HARD questions are never answered,
+so their evidence is never retrieved."""
+import contexteval
+
+EVIDENCE = %r
+HALVES = %r
+HARD = %r
+SPLIT_QUESTION = %r
+BUILDS = []
+
+
+def _app(chunks):
+    @contexteval.retriever(top_k="limit")
+    def search(query: str, limit: int = 3) -> list[str]:
+        return chunks[:limit]
+
+    def answer(question: str) -> str:
+        hits = search(question)
+        if question in HARD:
+            return "wrong"
+        if question == SPLIT_QUESTION:
+            return "right" if any(EVIDENCE in h for h in hits) else "wrong"
+        return "right"
+
+    return answer
+
+
+answer = _app([*HALVES, "noise about nothing"])
+%s
+'''
+SPLIT_APP_BUILD = '''
+def build(chunking):
+    BUILDS.append(chunking)
+    merged = (chunking.chunk_size or 0) > 22 or (chunking.overlap or 0) > 0
+    return _app([EVIDENCE, "noise about nothing"] if merged else [*HALVES, "noise about nothing"])
+'''
+
+
+def _split_project(project: Path, module: str, build: bool) -> str:
+    """init, import the split case plus two easy and one hard case, run, diagnose. Returns the spec."""
+    source = SPLIT_APP_SOURCE % (SPLIT_EVIDENCE, SPLIT_HALVES, HARD, SPLIT_QUESTION, SPLIT_APP_BUILD if build else "")
+    (project / f"{module}.py").write_text(source, encoding="utf-8")
+    lines = [
+        json.dumps({"question": SPLIT_QUESTION, "expected_answer": "right", "evidence": SPLIT_EVIDENCE}),
+        *(json.dumps({"question": q, "expected_answer": "right", "evidence": f"the fact behind {q}"}) for q in EASY[:2] + HARD[:1]),
+    ]
+    (project / "cases.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    assert _cli.main(["init", "--provider", "fake"]) == 0
+    assert _cli.main(["build-tests", "--import", "cases.jsonl"]) == 0
+    assert _cli.main(["run", f"{module}:answer", "--yes"]) == 0
+    assert _cli.main(["diagnose", "--yes"]) == 0
+    return f"{module}:answer"
+
+
+def test_sweep_with_a_builder_tries_the_chunking_the_split_signal_asks_for_and_recommends_it(project: Path, hooks: None, capsys: pytest.CaptureFixture[str]) -> None:
+    """v2 chunking through `_cli.main`. The split case is labeled missing/dropped with split gold
+    (no LLM call, so the halves never reach a prompt; the inject replay confirms). Defects: the
+    split signal not counted, chunk_size and overlap not proposed or not scaled from the 22
+    character halves, a chunking row run on the app's own index (the split case would still
+    fail), the index rebuilt per row instead of once per distinct chunking, or a final line that
+    does not name a chunking knob when only chunking fixed a case."""
+    spec = _split_project(project, "split_app_build", build=True)
+    capsys.readouterr()
+    assert _cli.main(["sweep", "--holdout", "0", "--yes"]) == 0
+    out = capsys.readouterr().out
+    assert "sweep: 2 labeled failures among the tune cases (missing/not_retrieved 1, missing/dropped 1); 1 with the evidence split across two adjacent chunks; the baseline retrieved up to 3 chunks of up to 22 characters" in out
+    assert "candidates, heaviest first (4 of 4; the number is how many failures ask for it): top_k=6 (1), top_k=9 (1), chunk_size=44 (1), overlap=6 (1)" in out
+    assert "chunking:" not in out
+    final = _final(out)
+    # The app records no input tokens, so every row that passes 3 of 4 ties and latency picks
+    # among them; a round-2 combination with a top_k may win, but a chunking knob is always in it.
+    assert final.startswith("Set ") and ("chunk_size=44" in final or "overlap=6" in final), final
+    builds = sys.modules["split_app_build"].BUILDS  # type: ignore[attr-defined]
+    assert builds[:2] == [Chunking(chunk_size=44), Chunking(overlap=6)] and len(builds) == len(set(builds))
+    store = Store.open(project)
+    try:
+        report, runs = _sweep_runs(store)
+        assert report.recommended is not None and not runs[report.recommended][0].chunking.is_default
+        passed = {s.trace.question: s.trace.test.passed for s in store.traces(report.recommended) if s.trace.test}
+        assert passed[SPLIT_QUESTION] is True and passed[HARD[0]] is False
+        assert spec == store.run(report.recommended).app
+    finally:
+        store.close()
+
+
+def test_sweep_without_a_builder_says_what_chunking_would_buy_and_goes_on_with_retrieval(project: Path, hooks: None, capsys: pytest.CaptureFixture[str]) -> None:
+    """Defects: a sweep on an app with no build(chunking) tries a chunking candidate and dies on
+    its first row, or silently drops the chunking candidates so the user never learns that one
+    failure pointed at chunking and what to add; or it stops instead of running the retrieval
+    candidates the other labels asked for."""
+    spec = _split_project(project, "split_app_nobuild", build=False)
+    capsys.readouterr()
+    assert _cli.main(["sweep", "--holdout", "0", "--yes"]) == 0
+    out = capsys.readouterr().out
+    assert (
+        f"chunking: 1 failure points at chunking, but {spec} has no build(chunking), so chunk_size=44, overlap=6 cannot be tried; "
+        "add `def build(chunking: contexteval.Chunking)` beside answer that rebuilds the index with contexteval.chunk_text"
+    ) in out
+    assert "candidates, heaviest first (2 of 2; the number is how many failures ask for it): top_k=6 (1), top_k=9 (1)" in out
+    assert "round 1, 4 tune cases" in out and "chunk_size" not in out.split("candidates, heaviest first")[1].split("\n")[0]
+    assert _final(out).startswith("Keep the current settings. no candidate beat the baseline on the tune cases")
+    store = Store.open(project)
+    try:
+        report, runs = _sweep_runs(store)
+        assert sorted(s.name for s, _ in runs.values()) == ["baseline", "top_k=6", "top_k=9"]
     finally:
         store.close()
 

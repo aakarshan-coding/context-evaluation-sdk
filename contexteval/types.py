@@ -325,14 +325,17 @@ def _count(d: Diagnosis, step: ReplayStep) -> str:
 SPLIT_GOLD_TEXT = "the evidence was split across two adjacent chunks"
 
 
+def split_gold_of(d: Diagnosis) -> bool:
+    """Whether the diagnosis carries the split signal; Flaky and Judged never do."""
+    return isinstance(d, (Missing, Irrelevant, Ignored, NotContext)) and d.split_gold
+
+
 def explain(d: Diagnosis) -> str:
     """Human evidence line, e.g. "keeping only the gold chunks fixed it (2/3)". Each step the
     diagnoser decided on carries its pass count, so a 2/3 reads as less sure than a 2/2. A split
     gold ends the line with SPLIT_GOLD_TEXT."""
     line = _explain_steps(d)
-    if isinstance(d, (Missing, Irrelevant, Ignored, NotContext)) and d.split_gold:
-        return f"{line}; {SPLIT_GOLD_TEXT}"
-    return line
+    return f"{line}; {SPLIT_GOLD_TEXT}" if split_gold_of(d) else line
 
 
 def _explain_steps(d: Diagnosis) -> str:

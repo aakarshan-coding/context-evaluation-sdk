@@ -30,8 +30,6 @@ from .types import (
     Ignored,
     Irrelevant,
     Judged,
-    Missing,
-    NotContext,
     RunId,
     Trace,
     TraceId,
@@ -39,6 +37,7 @@ from .types import (
     label_of,
     never,
     source_of,
+    split_gold_of,
     tallies,
 )
 
@@ -80,7 +79,7 @@ def _diagnosis_json(d: Diagnosis | None) -> Json | None:
         "label": label_of(d).value,
         "source": source_of(d),
         "explain": explain(d),
-        "split_gold": isinstance(d, (Missing, Irrelevant, Ignored, NotContext)) and d.split_gold,
+        "split_gold": split_gold_of(d),
         "chunks": chunks,
         "steps": [{"step": t.step.value, "passed": t.passed, "total": t.total, "majority": t.majority} for t in tallies(replays)],
         "replays": [{"step": r.step.value, "passed": r.passed, "answer": r.answer} for r in replays],

@@ -410,12 +410,22 @@ def _print_plan(plan: _sweep.Plan, spec: str) -> None:
     if not split.holdout:
         print("warning: no holdout cases, so the recommendation is not confirmed on cases the search did not see")
     labeled = ", ".join(f"{kind.value} {n}" for kind, n in plan.counts.items())
-    print(f"sweep: {sum(plan.counts.values())} labeled failures among the tune cases ({labeled}); the baseline retrieved up to {plan.baseline_k} chunks")
+    split_note = f"; {plan.split_gold} with the evidence split across two adjacent chunks" if plan.split_gold else ""
+    chars = f" of up to {plan.baseline.chunk_chars} characters" if plan.baseline.chunk_chars else ""
+    print(f"sweep: {sum(plan.counts.values())} labeled failures among the tune cases ({labeled}){split_note}; the baseline retrieved up to {plan.baseline_k} chunks{chars}")
     if plan.unlabeled:
         print(f"warning: {plan.unlabeled} tune failures have no label and do not guide the search; run `contexteval diagnose` to include them")
     for kind, n, reason in plan.unfixable:
         noun = "failure" if n == 1 else "failures"
         print(f"  no setting can fix {n} {kind.value} {noun}: {reason}")
+    if plan.withheld:
+        noun = "failure points" if plan.chunking_pointers == 1 else "failures point"
+        names = ", ".join(r.setting.name for r in plan.withheld)
+        print(
+            f"chunking: {plan.chunking_pointers} {noun} at chunking, but {spec} has no build(chunking), so {names} cannot be tried; "
+            "add `def build(chunking: contexteval.Chunking)` beside answer that rebuilds the index with contexteval.chunk_text "
+            "and returns the answer function (README, Chunking), then run the sweep again"
+        )
     if not plan.candidates:
         return
     shown = plan.candidates[: plan.max_settings]
@@ -440,7 +450,15 @@ def cmd_sweep(args: argparse.Namespace) -> int:
     try:
         try:
             source = _sweep.source_run(store, RunId(args.run) if args.run is not None else None)
-            plan, cases = _sweep.plan_sweep(store, source, rounds=args.rounds, max_settings=args.max_settings, holdout=args.holdout, seed=args.seed, tolerance=args.tolerance)
+        except _sweep.SweepNotPossible as e:
+            raise UserError(str(e)) from None
+        # The app loads before the plan: whether it offers build(chunking) decides which
+        # candidates the plan may run.
+        app = _runner.load_app(spec, pinecone_text_key=config.pinecone_text_key)
+        try:
+            plan, cases = _sweep.plan_sweep(
+                store, source, rounds=args.rounds, max_settings=args.max_settings, holdout=args.holdout, seed=args.seed, tolerance=args.tolerance, builder=app.build is not None
+            )
         except _sweep.SweepNotPossible as e:
             raise UserError(str(e)) from None
         if args.run is not None:
@@ -464,7 +482,6 @@ def cmd_sweep(args: argparse.Namespace) -> int:
                 "raise it, or pass --holdout 0 to tune on every case and read the result as unconfirmed"
             )
         provider = _provider(config)
-        app = _runner.load_app(spec, pinecone_text_key=config.pinecone_text_key)
         graded = [cases[c] for run_cases in plan.worst_case_cases for c in run_cases]
         confirm(_runner.estimate_grading(provider, graded), args.yes)
         grade = _runner.make_grader(provider)
@@ -477,7 +494,7 @@ def cmd_sweep(args: argparse.Namespace) -> int:
         except ProviderError as e:
             raise UserError(f"{e} (the sweep's finished runs are stored as an experiment)") from None
         except InterventionNotApplicable as e:
-            raise UserError(f"the app's retrieval cannot take a candidate setting: {e}") from None
+            raise UserError(f"the app cannot take a candidate setting: {e}") from None
         table = {row.run_id: row for row in store.experiment_table(experiment)}
         print(f"experiment {experiment} (sweep)")
         for number, round_runs in enumerate(report.rounds, 1):
