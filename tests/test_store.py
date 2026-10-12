@@ -136,17 +136,21 @@ DIAGNOSES = [
     Missing("dropped", False, REPLAYS[:1]),
     Irrelevant(REPLAYS, removed=((0, 1), (0, 2))),
     Ignored(REPLAYS, gold_at=((0, 2),)),
+    Ignored(REPLAYS, gold_at=((0, 1), (0, 2)), split_gold=True),
+    Missing("dropped", True, REPLAYS[:1], split_gold=True),
     NotContext(REPLAYS),
+    NotContext(REPLAYS, split_gold=True),
     Flaky((ReplayOutcome(ReplayStep.BASELINE_RERUN, True, "right"),)),
     Judged(JudgeVerdict.NO_FAILURE, "answer agrees with context"),
     Judged(JudgeVerdict.IGNORED, "the gold chunk was present and unused"),
 ]
 
 
-@pytest.mark.parametrize("diagnosis", DIAGNOSES, ids=lambda d: type(d).__name__)
+@pytest.mark.parametrize("diagnosis", DIAGNOSES, ids=lambda d: f"{type(d).__name__}{'-split' if getattr(d, 'split_gold', False) else ''}")
 def test_diagnosis_round_trip_every_variant(store: Store, diagnosis) -> None:
     """Defect: a variant's evidence fields (graft 1: removed, gold_at; Missing.cause/confirmed;
-    the judge verdict) not stored, so the UI cannot say what fixed it."""
+    the judge verdict; v2's split_gold) not stored, so the UI cannot say what fixed it. A row
+    written before split_gold existed reads as not split (the v1 test below)."""
     rid = store.new_run("baseline", "app:answer", BASELINE)
     tid = store.add_trace(rid, _trace())
     store.save_diagnosis(tid, diagnosis)

@@ -96,6 +96,7 @@ ul.failures button:focus-visible { outline: 2px solid var(--accent); }
 .b-not_context { color: var(--not_context); }
 .b-flaky { color: var(--flaky); }
 .b-judge, .b-no_failure, .b-undiagnosed { color: var(--judge); }
+.b-split { color: var(--gold-text); background: var(--gold-bg); }
 .b-pass { color: var(--pass); }
 .b-fail { color: var(--fail); }
 .pair { display: grid; gap: 8px; grid-template-columns: minmax(0, 1fr); }
@@ -203,6 +204,10 @@ function badge(diagnosis) {
   return el("span", { className: "badge b-" + label, text });
 }
 
+function splitBadge(diagnosis) {
+  return diagnosis && diagnosis.split_gold ? el("span", { className: "badge b-split", text: "split gold" }) : null;
+}
+
 function passBadge(passed) {
   if (passed === null) return el("span", { className: "badge b-judge", text: "ungraded" });
   return el("span", { className: "badge " + (passed ? "b-pass" : "b-fail"), text: passed ? "pass" : "fail" });
@@ -282,7 +287,7 @@ function renderFailures() {
       "data-trace": t.id,
       onclick: () => selectTrace(t.id, true),
     },
-      el("span", {}, t.passed === false || t.diagnosis ? badge(t.diagnosis) : passBadge(t.passed),
+      el("span", {}, t.passed === false || t.diagnosis ? badge(t.diagnosis) : passBadge(t.passed), splitBadge(t.diagnosis),
         el("span", { className: "q", text: t.question })),
       t.diagnosis ? el("span", { className: "why", text: t.diagnosis.explain }) : null,
       t.error ? el("span", { className: "why error", text: t.error }) : null);

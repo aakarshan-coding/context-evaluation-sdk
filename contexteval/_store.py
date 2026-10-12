@@ -227,14 +227,14 @@ def _refs_from(items: list[list[int]]) -> tuple[tuple[int, int], ...]:
 
 def _diagnosis_json(d: Diagnosis) -> dict[str, Any]:
     match d:
-        case Missing(cause=cause, confirmed=confirmed, replays=replays):
-            return {"kind": "missing", "cause": cause, "confirmed": confirmed, "replays": _replays_json(replays)}
-        case Irrelevant(replays=replays, removed=removed):
-            return {"kind": "irrelevant", "replays": _replays_json(replays), "removed": [list(p) for p in removed]}
-        case Ignored(replays=replays, gold_at=gold_at):
-            return {"kind": "ignored", "replays": _replays_json(replays), "gold_at": [list(p) for p in gold_at]}
-        case NotContext(replays=replays):
-            return {"kind": "not_context", "replays": _replays_json(replays)}
+        case Missing(cause=cause, confirmed=confirmed, replays=replays, split_gold=split):
+            return {"kind": "missing", "cause": cause, "confirmed": confirmed, "replays": _replays_json(replays), "split_gold": split}
+        case Irrelevant(replays=replays, removed=removed, split_gold=split):
+            return {"kind": "irrelevant", "replays": _replays_json(replays), "removed": [list(p) for p in removed], "split_gold": split}
+        case Ignored(replays=replays, gold_at=gold_at, split_gold=split):
+            return {"kind": "ignored", "replays": _replays_json(replays), "gold_at": [list(p) for p in gold_at], "split_gold": split}
+        case NotContext(replays=replays, split_gold=split):
+            return {"kind": "not_context", "replays": _replays_json(replays), "split_gold": split}
         case Flaky(replays=replays):
             return {"kind": "flaky", "replays": _replays_json(replays)}
         case Judged(verdict=verdict, rationale=rationale):
@@ -244,15 +244,17 @@ def _diagnosis_json(d: Diagnosis) -> dict[str, Any]:
 
 
 def _diagnosis_from(d: dict[str, Any]) -> Diagnosis:
+    """A row written before `split_gold` existed (0.3.0 and earlier) reads as not split."""
     kind = d["kind"]
+    split = bool(d.get("split_gold", False))
     if kind == "missing":
-        return Missing(cause=d["cause"], confirmed=d["confirmed"], replays=_replays_from(d["replays"]))
+        return Missing(cause=d["cause"], confirmed=d["confirmed"], replays=_replays_from(d["replays"]), split_gold=split)
     if kind == "irrelevant":
-        return Irrelevant(replays=_replays_from(d["replays"]), removed=_refs_from(d["removed"]))
+        return Irrelevant(replays=_replays_from(d["replays"]), removed=_refs_from(d["removed"]), split_gold=split)
     if kind == "ignored":
-        return Ignored(replays=_replays_from(d["replays"]), gold_at=_refs_from(d["gold_at"]))
+        return Ignored(replays=_replays_from(d["replays"]), gold_at=_refs_from(d["gold_at"]), split_gold=split)
     if kind == "not_context":
-        return NotContext(replays=_replays_from(d["replays"]))
+        return NotContext(replays=_replays_from(d["replays"]), split_gold=split)
     if kind == "flaky":
         return Flaky(replays=_replays_from(d["replays"]))
     if kind == "judged":

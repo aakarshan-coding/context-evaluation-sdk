@@ -67,19 +67,34 @@ def contains_evidence(text: str, evidence: Evidence) -> bool:
     return overlap / len(ev) >= EVIDENCE_TOKEN_THRESHOLD
 
 
+def _gold_alone_and_joined(chunks: Sequence[str], evidence: Evidence) -> tuple[list[bool], list[bool]]:
+    """Per chunk: holds the evidence alone; holds it only joined with its next neighbour (the
+    user's chunker cut the evidence in two). Both halves of a join are marked."""
+    alone = [contains_evidence(c, evidence) for c in chunks]
+    joined = [False] * len(chunks)
+    for i in range(len(chunks) - 1):
+        if not alone[i] and not alone[i + 1] and contains_evidence(f"{chunks[i]} {chunks[i + 1]}", evidence):
+            joined[i] = joined[i + 1] = True
+    return alone, joined
+
+
 def gold_flags(chunks: Sequence[str], evidence: Evidence) -> tuple[bool, ...]:
     """Which of one retrieval's chunks, in order, hold the evidence. The one gold rule: locate_gold,
     the GoldToTop and OnlyGold replays, and the dashboard's gold marks all read it.
 
     A chunk is gold when it holds the evidence alone, or when it and its next neighbour hold it
-    joined and neither does alone (the user's chunker cut the evidence in two); both are then gold.
+    joined and neither does alone; both are then gold.
     """
-    alone = [contains_evidence(c, evidence) for c in chunks]
-    flags = list(alone)
-    for i in range(len(chunks) - 1):
-        if not alone[i] and not alone[i + 1] and contains_evidence(f"{chunks[i]} {chunks[i + 1]}", evidence):
-            flags[i] = flags[i + 1] = True
-    return tuple(flags)
+    alone, joined = _gold_alone_and_joined(chunks, evidence)
+    return tuple(a or j for a, j in zip(alone, joined))
+
+
+def gold_split(chunks: Sequence[str], evidence: Evidence) -> bool:
+    """True when these chunks hold the evidence only by joining two adjacent ones: no chunk holds
+    it alone. The diagnosis records it as `split_gold`, the signal that the chunking cut the
+    evidence in two, which the sweep answers with a larger chunk_size or an overlap."""
+    alone, joined = _gold_alone_and_joined(chunks, evidence)
+    return any(joined) and not any(alone)
 
 
 def chunk_in_prompt(chunk_text: str, prompt: str) -> bool:

@@ -63,6 +63,22 @@ def test_empty_evidence_never_matches() -> None:
     assert not text.contains_evidence("anything", Evidence("..."))
 
 
+def test_gold_split_is_true_only_when_the_evidence_is_found_by_joining_alone() -> None:
+    """v2 chunking, the split signal. Defect: a split reported when a chunk also holds the evidence
+    whole (the join was not needed), when the halves are not adjacent (no gold at all), or when
+    nothing holds it; or no split reported for the one case that is one: adjacent halves and no
+    whole chunk. The flags and the signal come from one rule, so they agree on which chunks are gold."""
+    first = "Section 4. The refund window closes thirty days after"
+    second = "the delivery date for every order. Section 5 covers exchanges."
+    assert not text.contains_evidence(first, EVIDENCE) and not text.contains_evidence(second, EVIDENCE)
+    assert text.gold_split([first, second], EVIDENCE) is True
+    assert text.gold_flags([first, second], EVIDENCE) == (True, True)
+    assert text.gold_split(["noise", first, second, "noise"], EVIDENCE) is True
+    assert text.gold_split([first, second, EVIDENCE.text], EVIDENCE) is False
+    assert text.gold_split([first, "noise", second], EVIDENCE) is False
+    assert text.gold_split(["noise"], EVIDENCE) is False and text.gold_split([], EVIDENCE) is False
+
+
 def test_in_prompt_pairs_lists_only_delivered_chunks_found_in_prompt() -> None:
     """Defect: pairs computed over `retrieved` instead of `delivered`, or a chunk the app never put
     into the prompt reported as in_prompt."""

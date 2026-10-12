@@ -66,6 +66,7 @@ def test_locate_gold_in_prompt_reports_gold_and_other_chunk_positions() -> None:
     assert gold.location is GoldLocation.IN_PROMPT
     assert gold.gold == ((0, 2),)
     assert gold.other == ((0, 0), (0, 1))
+    assert gold.split is False
 
 
 def test_locate_gold_dropped_versus_not_retrieved() -> None:
@@ -120,6 +121,7 @@ def test_locate_gold_joins_adjacent_chunks_that_split_the_evidence() -> None:
     assert gold.location is GoldLocation.IN_PROMPT
     assert gold.gold == ((0, 1), (0, 2))
     assert gold.other == ((0, 0),)
+    assert gold.split is True
 
     chunks = tuple(Chunk(t, str(i), None, i) for i, t in enumerate(delivered))
     assert [c.text for c in apply_transform(GoldToTop(GOLD), chunks, "q")] == [SPLIT_A, SPLIT_B, OFF_TOPIC]
@@ -139,6 +141,30 @@ def test_locate_gold_reports_dropped_when_a_setting_removed_retrieved_gold() -> 
     not_retrieved and sends the user to raise top_k when their own setting dropped the gold."""
     trace = _event_trace(CASE.question, [OFF_TOPIC, GOLD.text], [OFF_TOPIC], [OFF_TOPIC])
     assert locate_gold(GOLD, trace).location is GoldLocation.DROPPED
+    assert locate_gold(GOLD, trace).split is False
+
+
+def test_locate_gold_marks_a_split_wherever_the_join_was_needed() -> None:
+    """v2 chunking. The split signal is the strongest evidence that chunking caused a failure, so
+    it must follow the gold wherever it sat. Defects: a dropped case whose two halves were
+    retrieved reads as not split; a case not retrieved at all reads as split; or a second
+    retrieval holding the evidence whole still reads as split."""
+    halves = [OFF_TOPIC, SPLIT_A, SPLIT_B]
+    dropped = _event_trace(CASE.question, halves, [OFF_TOPIC], [OFF_TOPIC])
+    assert locate_gold(GOLD, dropped).location is GoldLocation.DROPPED and locate_gold(GOLD, dropped).split is True
+    not_retrieved = _event_trace(CASE.question, [OFF_TOPIC], [OFF_TOPIC], [OFF_TOPIC])
+    assert locate_gold(GOLD, not_retrieved).split is False
+    split_event, whole_event = _event_trace(CASE.question, halves, halves, halves), _event_trace(CASE.question, [GOLD.text], [GOLD.text], [GOLD.text])
+    two = Trace(
+        question=CASE.question,
+        outcome=split_event.outcome,
+        retrievals=(*split_event.retrievals, *whole_event.retrievals),
+        llm_calls=(*split_event.llm_calls, *whole_event.llm_calls),
+        metrics=split_event.metrics,
+        test=None,
+        in_prompt=(*split_event.in_prompt, *((1, c) for _, c in whole_event.in_prompt)),
+    )
+    assert locate_gold(GOLD, two).location is GoldLocation.IN_PROMPT and locate_gold(GOLD, two).split is False
 
 
 @pytest.mark.parametrize(

@@ -56,6 +56,9 @@ class GoldMap:
     # Ladder steps whose transform leaves every retrieval's delivered chunks as they are. Such a
     # replay is a second baseline rerun, so a pass would be chance; diagnose_case skips it.
     unchanged: frozenset[ReplayStep] = frozenset()
+    # The gold was found only by joining two adjacent chunks (text.gold_split): the chunker cut
+    # the evidence in two. Carried onto the diagnosis as `split_gold`.
+    split: bool = False
 
 
 def _gold_refs(per_retrieval: Sequence[tuple[Chunk, ...]], evidence: Evidence) -> set[ChunkRef]:
@@ -67,14 +70,26 @@ def _gold_refs(per_retrieval: Sequence[tuple[Chunk, ...]], evidence: Evidence) -
     }
 
 
+def _split(per_retrieval: Sequence[tuple[Chunk, ...]], evidence: Evidence) -> bool:
+    """Every retrieval that holds the gold holds it only by a join, and at least one does."""
+    verdicts = [
+        text.gold_split(texts, evidence)
+        for texts in ([chunk.text for chunk in chunks] for chunks in per_retrieval)
+        if any(text.gold_flags(texts, evidence))
+    ]
+    return bool(verdicts) and all(verdicts)
+
+
 def locate_gold(evidence: Evidence, trace: Trace) -> GoldMap:
     """Pure. Gold is decided per chunk by text.gold_flags, the rule the replay transforms use, and
     never from the prompt text, which also holds the question.
 
     IN_PROMPT when a gold delivered chunk is in the prompt. DROPPED when gold was delivered but the
-    app left it out, or retrieved but cut by the run's setting before user code saw it.
+    app left it out, or retrieved but cut by the run's setting before user code saw it. `split`
+    is read from the chunk list the gold was found in.
     """
-    delivered_gold = _gold_refs([e.delivered for e in trace.retrievals], evidence)
+    delivered = [e.delivered for e in trace.retrievals]
+    delivered_gold = _gold_refs(delivered, evidence)
     gold = tuple(ref for ref in trace.in_prompt if ref in delivered_gold)
     if gold:
         other = tuple(ref for ref in trace.in_prompt if ref not in delivered_gold)
@@ -83,9 +98,12 @@ def locate_gold(evidence: Evidence, trace: Trace) -> GoldMap:
             for step, _ in LADDER
             if all(apply(REPLAY_INTERVENTION[step](evidence), e.delivered, e.query) == e.delivered for e in trace.retrievals)
         )
-        return GoldMap(GoldLocation.IN_PROMPT, gold, other, unchanged)
-    if delivered_gold or _gold_refs([e.retrieved for e in trace.retrievals], evidence):
-        return GoldMap(GoldLocation.DROPPED, (), ())
+        return GoldMap(GoldLocation.IN_PROMPT, gold, other, unchanged, split=_split(delivered, evidence))
+    if delivered_gold:
+        return GoldMap(GoldLocation.DROPPED, (), (), split=_split(delivered, evidence))
+    retrieved = [e.retrieved for e in trace.retrievals]
+    if _gold_refs(retrieved, evidence):
+        return GoldMap(GoldLocation.DROPPED, (), (), split=_split(retrieved, evidence))
     return GoldMap(GoldLocation.NOT_RETRIEVED, (), ())
 
 
@@ -104,8 +122,8 @@ Builder = Callable[[Replays, GoldMap], Diagnosis]
 
 # Plan item 5, in priority order: the least invasive fix wins. First passing step decides.
 LADDER: tuple[tuple[ReplayStep, Builder], ...] = (
-    (ReplayStep.GOLD_TO_TOP, lambda replays, gold: Ignored(replays, gold_at=gold.gold)),
-    (ReplayStep.ONLY_GOLD, lambda replays, gold: Irrelevant(replays, removed=gold.other)),
+    (ReplayStep.GOLD_TO_TOP, lambda replays, gold: Ignored(replays, gold_at=gold.gold, split_gold=gold.split)),
+    (ReplayStep.ONLY_GOLD, lambda replays, gold: Irrelevant(replays, removed=gold.other, split_gold=gold.split)),
 )
 
 MISSING_CAUSE: Mapping[GoldLocation, Literal["not_retrieved", "dropped"]] = {
@@ -156,7 +174,7 @@ def diagnose_case(gold: GoldMap, replay: Replay, samples: int = DEFAULT_SAMPLES)
     if cause is not None:
         injected, confirmed = _majority(ReplayStep.INJECT_EVIDENCE, replay, samples)
         outcomes += injected
-        return Missing(cause, confirmed=confirmed, replays=tuple(outcomes))
+        return Missing(cause, confirmed=confirmed, replays=tuple(outcomes), split_gold=gold.split)
     for step, build in LADDER:
         if step in gold.unchanged:
             continue  # recorded by its absence from the replays; types.explain names it
@@ -164,7 +182,7 @@ def diagnose_case(gold: GoldMap, replay: Replay, samples: int = DEFAULT_SAMPLES)
         outcomes += drawn
         if passed:
             return build(tuple(outcomes), gold)
-    return NotContext(tuple(outcomes))
+    return NotContext(tuple(outcomes), split_gold=gold.split)
 
 
 def make_replay(app: App, case: TestCase, evidence: Evidence, grade: Grader, base: Intervention = NO_INTERVENTION) -> Replay:

@@ -98,7 +98,7 @@ IRRELEVANT = Irrelevant(
     replays=(_replay(ReplayStep.BASELINE_RERUN, False), _replay(ReplayStep.GOLD_TO_TOP, False), _replay(ReplayStep.ONLY_GOLD, True)),
     removed=((0, 0), (0, 1)),
 )
-NOT_CONTEXT = NotContext((_replay(ReplayStep.BASELINE_RERUN, False, None),))
+NOT_CONTEXT = NotContext((_replay(ReplayStep.BASELINE_RERUN, False, None),), split_gold=True)
 FLAKY = Flaky((_replay(ReplayStep.BASELINE_RERUN, True, "thirty days"),))
 JUDGED = Judged(JudgeVerdict.IGNORED, "the prompt held the policy but the answer skipped it")
 
@@ -215,6 +215,10 @@ def test_run_traces_carry_pass_fail_label_and_explain_line(served: Served) -> No
     assert rows[s.ignored]["diagnosis"]["explain"] == "moving the gold chunk to the top fixed it (2/3); gold was at chunk 3 of retrieval 1"
     assert rows[s.irrelevant]["diagnosis"]["explain"] == "keeping only the gold chunks fixed it (1/1); removed chunks 1, 2 of retrieval 1"
     assert rows[s.missing]["diagnosis"]["explain"] == "the gold chunk was never retrieved; injecting the evidence fixed it (1/1)"
+    assert {tid: rows[tid]["diagnosis"]["split_gold"] for tid in rows if rows[tid]["diagnosis"]} == {
+        s.ignored: False, s.missing: False, s.irrelevant: False, s.not_context: True, s.flaky: False, s.imported: False
+    }
+    assert rows[s.not_context]["diagnosis"]["explain"].endswith("; the evidence was split across two adjacent chunks")
     assert rows[s.imported]["diagnosis"]["source"] == "judge"
     assert rows[s.imported]["diagnosis"]["source"] != rows[s.ignored]["diagnosis"]["source"]
     assert rows[s.ignored]["answer"] == "sixty days"
@@ -589,7 +593,8 @@ const timer = setInterval(async () => {
   if (!rows.length && Date.now() - started < 5000) return;
   clearInterval(timer);
   if (!traceId) {
-    console.log(JSON.stringify(rows.map((li) => li.children[0].children[0].children[0].textContent)));
+    const badges = (li) => li.children[0].children[0].children.filter((c) => (c.className || "").startsWith("badge"));
+    console.log(JSON.stringify(rows.map((li) => badges(li).map((c) => c.textContent).join(" "))));
     return;
   }
   await selectTrace(Number(traceId));
@@ -629,6 +634,15 @@ def test_detail_shows_each_step_with_its_pass_count_and_every_sample(served: Ser
     assert _run_page(served, tmp_path, str(s.base), str(s.not_context)) == [
         {"head": "fail baseline rerun (0/1)", "samples": ["fail (crashed)"]},
     ]
+
+
+def test_list_marks_split_gold_beside_the_label(served: Served, tmp_path: Path) -> None:
+    """v2 chunking. Defect: the dashboard carries split_gold in its JSON but the page never shows
+    it, so the one signal that points at chunking is invisible to someone reading the list."""
+    rows = _run_page(served, tmp_path, str(served.seed.base))
+    assert "not context split gold" in rows
+    assert [r for r in rows if "split gold" in r] == ["not context split gold"]
+    assert "ignored" in rows
 
 
 def test_list_shows_the_judge_label_for_judged_production_traces(served: Served, tmp_path: Path) -> None:

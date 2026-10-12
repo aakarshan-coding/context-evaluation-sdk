@@ -12,6 +12,7 @@ import pytest
 from contexteval._diagnose import DEFAULT_SAMPLES, LADDER, MAX_STEPS, GoldLocation, GoldMap, Replay, diagnose_case
 from contexteval.types import (
     LADDER_STEPS,
+    SPLIT_GOLD_TEXT,
     Flaky,
     Ignored,
     Irrelevant,
@@ -67,6 +68,34 @@ def test_decision_table(location, passing, steps, expected) -> None:
     diagnosis = diagnose_case(gold, replay, samples=1)
     assert requested == steps
     assert diagnosis == expected(_replays(steps, passing))
+
+
+@pytest.mark.parametrize(
+    ("location", "passing", "variant"),
+    [
+        (GoldLocation.IN_PROMPT, {TO_TOP}, Ignored),
+        (GoldLocation.IN_PROMPT, {ONLY}, Irrelevant),
+        (GoldLocation.IN_PROMPT, set(), NotContext),
+        (GoldLocation.DROPPED, {INJECT}, Missing),
+    ],
+)
+def test_split_gold_rides_on_the_label_and_into_the_explain_line(location, passing, variant) -> None:
+    """v2 chunking. Defect: locate_gold sees the split but the stored diagnosis loses it, so
+    neither the CLI line nor the sweep can tell a chunking failure from any other of its label;
+    or the signal is set on a case whose gold was whole; or a flaky case carries it."""
+
+    def replay(step: ReplayStep) -> ReplayOutcome:
+        return ReplayOutcome(step, step in passing, "scripted")
+
+    in_prompt = location is GoldLocation.IN_PROMPT
+    split = GoldMap(location, GOLD_AT if in_prompt else (), OTHER if in_prompt else (), split=True)
+    whole = GoldMap(location, GOLD_AT if in_prompt else (), OTHER if in_prompt else ())
+    with_split, without = diagnose_case(split, replay, samples=1), diagnose_case(whole, replay, samples=1)
+    assert isinstance(with_split, variant) and with_split.split_gold is True and without.split_gold is False
+    assert explain(with_split) == explain(without) + "; " + SPLIT_GOLD_TEXT
+    assert SPLIT_GOLD_TEXT == "the evidence was split across two adjacent chunks"
+    flaky = diagnose_case(split, lambda step: ReplayOutcome(step, True, "scripted"), samples=1)
+    assert isinstance(flaky, Flaky) and not hasattr(flaky, "split_gold")
 
 
 def test_ladder_prefers_the_least_invasive_fix() -> None:

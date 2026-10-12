@@ -207,28 +207,37 @@ def tallies(replays: Replays) -> tuple[StepTally, ...]:
     return tuple(StepTally(s, passed[s], total[s]) for s in order)
 
 
+# split_gold on the four variants below: the evidence was found only by joining two adjacent
+# chunks (text.gold_split), so the app's chunker cut it in two. It is the one signal that points
+# at chunking rather than retrieval, and the sweep reads it. Flaky has no gold to speak of.
+
+
 @dataclass(frozen=True)
 class Missing:
     cause: Literal["not_retrieved", "dropped"]
     confirmed: bool  # injecting the evidence as the first chunk made it pass
     replays: Replays
+    split_gold: bool = False  # possible for `dropped` only: both halves were retrieved and then cut
 
 
 @dataclass(frozen=True)
 class Irrelevant:
     replays: Replays
     removed: tuple[ChunkRef, ...]  # the non-gold chunks whose removal made it pass
+    split_gold: bool = False
 
 
 @dataclass(frozen=True)
 class Ignored:
     replays: Replays
     gold_at: tuple[ChunkRef, ...]  # where the gold sat before it was moved to the top
+    split_gold: bool = False
 
 
 @dataclass(frozen=True)
 class NotContext:
     replays: Replays
+    split_gold: bool = False
 
 
 @dataclass(frozen=True)
@@ -313,9 +322,20 @@ def _count(d: Diagnosis, step: ReplayStep) -> str:
     return f"({tally.count})"
 
 
+SPLIT_GOLD_TEXT = "the evidence was split across two adjacent chunks"
+
+
 def explain(d: Diagnosis) -> str:
     """Human evidence line, e.g. "keeping only the gold chunks fixed it (2/3)". Each step the
-    diagnoser decided on carries its pass count, so a 2/3 reads as less sure than a 2/2."""
+    diagnoser decided on carries its pass count, so a 2/3 reads as less sure than a 2/2. A split
+    gold ends the line with SPLIT_GOLD_TEXT."""
+    line = _explain_steps(d)
+    if isinstance(d, (Missing, Irrelevant, Ignored, NotContext)) and d.split_gold:
+        return f"{line}; {SPLIT_GOLD_TEXT}"
+    return line
+
+
+def _explain_steps(d: Diagnosis) -> str:
     match d:
         case Missing(cause="not_retrieved", confirmed=ok):
             fix = "fixed it" if ok else "did not fix it"
