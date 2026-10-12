@@ -14,7 +14,7 @@ from enum import Enum
 from typing import Literal, Union
 
 from . import _text as text
-from .types import Chunk, Evidence, never
+from .types import Chunk, Chunking, Evidence, knob_text, never
 
 
 class InterventionNotApplicable(Exception):
@@ -138,36 +138,44 @@ def apply(iv: Intervention, chunks: tuple[Chunk, ...], query: str | None) -> tup
 
 @dataclass(frozen=True)
 class Setting:
-    """One cell of an experiment grid. Knobs from plan item 15 and nothing else."""
+    """One cell of an experiment grid: the retrieval-time knobs from plan item 15, which the hooks
+    apply to every retrieval call, and the index-time chunking knobs (`Chunking`), which only the
+    app's own `build(chunking)` can apply. Nothing else, so no cell can carry gold."""
 
     top_k: int | None = None
     rerank: Literal["none", "lexical"] = "none"
     order: Order = Order.AS_IS
     max_chunks: int | None = None
     compress: int | None = None  # sentences kept per chunk
+    chunk_size: int | None = None
+    overlap: int | None = None
+    title: bool | None = None
 
     def __post_init__(self) -> None:
         # Settings are built from CLI tokens or stored JSON. Reject non-positive ints here
-        # so nothing downstream re-checks.
+        # so nothing downstream re-checks. Chunking checks its own knobs.
         for knob in ("top_k", "max_chunks", "compress"):
             value = getattr(self, knob)
             if value is not None and value < 1:
                 raise ValueError(f"{knob} must be a positive integer, got {value}")
         if self.rerank not in ("none", "lexical"):
             raise ValueError(f"rerank must be 'none' or 'lexical', got {self.rerank!r}")
+        self.chunking
+
+    @property
+    def chunking(self) -> Chunking:
+        """The index-time family of this setting; `Chunking()` when it keeps the app's own."""
+        return Chunking(chunk_size=self.chunk_size, overlap=self.overlap, title=self.title)
 
     @property
     def name(self) -> str:
-        """Non-default knobs as "top_k=10 rerank=lexical", or "baseline"."""
-        parts = []
-        for f in fields(self):
-            value = getattr(self, f.name)
-            if value != f.default:
-                parts.append(f"{f.name}={value.value if isinstance(value, Enum) else value}")
+        """Non-default knobs as "top_k=10 rerank=lexical title=on", or "baseline"."""
+        parts = [f"{f.name}={knob_text(getattr(self, f.name))}" for f in fields(self) if getattr(self, f.name) != f.default]
         return " ".join(parts) or "baseline"
 
     def intervention(self) -> Intervention:
-        """Fixed pipeline order: rerank, order, max_chunks, compress. Decided here once."""
+        """Fixed pipeline order: rerank, order, max_chunks, compress. Decided here once. The
+        chunking knobs take no part: they changed the index before any retrieval ran."""
         transforms: list[Transform] = []
         if self.rerank == "lexical":
             transforms.append(LexicalRerank())
@@ -186,10 +194,14 @@ class Setting:
             "order": self.order.value,
             "max_chunks": self.max_chunks,
             "compress": self.compress,
+            "chunk_size": self.chunk_size,
+            "overlap": self.overlap,
+            "title": self.title,
         }
 
     @classmethod
     def from_json(cls, data: dict[str, object]) -> Setting:
+        """A key an older build did not write (the chunking knobs) reads as its default."""
         known = {f.name for f in fields(cls)}
         unknown = set(data) - known
         if unknown:

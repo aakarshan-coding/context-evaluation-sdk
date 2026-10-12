@@ -12,7 +12,7 @@ from contexteval import _cli, _runner
 from contexteval import _text as text
 from contexteval._intervention import BASELINE, GoldToTop, InjectEvidence, OnlyGold, Order, Setting
 from contexteval._store import Store
-from contexteval.types import CaseId, Evidence, TestCase, TestOutcome, Trace
+from contexteval.types import CaseId, Chunking, Evidence, TestCase, TestOutcome, Trace
 
 GOLD_TRANSFORMS = (InjectEvidence, GoldToTop, OnlyGold)
 
@@ -31,6 +31,42 @@ def test_parse_grid_is_the_cartesian_product_in_token_order() -> None:
         Setting(top_k=10, rerank="lexical", order=Order.ENDS),
     ]
     assert _cli.parse_grid(["max_chunks=2", "compress=1"]) == [Setting(max_chunks=2, compress=1)]
+
+
+def test_parse_grid_mixes_chunking_knobs_with_retrieval_knobs() -> None:
+    """v2 chunking. Defect: chunk_size, overlap, or title rejected as an unknown knob; `on`/`off`
+    parsed as a string or an int; a setting name that prints `title=True`; or a chunking knob that
+    leaks into the retrieval intervention, so a chunk_size row also changes what reaches the prompt."""
+    grid = _cli.parse_grid(["top_k=4,10", "title=on,off", "chunk_size=300"])
+    assert grid == [
+        Setting(top_k=4, title=True, chunk_size=300),
+        Setting(top_k=4, title=False, chunk_size=300),
+        Setting(top_k=10, title=True, chunk_size=300),
+        Setting(top_k=10, title=False, chunk_size=300),
+    ]
+    assert grid[0].name == "top_k=4 chunk_size=300 title=on" and grid[1].name == "top_k=4 chunk_size=300 title=off"
+    assert _cli.parse_grid(["overlap=0,100"]) == [Setting(overlap=0), Setting(overlap=100)]
+    assert grid[0].chunking == Chunking(chunk_size=300, title=True) and Setting(top_k=8).chunking.is_default
+    assert grid[0].intervention() == Setting(top_k=4).intervention()
+    assert Setting.from_json(grid[0].to_json()) == grid[0]
+    older = {"top_k": 10, "rerank": "none", "order": "as_is", "max_chunks": None, "compress": None}
+    assert Setting.from_json(older) == Setting(top_k=10)
+
+
+@pytest.mark.parametrize(
+    ("tokens", "message"),
+    [
+        (["title=yes"], "bad value 'yes' for title; expected on|off"),
+        (["chunk_size=0"], "chunk_size must be a positive integer"),
+        (["overlap=-1"], "overlap must be 0 or more"),
+        (["chunk_size=100", "overlap=100"], "overlap .* must be smaller than chunk_size"),
+    ],
+)
+def test_parse_grid_rejects_chunking_values_that_cannot_chunk(tokens: list[str], message: str) -> None:
+    """Boundary: a bad chunking value is a one-line UserError before any build, never a traceback
+    from inside the user's build()."""
+    with pytest.raises(_cli.UserError, match=message):
+        _cli.parse_grid(tokens)
 
 
 def test_parse_grid_knobs_come_from_setting_fields() -> None:
@@ -68,16 +104,20 @@ def test_experiments_cannot_use_gold() -> None:
     answer. The full grid crosses every value of every enumerable knob, read from Setting itself."""
     hints = typing.get_type_hints(Setting)
     assert all(Evidence not in (hint, *typing.get_args(hint)) for hint in hints.values())
+    assert all(Evidence not in (hint, *typing.get_args(hint)) for hint in typing.get_type_hints(Chunking).values())
+    ints = {"chunk_size": "4,8", "overlap": "0,2"}  # jointly valid: overlap stays below chunk_size
     tokens = []
     for name, hint in hints.items():
         if typing.get_origin(hint) is typing.Literal:
             tokens.append(f"{name}={','.join(typing.get_args(hint))}")
         elif isinstance(hint, type) and issubclass(hint, Order):
             tokens.append(f"{name}={','.join(o.value for o in Order)}")
+        elif bool in typing.get_args(hint):
+            tokens.append(f"{name}=on,off")
         else:
-            tokens.append(f"{name}=1,3")
+            tokens.append(f"{name}={ints.get(name, '1,3')}")
     grid = _cli.parse_grid(tokens)
-    assert len(grid) == 2 * 2 * 3 * 2 * 2
+    assert len(grid) == 2 * 2 * 3 * 2 * 2 * 2 * 2 * 2
     for setting in [BASELINE, *grid]:
         assert not any(isinstance(t, GOLD_TRANSFORMS) for t in setting.intervention().transforms), setting.name
 

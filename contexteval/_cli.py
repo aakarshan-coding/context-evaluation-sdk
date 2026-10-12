@@ -98,11 +98,19 @@ def _knob_parsers() -> dict[str, tuple[KnobParser, str]]:
             parsers[name] = (hint, "|".join(m.value for m in hint))
         elif typing.get_origin(hint) is typing.Literal:
             parsers[name] = (_one_of(args), "|".join(args))
+        elif bool in args:
+            parsers[name] = (_on_off, "on|off")
         elif int in args or hint is int:
             parsers[name] = (int, "a positive integer")
         else:
             raise TypeError(f"Setting.{name}: no grid parser for {hint!r}")
     return parsers
+
+
+def _on_off(value: str) -> bool:
+    if value not in ("on", "off"):
+        raise ValueError(value)
+    return value == "on"
 
 
 def _one_of(allowed: tuple[str, ...]) -> KnobParser:
