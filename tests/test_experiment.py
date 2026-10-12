@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import sys
 import typing
 from pathlib import Path
 from statistics import mean
@@ -12,7 +14,7 @@ from contexteval import _cli, _runner
 from contexteval import _text as text
 from contexteval._intervention import BASELINE, GoldToTop, InjectEvidence, OnlyGold, Order, Setting
 from contexteval._store import Store
-from contexteval.types import CaseId, Chunking, Evidence, TestCase, TestOutcome, Trace
+from contexteval.types import CaseId, Chunking, Evidence, Judged, TestCase, TestOutcome, Trace
 
 GOLD_TRANSFORMS = (InjectEvidence, GoldToTop, OnlyGold)
 
@@ -140,12 +142,132 @@ def test_run_experiment_prepends_one_baseline_and_stores_each_setting(store: Sto
         return TestOutcome(c.id, True, "substring")
 
     grid = [Setting(top_k=10), BASELINE, Setting(top_k=10), Setting(order=Order.ENDS)]
-    eid = _runner.run_experiment(store, "app:answer", app, [case], grade, grid)
+    eid = _runner.run_experiment(store, _runner.LoadedApp("app:answer", app), [case], grade, grid)
     runs = [r for r in reversed(store.runs()) if r.experiment_id == eid]
     assert [r.run.setting for r in runs] == [BASELINE, Setting(top_k=10), Setting(order=Order.ENDS)]
     assert {r.run.kind for r in runs} == {"experiment"} and all(r.traces == 1 for r in runs)
     assert seen == ["q?"] * 3
     assert [row.setting_name for row in store.experiment_table(eid)] == ["baseline", "top_k=10", "order=ends"]
+
+
+BUILD_APP_SOURCE = '''
+"""Scripted app with the optional builder. Its own index answers "own index"; a built index
+answers with the chunking it was built for, so a trace shows which index answered it."""
+import sys
+
+import contexteval
+
+BUILDS = []  # every chunking build() was asked for, in order
+
+
+@contexteval.retriever(top_k="limit")
+def search(query: str, limit: int = 2) -> list[str]:
+    return [f"chunk {i} about {query}" for i in range(limit)]
+
+
+def answer(question: str) -> str:
+    search(question)
+    return "own index"
+
+
+def build(chunking: contexteval.Chunking):
+    BUILDS.append(chunking)
+
+    def built(question: str) -> str:
+        search(question)
+        return f"index {chunking.name}"
+
+    return built
+'''
+
+
+def _builder_project(project: Path, module: str, expected: str) -> None:
+    (project / f"{module}.py").write_text(BUILD_APP_SOURCE, encoding="utf-8")
+    cases = project / "cases.jsonl"
+    cases.write_text(json.dumps({"question": "which index?", "expected_answer": expected, "evidence": "index facts"}) + "\n", encoding="utf-8")
+    assert _cli.main(["init", "--provider", "fake"]) == 0
+    assert _cli.main(["build-tests", "--import", str(cases)]) == 0
+
+
+def test_experiment_builds_each_distinct_chunking_once_and_runs_every_row_on_its_index(project: Path, hooks: None, capsys: pytest.CaptureFixture[str]) -> None:
+    """v2 chunking through `_cli.main`. Defects: a chunking row run on the app's own index (the
+    answer would read "own index"), a build per row or per case instead of one per distinct
+    Chunking, a baseline that calls build(), or retrieval knobs that stop combining with chunking
+    knobs (top_k must still reach the retrieval under a chunk_size row)."""
+    _builder_project(project, "build_app_grid", "index chunk_size=800")
+    assert _cli.main(["run", "build_app_grid:answer", "--yes"]) == 0
+    capsys.readouterr()
+    assert _cli.main(["experiment", "chunk_size=300,800", "top_k=2,4", "--yes"]) == 0
+    out = capsys.readouterr().out
+    assert "1 cases x 5 settings" in out and "2 index builds (chunk_size=300, chunk_size=800)" in out
+    assert sys.modules["build_app_grid"].BUILDS == [Chunking(chunk_size=300), Chunking(chunk_size=800)]  # type: ignore[attr-defined]
+    store = Store.open(project)
+    try:
+        eid = store.experiments()[0].id
+        runs = [r for r in reversed(store.runs()) if r.experiment_id == eid]
+        answers = {r.run.setting.name: [s.trace for s in store.traces(r.run.id)][0] for r in runs}
+    finally:
+        store.close()
+    assert {name: t.outcome.text for name, t in answers.items()} == {  # type: ignore[union-attr]
+        "baseline": "own index",
+        "top_k=2 chunk_size=300": "index chunk_size=300",
+        "top_k=4 chunk_size=300": "index chunk_size=300",
+        "top_k=2 chunk_size=800": "index chunk_size=800",
+        "top_k=4 chunk_size=800": "index chunk_size=800",
+    }
+    assert {name: len(t.retrievals[0].delivered) for name, t in answers.items()} == {"baseline": 2, "top_k=2 chunk_size=300": 2, "top_k=4 chunk_size=300": 4, "top_k=2 chunk_size=800": 2, "top_k=4 chunk_size=800": 4}
+    assert {name: t.test.passed for name, t in answers.items()}["top_k=4 chunk_size=800"] is True  # type: ignore[union-attr]
+    assert {name: t.test.passed for name, t in answers.items()}["baseline"] is False  # type: ignore[union-attr]
+
+
+def test_experiment_without_a_builder_explains_the_contract_before_any_call(project: Path, hooks: None, capsys: pytest.CaptureFixture[str]) -> None:
+    """Defect: `contexteval experiment title=on` on an app with no build() runs the baseline, prints
+    the cost prompt, and then fails on the first chunking row with a traceback; or a retrieval-only
+    grid on the same app is refused too. The error is one line before any app call, names what to
+    add and where, and the retrieval knobs still work."""
+    (project / "plain_app.py").write_text(
+        "import contexteval\n\n@contexteval.retriever(top_k='limit')\ndef search(q, limit=2):\n    return ['a', 'b'][:limit]\n\ndef answer(q):\n    search(q)\n    return 'a'\n",
+        encoding="utf-8",
+    )
+    cases = project / "cases.jsonl"
+    cases.write_text(json.dumps({"question": "q?", "expected_answer": "a"}) + "\n", encoding="utf-8")
+    assert _cli.main(["init", "--provider", "fake"]) == 0
+    assert _cli.main(["build-tests", "--import", str(cases)]) == 0
+    assert _cli.main(["experiment", "plain_app:answer", "title=on", "top_k=4", "--yes"]) == 1
+    out, err = capsys.readouterr()
+    assert err.startswith("error: title=on needs the app to rebuild its index, and plain_app:answer has no plain_app:build")
+    assert "def build(chunking: contexteval.Chunking)" in err and "chunk_text" in err and "estimate:" not in out
+    store = Store.open(project)
+    try:
+        assert store.experiments() == [] and store.runs() == []
+    finally:
+        store.close()
+    assert _cli.main(["experiment", "plain_app:answer", "top_k=1", "--yes"]) == 0
+
+
+def test_diagnose_replays_an_experiment_run_against_the_index_it_was_built_on(project: Path, hooks: None, capsys: pytest.CaptureFixture[str]) -> None:
+    """Defect: `diagnose --run ID` on a chunk_size=800 experiment run replays the failure through
+    the app's own index, so the replay answers (and the label) describe a different app than the
+    one that failed. The replays carry the built index's answer."""
+    _builder_project(project, "build_app_diag", "index chunk_size=300")
+    assert _cli.main(["run", "build_app_diag:answer", "--yes"]) == 0
+    assert _cli.main(["experiment", "chunk_size=800", "--yes"]) == 0
+    store = Store.open(project)
+    try:
+        built_run = next(r.run.id for r in store.runs() if r.run.setting == Setting(chunk_size=800))
+    finally:
+        store.close()
+    capsys.readouterr()
+    assert _cli.main(["diagnose", "--run", str(built_run), "--yes"]) == 0
+    assert "missing      which index?" in capsys.readouterr().out
+    assert sys.modules["build_app_diag"].BUILDS == [Chunking(chunk_size=800)] * 2  # type: ignore[attr-defined]
+    store = Store.open(project)
+    try:
+        (stored,) = store.traces(built_run)
+    finally:
+        store.close()
+    assert stored.diagnosis is not None and not isinstance(stored.diagnosis, Judged)
+    assert {r.answer for r in stored.diagnosis.replays} == {"index chunk_size=800"}  # type: ignore[union-attr]
 
 
 def test_experiment_command_user_errors(project: Path, capsys: pytest.CaptureFixture[str]) -> None:

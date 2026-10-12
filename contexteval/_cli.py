@@ -261,7 +261,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             print(f"app: {len(cases)} calls to {spec}, ~{app_tokens[0]} input tokens each in the last run")
         confirm(_runner.estimate_grading(provider, cases), args.yes)
         try:
-            summary = _runner.run_suite(store, spec, app, cases, _runner.make_grader(provider))
+            summary = _runner.run_suite(store, app, cases, _runner.make_grader(provider))
         except ProviderError as e:
             raise UserError(str(e)) from None
         failed = summary.cases - summary.passed - summary.crashed
@@ -301,7 +301,9 @@ def cmd_diagnose(args: argparse.Namespace) -> int:
             spec = run.app or config.app
             if spec is None:
                 raise UserError(f"run {run.id} has no app recorded; pass one with `contexteval init --app`")
-            app = _runner.load_app(spec, pinecone_text_key=config.pinecone_text_key)
+            # Replays run against the index the run was made on, so a chunking experiment run is
+            # diagnosed on its own build.
+            app = _runner.load_app(spec, pinecone_text_key=config.pinecone_text_key).for_chunking(run.setting.chunking)
             ground_truth = sum(p.path == "replay" for p in todo)
             print(
                 f"app: up to {ground_truth * _diagnose.MAX_STEPS * args.samples} replay calls to {spec} "
@@ -350,17 +352,20 @@ def cmd_experiment(args: argparse.Namespace) -> int:
         settings = _runner.experiment_settings(grid)
         provider = _provider(config)
         app = _runner.load_app(spec, pinecone_text_key=config.pinecone_text_key)
-        print(f"experiment: {len(cases)} cases x {len(settings)} settings ({', '.join(s.name for s in settings)})")
+        app.ensure_buildable(settings)
+        builds = _runner.distinct_chunkings(settings)
+        build_note = f"; {len(builds)} index builds ({', '.join(c.name for c in builds)})" if builds else ""
+        print(f"experiment: {len(cases)} cases x {len(settings)} settings ({', '.join(s.name for s in settings)}){build_note}")
         app_tokens = store.mean_app_tokens()
         if app_tokens is not None:
             print(f"app: {len(cases) * len(settings)} calls to {spec}, ~{app_tokens[0]} input tokens each in the last run")
         confirm(_runner.estimate_grading(provider, list(cases) * len(settings)), args.yes)
         try:
-            experiment = _runner.run_experiment(store, spec, app, cases, _runner.make_grader(provider), grid)
+            experiment = _runner.run_experiment(store, app, cases, _runner.make_grader(provider), grid)
         except ProviderError as e:
             raise UserError(str(e)) from None
         except InterventionNotApplicable as e:
-            raise UserError(f"the app's retrieval cannot take this setting: {e}") from None
+            raise UserError(f"the app cannot take this setting: {e}") from None
         print(f"experiment {experiment}")
         print(format_experiment_table(store.experiment_table(experiment)))
         return 0
@@ -465,7 +470,7 @@ def cmd_sweep(args: argparse.Namespace) -> int:
         grade = _runner.make_grader(provider)
 
         def run_cases(experiment: ExperimentId, setting: Setting, on: Sequence[TestCase]) -> RunId:
-            return _runner.run_suite(store, spec, app, on, grade, setting, experiment).run
+            return _runner.run_suite(store, app, on, grade, setting, experiment).run
 
         try:
             experiment, report = _sweep.run_sweep(store, cases, plan, run_cases)
@@ -620,6 +625,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         return COMMANDS[args.command].run(args)
-    except (UserError, _runner.AppLoadError) as e:
+    except (UserError, _runner.AppLoadError, _runner.NoBuilder) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1

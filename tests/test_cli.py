@@ -185,7 +185,7 @@ def test_run_passes_the_configured_pinecone_text_key_to_load_app(project: Path, 
 
     def fake_load_app(spec, pinecone_text_key=None):  # type: ignore[no-untyped-def]
         seen["key"] = pinecone_text_key
-        return lambda question: "a"
+        return _cli._runner.LoadedApp(spec, lambda question: "a")
 
     monkeypatch.setattr(_cli._runner, "load_app", fake_load_app)
     assert _cli.main(["run", "my_app:answer", "--yes"]) == 0
@@ -237,7 +237,7 @@ def test_diagnose_hands_samples_to_the_run_and_states_the_worst_case(project: Pa
     tests = project / "t.jsonl"
     tests.write_text(json.dumps({"question": "q?", "expected_answer": "a", "evidence": "the answer is a"}) + "\n", encoding="utf-8")
     assert _cli.main(["build-tests", "--import", str(tests)]) == 0
-    monkeypatch.setattr(_cli._runner, "load_app", lambda spec, pinecone_text_key=None: (lambda question: "wrong"))
+    monkeypatch.setattr(_cli._runner, "load_app", lambda spec, pinecone_text_key=None: _cli._runner.LoadedApp(spec, lambda question: "wrong"))
     assert _cli.main(["run", "my_app:answer", "--yes"]) == 0
     seen: dict[str, object] = {}
 

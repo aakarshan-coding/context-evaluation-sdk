@@ -18,7 +18,7 @@ from contexteval import _capture as capture
 from contexteval import _hooks, retriever
 from contexteval._intervention import NO_INTERVENTION, InjectEvidence, Intervention, InterventionNotApplicable
 from contexteval._llm import FakeProvider, cost_usd
-from contexteval._runner import execute, make_grader, run_suite
+from contexteval._runner import LoadedApp, execute, make_grader, run_suite
 from contexteval._store import Store
 from contexteval.types import Answered, CaseId, Evidence, LLMCall, TestCase, Trace
 
@@ -327,7 +327,7 @@ def test_async_answer_runs_through_the_suite_with_in_prompt(store: Store, hooks:
 
     cases = [TestCase(CaseId(f"c{i}"), f"question {i}", "ans", None, "tests.jsonl") for i in (1, 2)]
     store.upsert_cases("tests", cases)
-    summary = run_suite(store, "tests:app", app, cases, make_grader(FakeProvider()))
+    summary = run_suite(store, LoadedApp("tests:app", app), cases, make_grader(FakeProvider()))
     assert (summary.cases, summary.passed, summary.crashed) == (2, 2, 0)
     traces = [s.trace for s in store.traces(summary.run)]
     assert [t.question for t in traces] == ["question 1", "question 2"]
