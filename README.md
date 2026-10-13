@@ -118,7 +118,7 @@ contexteval sweep --holdout 0 --yes
 The sweep says which labels no setting can fix and why, tries the settings the other labels call for, including a different chunking when the app offers `build(chunking)` as the demo does, combines the winners, and ends with one recommendation:
 
 ```text
-Set chunk_size=232 title=on. Accuracy 33% -> 67% (no holdout cases, so this is unconfirmed). Uses 49% more input tokens; mean latency 38 ms -> 6 ms.
+Set chunk_size=232 title=on. Accuracy 33% -> 67% (no holdout cases, so this is unconfirmed). Uses 49% more input tokens; mean latency 38 ms -> 5 ms.
 ```
 
 The [Sweep](#sweep) section shows the whole output and explains how the search works.
@@ -315,7 +315,7 @@ The search runs in rounds. Round 1 runs the baseline and each setting on its own
 
 To keep the sweep from fitting your test set, it splits the cases into a tune set and a holdout set with a fixed seed (`--holdout F`, default 0.3 of the cases, half the failures and half the passes in proportion; `--seed S` changes the split). The split comes first, and only the tune cases' labels choose the candidates, so the holdout cases stay unseen by the search. It chooses on the tune cases, then runs the baseline and the winner on the holdout cases. It recommends the winner only when it beat the baseline on tune and did not lose on holdout. Otherwise it recommends keeping your current settings and says why. A round ends the search when no setting beat the baseline, so a later round never builds on a setting that only tied it. If `--holdout F` rounds to 0 cases on your set, the sweep stops before any app call and says so, because no winner could be confirmed. `--holdout 0` tunes on every case; use it for a set too small to split, and read the result as unconfirmed.
 
-Among settings that pass about as many tune cases, the sweep prefers the cheaper one. Every setting that beat the baseline and passed within a near-tie window of the most accurate one is a contender. The window is 5% of the tune cases, rounded down, so it is 0 cases on a set under 20, 1 case on 35, and 5 cases on 100. `--tolerance N` sets it to N cases instead. The contender with the fewest mean input tokens wins, then the one that passed more, then the one with the lowest latency. If the source run recorded no input tokens, no setting is cheaper than another, so the window is 0 and the sweep prints why, as in `near-tie window: 0 (run 1 recorded no input tokens, so accuracy alone decides)`. The same rule picks the best setting in every round. When the winner is not the most accurate setting, the recommendation names the one it passed over and what that one costs. When the window is not 0, the sweep prints it before running, as in `near-tie window: 1 case (5% of 35)`. A window of 0, the default on a small set or `--tolerance 0`, picks the most accurate setting, with ties going to the cheaper one.
+Among settings that pass about as many tune cases, the sweep prefers the cheaper one. Every setting that beat the baseline and passed within a near-tie window of the most accurate one is a contender. The window is 5% of the tune cases, rounded down, so it is 0 cases on a set under 20, 1 case on 35, and 5 cases on 100. `--tolerance N` sets it to N cases instead. The contender with the fewest mean input tokens wins, and input tokens within 5% of the cheapest contender's count as equal. Among those, the one that passed more wins, then the one that changes fewer knobs, then the one with the lowest latency, so a combination whose extra knob adds nothing does not beat the single setting. If the source run recorded no input tokens, no setting is cheaper than another, so the window is 0 and the sweep prints why, as in `near-tie window: 0 (run 1 recorded no input tokens, so accuracy alone decides)`. The same rule picks the best setting in every round. When the winner is not the most accurate setting, the recommendation names the one it passed over and what that one costs. When the window is not 0, the sweep prints it before running, as in `near-tie window: 1 case (5% of 35)`. A window of 0, the default on a small set or `--tolerance 0`, picks the most accurate setting, with ties going to the cheaper one.
 
 Before running, the sweep prints the worst case, every round full plus the two holdout runs, and asks. Every candidate is a plain experiment setting, so the sweep never sees the evidence passages either.
 
@@ -335,26 +335,26 @@ estimate: 117 LLM calls, ~6604 input and ~234 output tokens, about $0.0000
 experiment 1 (sweep)
 round 1, 9 tune cases
 setting         accuracy  passed  mean input tokens  mean latency ms  total cost
-baseline        33%       3/9     122                38.0             unknown
-compress=2      33%       3/9     122                6.7              unknown
-title=on        44%       4/9     136                5.4              unknown
-chunk_size=232  56%       5/9     172                5.8              unknown
-top_k=8         44%       4/9     212                6.9              unknown
-top_k=12        44%       4/9     318                6.4              unknown
+baseline        33%       3/9     122                37.7             unknown
+compress=2      33%       3/9     122                6.3              unknown
+title=on        44%       4/9     136                6.3              unknown
+chunk_size=232  56%       5/9     172                3.0              unknown
+top_k=8         44%       4/9     212                3.9              unknown
+top_k=12        44%       4/9     318                7.5              unknown
 round 2, 9 tune cases
 setting                    accuracy  passed  mean input tokens  mean latency ms  total cost
-baseline                   33%       3/9     122                38.0             unknown
-compress=2 chunk_size=232  56%       5/9     168                5.8              unknown
-chunk_size=232 title=on    67%       6/9     182                5.7              unknown
-top_k=8 chunk_size=232     56%       5/9     351                5.4              unknown
-top_k=12 chunk_size=232    56%       5/9     511                5.8              unknown
+baseline                   33%       3/9     122                37.7             unknown
+compress=2 chunk_size=232  56%       5/9     168                6.8              unknown
+chunk_size=232 title=on    67%       6/9     182                4.7              unknown
+top_k=8 chunk_size=232     56%       5/9     351                7.6              unknown
+top_k=12 chunk_size=232    56%       5/9     511                7.6              unknown
 not applicable: overlap=29: build(overlap=29) raised ValueError: overlap (29) must be smaller than chunk_size (1)
-Set chunk_size=232 title=on. Accuracy 33% -> 67% (no holdout cases, so this is unconfirmed). Uses 49% more input tokens; mean latency 38 ms -> 6 ms.
+Set chunk_size=232 title=on. Accuracy 33% -> 67% (no holdout cases, so this is unconfirmed). Uses 49% more input tokens; mean latency 38 ms -> 5 ms.
 ```
 
 The split case asks for `chunk_size=232`, twice the longest chunk the baseline delivered, and for `overlap=29`. On 9 cases every candidate has weight 1 or 2 and the split signal's two come right after the two weight-2 settings, so they survive the default cap of 6 and `rerank=lexical`, `max_chunks=2`, and the two `order` settings do not. `chunk_size=232` packs the two fitting paragraphs into one chunk, which fixes the split case, and it also packs the never-retrieved warranty sentence with neighbours that rank higher, so that case passes too: 5 of 9. `title=on` alone lifts the same warranty chunk into the top 4. Round 2 combines the winner with every round-1 setting that changes other knobs, and `chunk_size=232 title=on` also puts the ignored case's chunk first: 6 of 9. The demo's own chunking is one paragraph per chunk, which its `build` expresses as `chunk_size=1`, so an overlap of 29 cannot be built; the sweep lists the reason and goes on. On 9 tune cases the window rounds down to 0, so accuracy decides. The baseline row's latency includes the demo's one-time index warm-up, as the `experiment` table's does.
 
-With the default `--holdout 0.3`, the demo keeps 3 of its 9 cases back. With seed 0 the split and irrelevant failures land in the holdout, so the search sees the ignored and never-retrieved failures among the fixable ones and proposes `top_k=8`, `top_k=12`, the two `order` settings, `compress=2`, and `title=on`. `top_k=8`, `top_k=12`, and `title=on` each pass one more of the 6 tune cases, and so does every round-2 combination of `title=on` with another knob. They all pass 3 of 6, and the four at 136 input tokens tie on tokens as well, so the sweep's last key, latency, picks `order=reverse title=on` by a fraction of a millisecond, although the reorder added nothing. On the 3 holdout cases it ties the baseline at 1 of 3, so the line reads `Set order=reverse title=on. Accuracy 33% -> 50% (holdout 33% -> 33%)`. A tie this close is noise on a set this small, which is why the demo uses `--holdout 0`.
+With the default `--holdout 0.3`, the demo keeps 3 of its 9 cases back. With seed 0 the split and irrelevant failures land in the holdout, so the search sees the ignored and never-retrieved failures among the fixable ones and proposes `top_k=8`, `top_k=12`, the two `order` settings, `compress=2`, and `title=on`. `top_k=8`, `top_k=12`, and `title=on` each pass one more of the 6 tune cases, and so does every round-2 combination of `title=on` with another knob. They all pass 3 of 6, and the four at 136 input tokens tie on tokens, so the sweep picks `title=on`, which changes one knob where the combinations change two. On the 3 holdout cases it ties the baseline at 1 of 3, so the line reads `Set title=on. Accuracy 33% -> 50% (holdout 33% -> 33%)`. A tie this close is noise on a set this small, which is why the demo uses `--holdout 0`.
 
 The sweep is stored as an experiment. The dashboard lists it with its rows and marks the recommended one.
 
