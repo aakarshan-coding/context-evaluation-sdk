@@ -241,6 +241,7 @@ DEFAULT_ROUNDS = 2
 DEFAULT_MAX_SETTINGS = 6
 DEFAULT_HOLDOUT = 0.3
 NEAR_TIE_PERCENT = 5  # the default near-tie window, as a share of the tune cases
+TOKEN_TIE_PERCENT = 5  # input tokens within this share of the cheapest contender's count as equal
 
 
 @dataclass(frozen=True)
@@ -421,12 +422,15 @@ def plan_sweep(
 def choose(rows: Mapping[Setting, ExperimentRow], baseline_passed: int, window: int) -> Setting:
     """The best setting on the same cases. Every setting within `window` passes of the most
     passing one, and passing more than the baseline, is a contender; the cheapest contender wins:
-    fewest input tokens, then most passes, then lowest latency. When nothing passes more than the
+    fewest input tokens, counting those within TOKEN_TIE_PERCENT of the cheapest as equal, then
+    most passes, then fewest changed knobs, then lowest latency. When nothing passes more than the
     baseline, only the most passing settings contend. Table order breaks exact ties."""
     top = max(row.passed for row in rows.values())
     floor = top if top <= baseline_passed else max(top - window, baseline_passed + 1)
     contenders = [s for s, row in rows.items() if row.passed >= floor]
-    return min(contenders, key=lambda s: (rows[s].mean_input_tokens, -rows[s].passed, rows[s].mean_latency_ms))
+    cheapest = min(rows[s].mean_input_tokens for s in contenders)
+    tied = [s for s in contenders if rows[s].mean_input_tokens * 100 <= cheapest * (100 + TOKEN_TIE_PERCENT)]
+    return min(tied, key=lambda s: (-rows[s].passed, len(knobs(s)), rows[s].mean_latency_ms))
 
 
 def winner(table: Mapping[Setting, ExperimentRow], window: int) -> Setting | None:

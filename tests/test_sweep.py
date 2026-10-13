@@ -526,7 +526,6 @@ def test_near_tie_prefers_more_passes_before_lower_latency() -> None:
     assert _sweep.choose(rows, 30, 2) == rev
 
 
-@pytest.mark.xfail(strict=True, reason="the near-tie key ranks a one-token difference above the number of changed knobs")
 def test_near_tie_prefers_fewer_changed_knobs_over_a_combination_whose_extra_knob_adds_nothing() -> None:
     """Defect: among settings that pass the same cases at input tokens within noise of each other,
     the key ranks one token and then latency, so the sweep recommends `order=reverse title=on`
