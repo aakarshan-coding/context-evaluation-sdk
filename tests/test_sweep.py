@@ -526,6 +526,29 @@ def test_near_tie_prefers_more_passes_before_lower_latency() -> None:
     assert _sweep.choose(rows, 30, 2) == rev
 
 
+@pytest.mark.xfail(strict=True, reason="the near-tie key ranks a one-token difference above the number of changed knobs")
+def test_near_tie_prefers_fewer_changed_knobs_over_a_combination_whose_extra_knob_adds_nothing() -> None:
+    """Defect: among settings that pass the same cases at input tokens within noise of each other,
+    the key ranks one token and then latency, so the sweep recommends `order=reverse title=on`
+    over `title=on` alone on the recorded real-bot rows, though the reorder adds nothing and the
+    combination was only faster by chance. Fewer changed knobs win a token tie; a setting well
+    above the cheapest (`top_k=8 title=on` at 779) still loses on tokens."""
+    title = Setting(title=True)
+    rev, ends = Setting(order=Order.REVERSE, title=True), Setting(order=Order.ENDS, title=True)
+    wide = Setting(top_k=8, title=True)
+    rows = {
+        BASELINE: _row(BASELINE, 32, 399.0, 917.0, 35),
+        title: _row(title, 35, 435.0, 895.0, 35),
+        rev: _row(rev, 35, 434.0, 868.0, 35),
+        ends: _row(ends, 35, 434.0, 884.0, 35),
+        wide: _row(wide, 35, 779.0, 900.0, 35),
+    }
+    assert _sweep.winner(rows, 1) == title
+    assert _sweep.decide(rows, 1, None) == _sweep.Decision(title, None, "")
+    rows[rev] = _row(rev, 35, 300.0, 868.0, 35)
+    assert _sweep.winner(rows, 1) == rev
+
+
 def test_window_is_zero_when_the_source_run_recorded_no_input_tokens(project: Path, hooks: None, capsys: pytest.CaptureFixture[str]) -> None:
     """Review Q4. Defect: a near-tie window on an app whose input tokens are unknown (no hooked
     LLM call, so every row reads 0 tokens): the sweep prints a window it cannot apply and credits
