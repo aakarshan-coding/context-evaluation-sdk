@@ -333,30 +333,30 @@ sweep: 7 labeled failures among the tune cases (not_context 2, flaky 1, irreleva
   no setting can fix 2 not_context failures: the context held the answer and the model still got it wrong; look at the prompt, the model, or the expected answer
   no setting can fix 1 flaky failure: the unchanged app passed on rerun; a setting cannot make the model deterministic
   no setting can fix 1 missing/dropped failure: retrieval found the gold chunk and your own code removed it before the prompt; no retrieval setting changes that filter
-candidates, heaviest first (6 of 10; the number is how many failures ask for it): compress=2 (2), title=on (2), chunk_size=232 (1), overlap=29 (1), top_k=8 (1), top_k=12 (1)
+candidates, heaviest first (6 of 10; the number is how many failures ask for it): compress=2 (2), title=on (2), chunk_size=232 (1), chunk_size=116 overlap=29 (1), top_k=8 (1), top_k=12 (1)
 app: up to 117 calls to contexteval.demo.app:answer (9 tune cases x (1 baseline + 6 settings x 2 rounds) + 0 holdout cases x 2, worst case)
 estimate: 117 LLM calls, ~6604 input and ~234 output tokens, about $0.0000
 experiment 1 (sweep)
 round 1, 9 tune cases
-setting         accuracy  passed  mean input tokens  mean latency ms  total cost
-baseline        33%       3/9     122                37.7             unknown
-compress=2      33%       3/9     122                6.3              unknown
-title=on        44%       4/9     136                6.3              unknown
-chunk_size=232  56%       5/9     172                3.0              unknown
-top_k=8         44%       4/9     212                3.9              unknown
-top_k=12        44%       4/9     318                7.5              unknown
+setting                    accuracy  passed  mean input tokens  mean latency ms  total cost
+baseline                   33%       3/9     122                261.8            unknown
+compress=2                 33%       3/9     122                13.8             unknown
+title=on                   44%       4/9     136                11.9             unknown
+chunk_size=232             56%       5/9     172                14.1             unknown
+chunk_size=116 overlap=29  22%       2/9     143                13.6             unknown
+top_k=8                    44%       4/9     212                15.5             unknown
+top_k=12                   44%       4/9     318                16.0             unknown
 round 2, 9 tune cases
 setting                    accuracy  passed  mean input tokens  mean latency ms  total cost
-baseline                   33%       3/9     122                37.7             unknown
-compress=2 chunk_size=232  56%       5/9     168                6.8              unknown
-chunk_size=232 title=on    67%       6/9     182                4.7              unknown
-top_k=8 chunk_size=232     56%       5/9     351                7.6              unknown
-top_k=12 chunk_size=232    56%       5/9     511                7.6              unknown
-not applicable: overlap=29: build(overlap=29) raised ValueError: overlap (29) must be smaller than chunk_size (1)
-Set chunk_size=232 title=on. Accuracy 33% -> 67% (no holdout cases, so this is unconfirmed). Uses 49% more input tokens; mean latency 38 ms -> 5 ms.
+baseline                   33%       3/9     122                261.8            unknown
+compress=2 chunk_size=232  56%       5/9     168                13.6             unknown
+chunk_size=232 title=on    67%       6/9     182                12.1             unknown
+top_k=8 chunk_size=232     56%       5/9     351                11.7             unknown
+top_k=12 chunk_size=232    56%       5/9     511                12.6             unknown
+Set chunk_size=232 title=on. Accuracy 33% -> 67% (no holdout cases, so this is unconfirmed). Uses 49% more input tokens; mean latency 262 ms -> 12 ms.
 ```
 
-The split case asks for `chunk_size=232`, twice the longest chunk the baseline delivered, and for `overlap=29`. On 9 cases every candidate has weight 1 or 2 and the split signal's two come right after the two weight-2 settings, so they survive the default cap of 6 and `rerank=lexical`, `max_chunks=2`, and the two `order` settings do not. `chunk_size=232` packs the two fitting paragraphs into one chunk, which fixes the split case, and it also packs the never-retrieved warranty sentence with neighbours that rank higher, so that case passes too: 5 of 9. `title=on` alone lifts the same warranty chunk into the top 4. Round 2 combines the winner with every round-1 setting that changes other knobs, and `chunk_size=232 title=on` also puts the ignored case's chunk first: 6 of 9. The demo's own chunking is one paragraph per chunk, which its `build` expresses as `chunk_size=1`, so an overlap of 29 cannot be built; the sweep lists the reason and goes on. On 9 tune cases the window rounds down to 0, so accuracy decides. The baseline row's latency includes the demo's one-time index warm-up, as the `experiment` table's does.
+The split case asks for `chunk_size=232`, twice the longest chunk the baseline delivered, and for `chunk_size=116 overlap=29`, an overlap of a quarter of that chunk with the chunk size it was measured against. On 9 cases every candidate has weight 1 or 2 and the split signal's two come right after the two weight-2 settings, so they survive the default cap of 6 and `rerank=lexical`, `max_chunks=2`, and the two `order` settings do not. `chunk_size=232` packs the two fitting paragraphs into one chunk, which fixes the split case, and it also packs the never-retrieved warranty sentence with neighbours that rank higher, so that case passes too: 5 of 9. `title=on` alone lifts the same warranty chunk into the top 4. Round 2 combines the winner with every round-1 setting that changes other knobs, and `chunk_size=232 title=on` also puts the ignored case's chunk first: 6 of 9. `chunk_size=116 overlap=29` passes only 2 of 9, and it sets `chunk_size` as the winner does, so round 2 does not combine them. On 9 tune cases the window rounds down to 0, so accuracy decides. The baseline row's latency includes the demo's one-time index warm-up, as the `experiment` table's does.
 
 With the default `--holdout 0.3`, the demo keeps 3 of its 9 cases back. With seed 0 the split and irrelevant failures land in the holdout, so the search sees the ignored and never-retrieved failures among the fixable ones and proposes `top_k=8`, `top_k=12`, the two `order` settings, `compress=2`, and `title=on`. `top_k=8`, `top_k=12`, and `title=on` each pass one more of the 6 tune cases, and so does every round-2 combination of `title=on` with another knob. They all pass 3 of 6, and the four at 136 input tokens tie on tokens, so the sweep picks `title=on`, which changes one knob where the combinations change two. On the 3 holdout cases it ties the baseline at 1 of 3, so the line reads `Set title=on. Accuracy 33% -> 50% (holdout 33% -> 33%)`. A tie this close is noise on a set this small, which is why the demo uses `--holdout 0`.
 

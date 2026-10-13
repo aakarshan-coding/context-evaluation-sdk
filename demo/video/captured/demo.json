@@ -3,37 +3,37 @@
   {
    "cmd": "pip install contexteval",
    "out": "Collecting contexteval\n  Downloading contexteval-0.4.0-py3-none-any.whl.metadata (39 kB)\nDownloading contexteval-0.4.0-py3-none-any.whl (111 kB)\nInstalling collected packages: contexteval\nSuccessfully installed contexteval-0.4.0",
-   "seconds": 5.248829599993769
+   "seconds": 12.739718299999367
   },
   {
    "cmd": "contexteval init --provider fake",
    "out": "initialized .\\.contexteval",
-   "seconds": 0.5633637999999337
+   "seconds": 0.5702633999753743
   },
   {
    "cmd": "python -m contexteval.demo.planted",
    "out": "planted.jsonl",
-   "seconds": 0.28547609999077395
+   "seconds": 0.3568123999866657
   },
   {
    "cmd": "contexteval build-tests --import planted.jsonl",
    "out": "imported 9 cases (9 new) into test set 'planted'",
-   "seconds": 0.4140511999721639
+   "seconds": 0.4911596000310965
   },
   {
    "cmd": "contexteval run contexteval.demo.app:answer --yes",
    "out": "estimate: 9 LLM calls, ~508 input and ~18 output tokens, about $0.0000\nrun 1: 9 cases, 2 passed, 7 failed, 0 crashed",
-   "seconds": 20.87109650002094
+   "seconds": 24.543080600036774
   },
   {
    "cmd": "contexteval diagnose --yes",
    "out": "app: up to 63 replay calls to contexteval.demo.app:answer (7 failures with evidence, 3 steps x 3 samples each, worst case)\nestimate: 63 LLM calls, ~3546 input and ~126 output tokens, about $0.0000\nrun 1:\n  not_context  When is phone support open?\n               keeping only gold (0/2) did not fix it; moving gold to the top was skipped because gold was already at the top\n  flaky        Where is Trailhead Gear headquartered?\n               the unchanged baseline passed on rerun (2/2)\n  irrelevant   Can fuel canisters be shipped by air?\n               keeping only the gold chunks fixed it (2/2); removed chunks 2, 3, 4 of retrieval 1; moving gold to the top was skipped because gold was already at the top\n  ignored      How long do warranty repairs take?\n               moving the gold chunk to the top fixed it (2/2); gold was at chunk 3 of retrieval 1\n  not_context  How much does a custom boot fitting cost if I buy the boots from you?\n               keeping only gold (0/2) did not fix it; moving gold to the top was skipped because gold was already at the top; the evidence was split across two adjacent chunks\n  missing      How long is the warranty on a sleeping bag?\n               the gold chunk was never retrieved; injecting the evidence fixed it (2/2)\n  missing      What is store credit for a returned tent worth?\n               the gold chunk was retrieved but dropped before the prompt; injecting the evidence fixed it (2/2)\ndiagnosed 7, skipped 0 already labeled, skipped 0 crashed, skipped 0 with no answer text",
-   "seconds": 12.829825300024822
+   "seconds": 20.919265699980315
   },
   {
    "cmd": "contexteval sweep --holdout 0 --yes",
-   "out": "source: run 1 (the newest baseline run with diagnoses)\nsplit: 9 tune cases, 0 holdout cases (seed 0); only the tune cases' labels guide the search\nwarning: no holdout cases, so the recommendation is not confirmed on cases the search did not see\nsweep: 7 labeled failures among the tune cases (not_context 2, flaky 1, irrelevant 1, ignored 1, missing/not_retrieved 1, missing/dropped 1); 1 with the evidence split across two adjacent chunks; the baseline retrieved up to 4 chunks of up to 116 characters\n  no setting can fix 2 not_context failures: the context held the answer and the model still got it wrong; look at the prompt, the model, or the expected answer\n  no setting can fix 1 flaky failure: the unchanged app passed on rerun; a setting cannot make the model deterministic\n  no setting can fix 1 missing/dropped failure: retrieval found the gold chunk and your own code removed it before the prompt; no retrieval setting changes that filter\ncandidates, heaviest first (6 of 10; the number is how many failures ask for it): compress=2 (2), title=on (2), chunk_size=232 (1), overlap=29 (1), top_k=8 (1), top_k=12 (1)\napp: up to 117 calls to contexteval.demo.app:answer (9 tune cases x (1 baseline + 6 settings x 2 rounds) + 0 holdout cases x 2, worst case)\nestimate: 117 LLM calls, ~6604 input and ~234 output tokens, about $0.0000\nexperiment 1 (sweep)\nround 1, 9 tune cases\nsetting         accuracy  passed  mean input tokens  mean latency ms  total cost\nbaseline        33%       3/9     122                53.8             unknown\ncompress=2      33%       3/9     122                10.0             unknown\ntitle=on        44%       4/9     136                8.3              unknown\nchunk_size=232  56%       5/9     172                7.4              unknown\ntop_k=8         44%       4/9     212                10.4             unknown\ntop_k=12        44%       4/9     318                9.6              unknown\nround 2, 9 tune cases\nsetting                    accuracy  passed  mean input tokens  mean latency ms  total cost\nbaseline                   33%       3/9     122                53.8             unknown\ncompress=2 chunk_size=232  56%       5/9     168                14.6             unknown\nchunk_size=232 title=on    67%       6/9     182                8.1              unknown\ntop_k=8 chunk_size=232     56%       5/9     351                8.8              unknown\ntop_k=12 chunk_size=232    56%       5/9     511                9.3              unknown\nnot applicable: overlap=29: build(overlap=29) raised ValueError: overlap (29) must be smaller than chunk_size (1)\nSet chunk_size=232 title=on. Accuracy 33% -> 67% (no holdout cases, so this is unconfirmed). Uses 49% more input tokens; mean latency 54 ms -> 8 ms.",
-   "seconds": 13.264532200002577
+   "out": "source: run 1 (the newest baseline run with diagnoses)\nsplit: 9 tune cases, 0 holdout cases (seed 0); only the tune cases' labels guide the search\nwarning: no holdout cases, so the recommendation is not confirmed on cases the search did not see\nsweep: 7 labeled failures among the tune cases (not_context 2, flaky 1, irrelevant 1, ignored 1, missing/not_retrieved 1, missing/dropped 1); 1 with the evidence split across two adjacent chunks; the baseline retrieved up to 4 chunks of up to 116 characters\n  no setting can fix 2 not_context failures: the context held the answer and the model still got it wrong; look at the prompt, the model, or the expected answer\n  no setting can fix 1 flaky failure: the unchanged app passed on rerun; a setting cannot make the model deterministic\n  no setting can fix 1 missing/dropped failure: retrieval found the gold chunk and your own code removed it before the prompt; no retrieval setting changes that filter\ncandidates, heaviest first (6 of 10; the number is how many failures ask for it): compress=2 (2), title=on (2), chunk_size=232 (1), chunk_size=116 overlap=29 (1), top_k=8 (1), top_k=12 (1)\napp: up to 117 calls to contexteval.demo.app:answer (9 tune cases x (1 baseline + 6 settings x 2 rounds) + 0 holdout cases x 2, worst case)\nestimate: 117 LLM calls, ~6604 input and ~234 output tokens, about $0.0000\nexperiment 1 (sweep)\nround 1, 9 tune cases\nsetting                    accuracy  passed  mean input tokens  mean latency ms  total cost\nbaseline                   33%       3/9     122                261.8            unknown\ncompress=2                 33%       3/9     122                13.8             unknown\ntitle=on                   44%       4/9     136                11.9             unknown\nchunk_size=232             56%       5/9     172                14.1             unknown\nchunk_size=116 overlap=29  22%       2/9     143                13.6             unknown\ntop_k=8                    44%       4/9     212                15.5             unknown\ntop_k=12                   44%       4/9     318                16.0             unknown\nround 2, 9 tune cases\nsetting                    accuracy  passed  mean input tokens  mean latency ms  total cost\nbaseline                   33%       3/9     122                261.8            unknown\ncompress=2 chunk_size=232  56%       5/9     168                13.6             unknown\nchunk_size=232 title=on    67%       6/9     182                12.1             unknown\ntop_k=8 chunk_size=232     56%       5/9     351                11.7             unknown\ntop_k=12 chunk_size=232    56%       5/9     511                12.6             unknown\nSet chunk_size=232 title=on. Accuracy 33% -> 67% (no holdout cases, so this is unconfirmed). Uses 49% more input tokens; mean latency 262 ms -> 12 ms.",
+   "seconds": 37.29380939999828
   }
  ]
 }

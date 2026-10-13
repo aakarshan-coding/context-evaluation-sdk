@@ -2,6 +2,12 @@
 
 This project follows [Semantic Versioning](https://semver.org/). Each release lists what changed for people who use contexteval.
 
+## Unreleased
+
+### Fixed
+
+- `contexteval sweep` proposes an overlap together with the chunk size it was measured against, as in `chunk_size=116 overlap=29`. It used to propose the overlap alone, so your `build` filled in your own chunk size, which could be smaller than the overlap; the demo's sweep listed `overlap=29` as not applicable for that reason.
+
 ## 0.4.0 (2026-10-13)
 
 ### Added
