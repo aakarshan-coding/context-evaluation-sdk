@@ -11,6 +11,12 @@ This project follows [Semantic Versioning](https://semver.org/). Each release li
 - `contexteval sweep` proposes chunking from the labels and that signal: a split evidence asks for `chunk_size` at twice and `overlap` at a quarter of the longest chunk the baseline delivered, and `ignored` and `irrelevant` failures ask for `title=on`. Among settings that as many failures ask for, the split signal's come first. These settings run only when the app offers `build(chunking)`; otherwise the sweep says how many failures pointed at chunking and what to add, and goes on with the retrieval settings. A `build` that refuses a chunking is listed as not applicable, as a refused `top_k` is. The experiment header counts the index builds a grid needs.
 - The demo app and `examples/realbot/bot.py` offer `build(chunking)`. The demo has a ninth planted case whose evidence spans two paragraphs of `corpus/fitting.md`; it is labeled `not_context` with the split signal, and the demo sweep now recommends `chunk_size=232 title=on`.
 
+### Changed
+
+- `contexteval sweep` breaks near-ties by the number of changed knobs. Input tokens within 5% of the cheapest contender's count as equal; among those the setting that passed more wins, then the one that changes fewer knobs, then the faster one. A combination such as `order=reverse title=on` no longer beats `title=on` alone by one input token when the reorder adds nothing. With the default holdout the demo sweep now recommends `title=on`.
+- When the sweep keeps the current settings, its last line is one sentence, such as "Keep the current settings, because no candidate beat the baseline on the tune cases (...)", instead of a second sentence that started in lowercase.
+- `contexteval --help` describes diagnosis, experiments, the sweep, and chunking, and the `experiment` and `sweep` help lines name chunking settings.
+
 ## 0.3.0 (v2, 2026-10-11)
 
 ### Added
