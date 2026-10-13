@@ -2,7 +2,7 @@
 
 This project follows [Semantic Versioning](https://semver.org/). Each release lists what changed for people who use contexteval.
 
-## Unreleased
+## 0.4.0 (2026-10-13)
 
 ### Added
 
