@@ -452,7 +452,7 @@ def cmd_sweep(args: argparse.Namespace) -> int:
             source = _sweep.source_run(store, RunId(args.run) if args.run is not None else None)
         except _sweep.SweepNotPossible as e:
             raise UserError(str(e)) from None
-        # The app loads before the plan: whether it offers build(chunking) decides which
+        # The app loads before the plan, because whether it offers build(chunking) decides which
         # candidates the plan may run.
         app = _runner.load_app(spec, pinecone_text_key=config.pinecone_text_key)
         try:

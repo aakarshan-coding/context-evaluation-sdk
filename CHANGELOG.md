@@ -2,6 +2,15 @@
 
 This project follows [Semantic Versioning](https://semver.org/). Each release lists what changed for people who use contexteval.
 
+## Unreleased
+
+### Added
+
+- Chunking settings for `contexteval experiment` and `contexteval sweep`: `chunk_size` (characters per chunk), `overlap` (characters carried from the end of one chunk into the next), and `title` (`on` or `off`, every chunk starts with its document's title). Chunking happens when your app builds its index, so these need an optional `build(chunking)` function beside `answer` in your app module. It takes a `contexteval.Chunking` and returns the answer function for an index built with it. `contexteval.chunk_text(text, chunking, title=None)` splits one document the way the real bot does, with overlap and an optional title, for use inside `build`; `Chunking.with_defaults` fills the knobs the experiment did not set with your app's own values. Each distinct chunking builds once per command and every case and setting that shares it reuses the build; the baseline never calls `build`. Without `build`, a chunking knob is a one-line error before any app call that says what to add.
+- A diagnosis records when the evidence was found only by joining two adjacent chunks. The label line then ends with "the evidence was split across two adjacent chunks", and the dashboard marks the failure "split gold". A diagnosis stored by an earlier version reads as not split.
+- `contexteval sweep` proposes chunking from the labels and that signal: a split evidence asks for `chunk_size` at twice and `overlap` at a quarter of the longest chunk the baseline delivered, and `ignored` and `irrelevant` failures ask for `title=on`. Among settings that as many failures ask for, the split signal's come first. These settings run only when the app offers `build(chunking)`; otherwise the sweep says how many failures pointed at chunking and what to add, and goes on with the retrieval settings. A `build` that refuses a chunking is listed as not applicable, as a refused `top_k` is. The experiment header counts the index builds a grid needs.
+- The demo app and `examples/realbot/bot.py` offer `build(chunking)`. The demo has a ninth planted case whose evidence spans two paragraphs of `corpus/fitting.md`; it is labeled `not_context` with the split signal, and the demo sweep now recommends `chunk_size=232 title=on`.
+
 ## 0.3.0 (v2, 2026-10-11)
 
 ### Added

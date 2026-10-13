@@ -134,8 +134,8 @@ class Unfixable:
 # The cause-to-candidates policy (design-notes "diagnosis-guided search"). Table order inside a
 # cause is the tie-break between candidates of equal weight. Chunking candidates (title=on,
 # chunk_size, overlap) run only when the app offers build(chunking); the plan withholds them
-# otherwise and the CLI says what to add. title=on answers the real-bot audit's cause: a chunk
-# cut from its heading carries no product name, so the model reads it as ignored or irrelevant.
+# otherwise and the CLI says what to add. title=on answers the real-bot audit's cause, a chunk
+# cut from its heading that carries no product name, so the model reads it as ignored or irrelevant.
 POLICY: Mapping[Cause, Fixable | Unfixable] = {
     FailureKind.NOT_RETRIEVED: Fixable((Scaled("top_k", 2), Scaled("top_k", 3))),
     FailureKind.DROPPED: Unfixable(

@@ -59,7 +59,7 @@ Run every case through the demo app's `answer()` function:
 contexteval run contexteval.demo.app:answer --yes
 ```
 
-You see `run 1: 8 cases, 2 passed, 6 failed, 0 crashed`.
+You see `run 1: 9 cases, 2 passed, 7 failed, 0 crashed`.
 
 Label each failure:
 
@@ -70,7 +70,7 @@ contexteval diagnose --yes
 Each failure gets a label and a line of evidence:
 
 ```text
-app: up to 54 replay calls to contexteval.demo.app:answer (6 failures with evidence, 3 steps x 3 samples each, worst case)
+app: up to 63 replay calls to contexteval.demo.app:answer (7 failures with evidence, 3 steps x 3 samples each, worst case)
 run 1:
   not_context  When is phone support open?
                keeping only gold (0/2) did not fix it; moving gold to the top was skipped because gold was already at the top
@@ -80,14 +80,18 @@ run 1:
                keeping only the gold chunks fixed it (2/2); removed chunks 2, 3, 4 of retrieval 1; moving gold to the top was skipped because gold was already at the top
   ignored      How long do warranty repairs take?
                moving the gold chunk to the top fixed it (2/2); gold was at chunk 3 of retrieval 1
+  not_context  How much does a custom boot fitting cost if I buy the boots from you?
+               keeping only gold (0/2) did not fix it; moving gold to the top was skipped because gold was already at the top; the evidence was split across two adjacent chunks
   missing      How long is the warranty on a sleeping bag?
                the gold chunk was never retrieved; injecting the evidence fixed it (2/2)
   missing      What is store credit for a returned tent worth?
                the gold chunk was retrieved but dropped before the prompt; injecting the evidence fixed it (2/2)
-diagnosed 6, skipped 0 already labeled, skipped 0 crashed, skipped 0 with no answer text
+diagnosed 7, skipped 0 already labeled, skipped 0 crashed, skipped 0 with no answer text
 ```
 
 The count after each step is samples that passed over samples drawn. The demo's fake model is deterministic, so every step settles at 2 of 2. A real model at a non-zero temperature shows splits like `(2/3)`.
+
+The second `not_context` line ends with "the evidence was split across two adjacent chunks". The demo chunks one paragraph per chunk, and that case's evidence spans two paragraphs, so the model saw it in two pieces. The [Chunking](#chunking) section shows how to test a different chunking.
 
 Test a fix. The "never retrieved" case ranks 5th, and the demo retrieves 4 chunks:
 
@@ -99,22 +103,22 @@ The table compares the baseline with the new setting:
 
 ```text
 setting   accuracy  passed  mean input tokens  mean latency ms  total cost
-baseline  38%       3/8     124                62.0             unknown
-top_k=10  50%       4/8     272                7.9              unknown
+baseline  33%       3/9     122                27.9             unknown
+top_k=10  44%       4/9     267                5.2              unknown
 ```
 
 The "never retrieved" case passes under `top_k=10`, so accuracy rises by one case. The flaky case failed only on its first call, so it passes in both rows. The cost column reads `unknown` because the fake model has no price.
 
-Or let contexteval pick the settings from the labels. The demo has only 8 cases, too few to hold any out, so this run tunes on all of them:
+Or let contexteval pick the settings from the labels. The demo has only 9 cases, too few to hold any out, so this run tunes on all of them:
 
 ```bash
 contexteval sweep --holdout 0 --yes
 ```
 
-The sweep says which labels no setting can fix and why, tries the settings the other labels call for, combines the winners, and ends with one recommendation:
+The sweep says which labels no setting can fix and why, tries the settings the other labels call for, including a different chunking when the app offers `build(chunking)` as the demo does, combines the winners, and ends with one recommendation:
 
 ```text
-Set top_k=8 rerank=lexical. Accuracy 38% -> 62% (no holdout cases, so this is unconfirmed). Uses 76% more input tokens; mean latency 36 ms -> 4 ms.
+Set chunk_size=232 title=on. Accuracy 33% -> 67% (no holdout cases, so this is unconfirmed). Uses 49% more input tokens; mean latency 38 ms -> 6 ms.
 ```
 
 The [Sweep](#sweep) section shows the whole output and explains how the search works.
@@ -144,7 +148,7 @@ The whole workflow made 39 calls to `gpt-4.1-mini` and cost $0.0038 in our run. 
 
 ## Point it at your own app
 
-contexteval needs one function that takes a question and returns an answer string. You pass it to the CLI as `module:function`. The CLI imports the module from the current directory.
+contexteval needs one function that takes a question and returns an answer string. You pass it to the CLI as `module:function`. The CLI imports the module from the current directory. A second, optional function `build(chunking)` beside it lets experiments change how your documents are chunked (see [Chunking](#chunking)).
 
 If your app queries chromadb or pinecone, or retrieves through a LangChain or LlamaIndex retriever, and calls OpenAI or Anthropic, directly or through the framework's chat model, it works as is. contexteval patches those classes before it imports your module.
 
@@ -217,7 +221,7 @@ Every command except `init` finds the project by walking up from the current dir
 | `contexteval build-tests --import FILE` | Imports your own JSONL or CSV cases. Makes no LLM calls. |
 | `contexteval run [module:function] [--test-set NAME] [--yes]` | Runs every case through your function and grades each answer. Remembers the app for later commands. |
 | `contexteval diagnose [--run ID] [--samples N] [--force] [--yes]` | Labels each failure of the latest baseline run, or of run `ID`. Each replay step draws up to `N` samples (default 3, odd) and a majority decides. Skips failures that already have a label unless you pass `--force`. |
-| `contexteval experiment [module:function] KNOB=v1,v2 ... [--yes]` | Runs every case under each combination of settings and prints a comparison table. |
+| `contexteval experiment [module:function] KNOB=v1,v2 ... [--yes]` | Runs every case under each combination of settings and prints a comparison table. Chunking knobs need `build(chunking)` in your app module. |
 | `contexteval sweep [module:function] [--run ID] [--rounds N] [--max-settings N] [--holdout F] [--seed S] [--tolerance N] [--yes]` | Picks settings from the labels of the newest baseline run with diagnoses, or of run `ID`, tries them on a tune split, confirms the winner on a holdout split, and prints one recommendation. |
 | `contexteval ui [--port 8765] [--no-open]` | Serves the dashboard at `http://127.0.0.1:8765/`. |
 
@@ -240,7 +244,7 @@ Each step is sampled, because an app that calls its model at a non-zero temperat
 
 Chunk and retrieval positions in label lines and in the dashboard count from 1.
 
-A passage counts as present when the chunk or prompt contains the evidence text after normalization. It also counts when 80% of the evidence words appear inside a window about 1.5 times the evidence length. The second rule catches evidence that your chunker split in two.
+A passage counts as present when the chunk or prompt contains the evidence text after normalization. It also counts when 80% of the evidence words appear inside a window about 1.5 times the evidence length. The second rule catches evidence that your chunker split in two: two adjacent chunks that hold the evidence between them are both gold. When that join was the only way to find the evidence, the diagnosis records it, the label line ends with "the evidence was split across two adjacent chunks", and the dashboard marks the failure "split gold". That is the clearest sign that the chunking caused the failure, and the [sweep](#sweep) reads it.
 
 ## Experiment knobs
 
@@ -253,8 +257,37 @@ Each knob takes a comma-separated list of values. contexteval runs every combina
 | `order` | `as_is`, `reverse`, `ends` | `ends` puts the best chunks at the start and end of the context, for models that lose the middle. |
 | `max_chunks` | a positive integer | Keeps only the first N chunks. |
 | `compress` | a positive integer | Keeps the N sentences of each chunk with the most word overlap with the question. |
+| `chunk_size` | a positive integer | Characters per chunk when your app builds its index. Needs `build(chunking)` ([Chunking](#chunking)). |
+| `overlap` | 0 or a positive integer | Characters carried from the end of one chunk into the next. Needs `build(chunking)`. |
+| `title` | `on`, `off` | Every chunk starts with its document's title. Needs `build(chunking)`. |
 
-For example, `contexteval experiment top_k=3,10 rerank=none,lexical` runs five settings: the baseline and four combinations. The table shows accuracy, cases passed, mean input tokens, mean latency, and total app cost per setting. Experiments never see the evidence passages, so a setting cannot win by peeking at the answer.
+For example, `contexteval experiment top_k=3,10 rerank=none,lexical` runs five settings: the baseline and four combinations. The table shows accuracy, cases passed, mean input tokens, mean latency, and total app cost per setting. Experiments never see the evidence passages, so a setting cannot win by peeking at the answer. The first five knobs change what reaches the prompt after retrieval, and contexteval applies them from the outside. The last three change the index itself, which only your app can rebuild.
+
+## Chunking
+
+Chunking happens when your app builds its index, before contexteval sees a chunk, so contexteval cannot re-chunk your documents by itself. To let `experiment` and `sweep` try other chunkings, put a `build` function next to `answer` in the same module. It takes a `contexteval.Chunking` and returns the answer function to run on an index built with it:
+
+```python
+def build(chunking: contexteval.Chunking):
+    chunking = chunking.with_defaults(chunk_size=500, overlap=0, title=False)  # your app's own values
+    for path in DOCS_DIR.glob("*.md"):
+        for n, chunk in enumerate(contexteval.chunk_text(path.read_text(), chunking, title=path.stem)):
+            index.add(f"{path.name}#{n}", chunk)
+    return answer
+```
+
+`Chunking` has three knobs. `chunk_size` is the characters per chunk, `overlap` the characters carried from the end of one chunk into the next, and `title` whether every chunk starts with its document's title. A knob the experiment did not set is `None`, and `with_defaults` fills it with your app's own value, so `title=on` alone changes nothing else. `contexteval.chunk_text(text, chunking, title=None)` splits one document: it packs whole paragraphs (text between blank lines) into a chunk until the next one would pass `chunk_size`, carries the last `overlap` characters forward in whole words, and prefixes the title when `title` is on. The prefix does not count toward the size, so a title experiment keeps the same chunk boundaries. `chunk_text` refuses a `Chunking` with an unset knob, because a guessed size would make a title experiment also change the chunks.
+
+Then chunking knobs work like the others, alone or with retrieval knobs:
+
+```bash
+contexteval experiment chunk_size=300,800 overlap=0,100 title=on,off --yes
+contexteval experiment top_k=8 title=on,off --yes
+```
+
+Each distinct chunking builds the index once per command, and every case and setting that shares it reuses that build; the experiment header says how many builds the grid needs. The baseline never calls `build`, so `contexteval run` is unchanged for an app that offers it. If your module has no `build`, a chunking knob is a one-line error before any app call that says what to add, and retrieval knobs still work. A `build` that raises, for example on an overlap larger than your chunk size, marks that setting not applicable; `experiment` stops with the reason and `sweep` skips it and goes on. `diagnose --run ID` on a chunking experiment run replays against the index that run was built on.
+
+The demo's `build` is in `contexteval/demo/app.py` and the real bot's in `examples/realbot/bot.py`. Both route their own chunking through `chunk_text`, so `build(Chunking())` and `answer` use the same index.
 
 ## Sweep
 
@@ -265,15 +298,18 @@ Each label asks for different settings. The sweep tries the ones the labels you 
 | Label | Settings tried | Why |
 |---|---|---|
 | `missing`, never retrieved | `top_k` at 2k and 3k | The right chunk ranked below k. |
-| `irrelevant` | `rerank=lexical`, `max_chunks` at k/2, `compress=2` | Other chunks crowded the right one out. |
-| `ignored` | `order=ends`, `order=reverse`, `compress=2` | The model skipped a chunk in the middle. |
+| `irrelevant` | `rerank=lexical`, `max_chunks` at k/2, `compress=2`, `title=on` | Other chunks crowded the right one out. A chunk cut from its heading carries no subject, so the model may read it as off-topic. |
+| `ignored` | `order=ends`, `order=reverse`, `compress=2`, `title=on` | The model skipped a chunk in the middle, or could not tell which subject a heading-less chunk belongs to. |
+| evidence split across two adjacent chunks, under any label | `chunk_size` at 2c and `overlap` at c/4, where c is the longest chunk the baseline delivered | The chunker cut the evidence in two. |
 | `missing`, dropped | none | Retrieval found the chunk and your own code removed it before the prompt. No retrieval setting changes that filter. |
 | `not_context` | none | The context held the answer and the model still got it wrong. Look at the prompt, the model, or the expected answer. |
 | `flaky` | none | The unchanged app passed on rerun. A setting cannot make the model deterministic. |
 
-A setting that more failures ask for is tried first. `--max-settings N` caps how many are tried per round (default 6).
+A failure counts once for its label and once more when its evidence was split, so a split `ignored` case asks for both kinds of fix. A setting that more failures ask for is tried first; among settings that as many failures ask for, the split signal's come first, because the split is direct evidence of the cause where a label's settings are a guess. `--max-settings N` caps how many are tried per round (default 6).
 
-If your app's retrieval cannot take a setting, for example a `top_k` on a retriever with no such knob, the sweep skips that setting and every later setting on the same knob, and goes on with the rest. The output lists each one, as in `not applicable: top_k=8: ...`, and the saved report keeps the reasons. The report is saved even when the sweep stops early, for example on a provider error or Ctrl-C, and it says why it stopped.
+`title=on`, `chunk_size`, and `overlap` change the index, so the sweep tries them only when your app module offers `build(chunking)` ([Chunking](#chunking)). Without it the sweep prints how many failures pointed at chunking, which settings it would have tried, and what to add, then goes on with the retrieval settings. The real bot in `examples/realbot` is the case this was built for: its chunker cut each product's heading away from its spec list, so a spec list in the prompt named no product and the model took specs from the wrong bike. `title=on` puts the document title back on every chunk.
+
+If your app cannot take a setting, for example a `top_k` on a retriever with no such knob or a `build` that raises on an overlap larger than its chunk size, the sweep skips that setting and every later setting on the same knob, and goes on with the rest. The output lists each one, as in `not applicable: top_k=8: ...`, and the saved report keeps the reasons. The report is saved even when the sweep stops early, for example on a provider error or Ctrl-C, and it says why it stopped.
 
 The search runs in rounds. Round 1 runs the baseline and each setting on its own. Round 2 combines the best setting so far with each round-1 setting that changes a different knob and did not lose to the baseline. `--rounds N` sets the depth (default 2). A round with nothing new to try ends the search early, so a run whose labels are all `missing` stops after round 1.
 
@@ -287,39 +323,38 @@ The whole output for the demo (`contexteval sweep --holdout 0 --yes` after `diag
 
 ```text
 source: run 1 (the newest baseline run with diagnoses)
-split: 8 tune cases, 0 holdout cases (seed 0); only the tune cases' labels guide the search
+split: 9 tune cases, 0 holdout cases (seed 0); only the tune cases' labels guide the search
 warning: no holdout cases, so the recommendation is not confirmed on cases the search did not see
-sweep: 6 labeled failures among the tune cases (not_context 1, flaky 1, irrelevant 1, ignored 1, missing/not_retrieved 1, missing/dropped 1); the baseline retrieved up to 4 chunks
-  no setting can fix 1 not_context failure: the context held the answer and the model still got it wrong; look at the prompt, the model, or the expected answer
+sweep: 7 labeled failures among the tune cases (not_context 2, flaky 1, irrelevant 1, ignored 1, missing/not_retrieved 1, missing/dropped 1); 1 with the evidence split across two adjacent chunks; the baseline retrieved up to 4 chunks of up to 116 characters
+  no setting can fix 2 not_context failures: the context held the answer and the model still got it wrong; look at the prompt, the model, or the expected answer
   no setting can fix 1 flaky failure: the unchanged app passed on rerun; a setting cannot make the model deterministic
   no setting can fix 1 missing/dropped failure: retrieval found the gold chunk and your own code removed it before the prompt; no retrieval setting changes that filter
-candidates, heaviest first (6 of 7; the number is how many failures ask for it): compress=2 (2), top_k=8 (1), top_k=12 (1), rerank=lexical (1), max_chunks=2 (1), order=ends (1)
-app: up to 104 calls to contexteval.demo.app:answer (8 tune cases x (1 baseline + 6 settings x 2 rounds) + 0 holdout cases x 2, worst case)
-estimate: 104 LLM calls, ~5824 input and ~208 output tokens, about $0.0000
+candidates, heaviest first (6 of 10; the number is how many failures ask for it): compress=2 (2), title=on (2), chunk_size=232 (1), overlap=29 (1), top_k=8 (1), top_k=12 (1)
+app: up to 117 calls to contexteval.demo.app:answer (9 tune cases x (1 baseline + 6 settings x 2 rounds) + 0 holdout cases x 2, worst case)
+estimate: 117 LLM calls, ~6604 input and ~234 output tokens, about $0.0000
 experiment 1 (sweep)
-round 1, 8 tune cases
+round 1, 9 tune cases
 setting         accuracy  passed  mean input tokens  mean latency ms  total cost
-baseline        38%       3/8     124                35.6             unknown
-compress=2      38%       3/8     124                3.8              unknown
-top_k=8         50%       4/8     217                4.1              unknown
-top_k=12        50%       4/8     323                4.4              unknown
-rerank=lexical  50%       4/8     124                5.3              unknown
-max_chunks=2    38%       3/8     74                 3.3              unknown
-order=ends      38%       3/8     124                3.4              unknown
-round 2, 8 tune cases
-setting                      accuracy  passed  mean input tokens  mean latency ms  total cost
-baseline                     38%       3/8     124                35.6             unknown
-rerank=lexical compress=2    50%       4/8     124                3.9              unknown
-top_k=8 rerank=lexical       62%       5/8     217                3.6              unknown
-top_k=12 rerank=lexical      62%       5/8     323                3.8              unknown
-rerank=lexical max_chunks=2  50%       4/8     74                 3.8              unknown
-rerank=lexical order=ends    50%       4/8     124                3.9              unknown
-Set top_k=8 rerank=lexical. Accuracy 38% -> 62% (no holdout cases, so this is unconfirmed). Uses 76% more input tokens; mean latency 36 ms -> 4 ms.
+baseline        33%       3/9     122                38.0             unknown
+compress=2      33%       3/9     122                6.7              unknown
+title=on        44%       4/9     136                5.4              unknown
+chunk_size=232  56%       5/9     172                5.8              unknown
+top_k=8         44%       4/9     212                6.9              unknown
+top_k=12        44%       4/9     318                6.4              unknown
+round 2, 9 tune cases
+setting                    accuracy  passed  mean input tokens  mean latency ms  total cost
+baseline                   33%       3/9     122                38.0             unknown
+compress=2 chunk_size=232  56%       5/9     168                5.8              unknown
+chunk_size=232 title=on    67%       6/9     182                5.7              unknown
+top_k=8 chunk_size=232     56%       5/9     351                5.4              unknown
+top_k=12 chunk_size=232    56%       5/9     511                5.8              unknown
+not applicable: overlap=29: build(overlap=29) raised ValueError: overlap (29) must be smaller than chunk_size (1)
+Set chunk_size=232 title=on. Accuracy 33% -> 67% (no holdout cases, so this is unconfirmed). Uses 49% more input tokens; mean latency 38 ms -> 6 ms.
 ```
 
-`top_k=8` retrieves the chunk that ranked 5th, and `rerank=lexical` moves the ignored case's chunk to the top, so `top_k=8 rerank=lexical` passes the most cases. On 8 tune cases the window rounds down to 0, so accuracy decides, and `top_k=8 rerank=lexical` beats `top_k=12 rerank=lexical`, which passes as many cases, on input tokens. With `--tolerance 1` the sweep would take `rerank=lexical max_chunks=2`, which passes one case fewer with 74 input tokens instead of 217 and leaves the planted not_retrieved case failing. The baseline row's latency includes the demo's one-time index warm-up, as the `experiment` table's does.
+The split case asks for `chunk_size=232`, twice the longest chunk the baseline delivered, and for `overlap=29`. On 9 cases every candidate has weight 1 or 2 and the split signal's two come right after the two weight-2 settings, so they survive the default cap of 6 and `rerank=lexical`, `max_chunks=2`, and the two `order` settings do not. `chunk_size=232` packs the two fitting paragraphs into one chunk, which fixes the split case, and it also packs the never-retrieved warranty sentence with neighbours that rank higher, so that case passes too: 5 of 9. `title=on` alone lifts the same warranty chunk into the top 4. Round 2 combines the winner with every round-1 setting that changes other knobs, and `chunk_size=232 title=on` also puts the ignored case's chunk first: 6 of 9. The demo's own chunking is one paragraph per chunk, which its `build` expresses as `chunk_size=1`, so an overlap of 29 cannot be built; the sweep lists the reason and goes on. On 9 tune cases the window rounds down to 0, so accuracy decides. The baseline row's latency includes the demo's one-time index warm-up, as the `experiment` table's does.
 
-With the default `--holdout 0.3`, the demo keeps 3 of its 8 cases back. With seed 0 the not_retrieved and irrelevant failures land in the holdout, so the search sees only the ignored failure among the fixable ones. No reorder or compress setting beats the baseline on the 5 tune cases, and the sweep recommends keeping the current settings. This is the holdout doing its job on a set this small, and it is why the demo uses `--holdout 0`.
+With the default `--holdout 0.3`, the demo keeps 3 of its 9 cases back. With seed 0 the split and irrelevant failures land in the holdout, so the search sees the ignored and never-retrieved failures among the fixable ones and proposes `top_k=8`, `top_k=12`, the two `order` settings, `compress=2`, and `title=on`. `top_k=8`, `top_k=12`, and `title=on` each pass one more of the 6 tune cases, and so does every round-2 combination of `title=on` with another knob. They all pass 3 of 6, and the four at 136 input tokens tie on tokens as well, so the sweep's last key, latency, picks `order=reverse title=on` by a fraction of a millisecond, although the reorder added nothing. On the 3 holdout cases it ties the baseline at 1 of 3, so the line reads `Set order=reverse title=on. Accuracy 33% -> 50% (holdout 33% -> 33%)`. A tie this close is noise on a set this small, which is why the demo uses `--holdout 0`.
 
 The sweep is stored as an experiment. The dashboard lists it with its rows and marks the recommended one.
 
@@ -346,6 +381,7 @@ The estimate counts characters divided by 4 as tokens, priced from a built-in ta
 - `@contexteval.retriever` accepts `async def` functions, and `answer` may be `async def`. The CLI runs an async `answer` on one event loop for the whole command, so clients bound to the loop stay valid across questions. In production each asyncio task has its own capture buffer.
 - pgvector has no client library to hook. Use `@contexteval.retriever` on your query function.
 - Production traces are split by a heuristic. Each LLM call closes one trace that holds the retrievals since the previous LLM call. An agent that calls the LLM several times per question produces several traces.
+- The chunking knobs (`chunk_size`, `overlap`, `title`) need a `build(chunking)` function beside `answer`. contexteval cannot re-chunk an index it did not build. The split signal joins only chunks that are adjacent in the order your app received them, so evidence whose halves were retrieved apart, or only one of them, reads as `not_retrieved`.
 - Cases run one at a time, in the same process as the CLI.
 - An experiment setting applies to every retrieval call in a run.
 - A chromadb call with several query texts is recorded but never changed by an experiment.
@@ -354,7 +390,7 @@ The estimate counts characters divided by 4 as tokens, priced from a built-in ta
 
 ## Roadmap
 
-- v2. LangChain and LlamaIndex support (done). An automatic sweep that picks experiments from the labels (done, `contexteval sweep`).
+- v2. LangChain and LlamaIndex support (done). An automatic sweep that picks experiments from the labels (done, `contexteval sweep`). Chunking settings for experiments and the sweep, through an optional `build(chunking)` in the app (done).
 - v3. A background optimizer that replays sampled production traces and suggests changes. OpenTelemetry import.
 - v4. Support for long-running tool agents. A hosted team version.
 
