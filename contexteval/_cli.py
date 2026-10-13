@@ -623,14 +623,14 @@ COMMANDS: dict[str, Command] = {
     "build-tests": Command(cmd_build_tests, "generate test cases from documents, or import a file", _args_build_tests),
     "run": Command(cmd_run, "run every test case through your answer() and grade it", _args_run),
     "diagnose": Command(cmd_diagnose, "label each failure of a run", _args_diagnose),
-    "experiment": Command(cmd_experiment, "run a settings grid and compare", _args_experiment),
-    "sweep": Command(cmd_sweep, "pick settings from the latest diagnosis, try them, and recommend one", _args_sweep),
+    "experiment": Command(cmd_experiment, "run a grid of retrieval or chunking settings and compare", _args_experiment),
+    "sweep": Command(cmd_sweep, "pick retrieval and chunking settings from the latest diagnosis, try them, and recommend one", _args_sweep),
     "ui": Command(cmd_ui, "serve the local dashboard", _args_ui),
 }
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="contexteval", description="Find out why your RAG agent's context failed.")
+    parser = argparse.ArgumentParser(prog="contexteval", description="Diagnose why your RAG agent's context failed, test retrieval and chunking settings, and sweep for the one to set.")
     sub = parser.add_subparsers(dest="command", metavar="COMMAND", required=True)
     for name, command in COMMANDS.items():
         command.add_arguments(sub.add_parser(name, help=command.help))

@@ -28,12 +28,15 @@ def test_python_m_help_lists_all_six_commands() -> None:
 
 
 def test_main_help_exits_zero(capsys: pytest.CaptureFixture[str]) -> None:
-    """Defect: --help treated as an error exit, which breaks `contexteval --help` in docs."""
+    """Defect: --help treated as an error exit, which breaks `contexteval --help` in docs; or a
+    description that still names only the v1 diagnosis and hides experiments, the sweep, and
+    chunking."""
     with pytest.raises(SystemExit) as exc:
         _cli.main(["--help"])
     assert exc.value.code == 0
     out = capsys.readouterr().out
     assert all(name in out for name in COMMANDS)
+    assert "Diagnose why your RAG agent's context failed, test retrieval and chunking settings, and sweep for the one to set." in " ".join(out.split())
     assert set(_cli.COMMANDS) == set(COMMANDS)
 
 
