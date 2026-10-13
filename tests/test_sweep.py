@@ -470,7 +470,7 @@ def test_sweep_over_an_app_with_no_top_k_knob_ends_with_a_line_and_a_report(proj
     assert err == ""
     assert "not applicable: top_k=4: " in out and "has no top_k parameter" in out
     assert "not applicable: top_k=6: sets top_k, which top_k=4 showed the app's retrieval cannot take" in out
-    assert _final(out).startswith("Keep the current settings. no candidate could run; top_k=4: ") and "top_k=6" in _final(out)
+    assert _final(out).startswith("Keep the current settings, because no candidate could run; top_k=4: ") and "top_k=6" in _final(out)
     store = Store.open(project)
     try:
         report, runs = _sweep_runs(store)
@@ -513,7 +513,7 @@ def test_report_is_saved_when_the_sweep_stops_early(store: Store) -> None:
     assert [[settings[r] for r in round_] for round_ in halfway.rounds] == [[Setting(top_k=8)]]
     at_start = _sweep.SweepReport.from_json(later.report)
     assert at_start.baseline_run is None and at_start.rounds == () and at_start.reason == halfway.reason
-    assert _sweep.recommendation_line(at_start, []) == "Keep the current settings. the sweep stopped early: RuntimeError: provider down."
+    assert _sweep.recommendation_line(at_start, []) == "Keep the current settings, because the sweep stopped early: RuntimeError: provider down."
 
 
 def test_near_tie_prefers_more_passes_before_lower_latency() -> None:
@@ -638,7 +638,7 @@ def test_a_setting_that_wins_on_tune_but_loses_on_holdout_is_not_recommended(pro
     assert _cli.main(["sweep", "--holdout", "0.5", "--seed", "3", "--yes"]) == 0
     out = capsys.readouterr().out
     final = out.rstrip().splitlines()[-1]
-    assert final.startswith("Keep the current settings. top_k=4 won on the tune cases (40% -> 100%) but lost on the holdout cases (40% -> 0%)")
+    assert final.startswith("Keep the current settings, because top_k=4 won on the tune cases (40% -> 100%) but lost on the holdout cases (40% -> 0%)")
     assert "holdout, 5 cases" in out
 
     store = Store.open(project)
@@ -930,7 +930,7 @@ def test_sweep_without_a_builder_says_what_chunking_would_buy_and_goes_on_with_r
     ) in out
     assert "candidates, heaviest first (2 of 2; the number is how many failures ask for it): top_k=6 (1), top_k=9 (1)" in out
     assert "round 1, 4 tune cases" in out and "chunk_size" not in out.split("candidates, heaviest first")[1].split("\n")[0]
-    assert _final(out).startswith("Keep the current settings. no candidate beat the baseline on the tune cases")
+    assert _final(out).startswith("Keep the current settings, because no candidate beat the baseline on the tune cases")
     store = Store.open(project)
     try:
         report, runs = _sweep_runs(store)

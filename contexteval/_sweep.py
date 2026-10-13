@@ -673,7 +673,7 @@ def recommendation_line(report: SweepReport, table: Sequence[ExperimentRow]) -> 
     """One plain sentence or two: the change to make, the accuracy before and after on tune and
     holdout, and what it costs; or why to keep the current settings."""
     if report.recommended is None or report.baseline_run is None:
-        return f"Keep the current settings. {report.reason}."
+        return f"Keep the current settings, because {report.reason}."
     rows = {row.run_id: row for row in table}
     before, after = rows[report.baseline_run], rows[report.recommended]
     if report.holdout_runs:
