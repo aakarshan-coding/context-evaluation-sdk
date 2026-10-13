@@ -1,0 +1,36 @@
+{
+ "steps": [
+  {
+   "cmd": "contexteval init --provider openai --model gpt-4.1-mini",
+   "out": "initialized .\\.contexteval",
+   "seconds": 1.465018399991095
+  },
+  {
+   "cmd": "contexteval build-tests --import customer_questions.jsonl",
+   "out": "imported 28 cases (28 new) into test set 'customer_questions'",
+   "seconds": 1.6542700999998488
+  },
+  {
+   "cmd": "contexteval build-tests corpus --per-passage 1 --yes",
+   "out": "estimate: 24 LLM calls, ~9432 input and ~2880 output tokens, about $0.0084\nbuilt 23 cases (23 new) from 22 documents; rejected 1\n  rejected 1: evidence not verbatim",
+   "seconds": 35.38364630000433
+  },
+  {
+   "cmd": "contexteval run examples.realbot.bot:answer --yes",
+   "out": "estimate: 51 LLM calls, ~3395 input and ~102 output tokens, about $0.0015\nrun 1: 51 cases, 45 passed, 6 failed, 0 crashed",
+   "seconds": 81.83183320000535
+  },
+  {
+   "cmd": "contexteval diagnose --yes",
+   "out": "app: up to 54 replay calls to examples.realbot.bot:answer (6 failures with evidence, 3 steps x 3 samples each, worst case)\nestimate: 54 LLM calls, ~3384 input and ~108 output tokens, about $0.0015\nrun 1:\n  missing      How heavy is the Trailhawk Pro?\n               the gold chunk was never retrieved; injecting the evidence fixed it (2/2)\n  missing      When do Ridgeline Rewards certificates expire?\n               the gold chunk was never retrieved; injecting the evidence fixed it (2/2)\n  missing      What's the most weight the Metro-E can carry, including me?\n               the gold chunk was never retrieved; injecting the evidence fixed it (2/2)\n  missing      What type of drivetrain does the standard Ridgeline Gravel SL use?\n               the gold chunk was never retrieved; injecting the evidence fixed it (2/2)\n  missing      What type of brakes does the Trailhawk 29 Hardtail have?\n               the gold chunk was never retrieved; injecting the evidence fixed it (2/2)\n  ignored      What is the rear travel of the Trailhawk Pro's suspension?\n               moving the gold chunk to the top fixed it (2/2); gold was at chunk 4 of retrieval 1\ndiagnosed 6, skipped 0 already labeled, skipped 0 crashed, skipped 0 with no answer text",
+   "seconds": 41.80256789998384
+  },
+  {
+   "cmd": "contexteval sweep --yes",
+   "out": "source: run 1 (the newest baseline run with diagnoses)\nsplit: 35 tune cases, 16 holdout cases (seed 0); only the tune cases' labels guide the search\nsweep: 4 labeled failures among the tune cases (missing/not_retrieved 3, ignored 1); the baseline retrieved up to 4 chunks of up to 534 characters\ncandidates, heaviest first (6 of 6; the number is how many failures ask for it): top_k=8 (3), top_k=12 (3), order=ends (1), order=reverse (1), compress=2 (1), title=on (1)\nnear-tie window: 1 case (5% of 35)\napp: up to 487 calls to examples.realbot.bot:answer (35 tune cases x (1 baseline + 6 settings x 2 rounds) + 16 holdout cases x 2, worst case)\nestimate: 487 LLM calls, ~32189 input and ~974 output tokens, about $0.0144\nexperiment 1 (sweep)\nround 1, 35 tune cases\nsetting        accuracy  passed  mean input tokens  mean latency ms  total cost\nbaseline       89%       31/35   400                1099.0           $0.0074\ntop_k=8        100%      35/35   761                1089.9           $0.0125\ntop_k=12       100%      35/35   1105               1148.0           $0.0174\norder=ends     91%       32/35   400                1063.3           $0.0074\norder=reverse  89%       31/35   400                1121.2           $0.0074\ncompress=2     80%       28/35   261                1101.7           $0.0053\ntitle=on       100%      35/35   437                1112.2           $0.0078\nround 2, 35 tune cases\nsetting                 accuracy  passed  mean input tokens  mean latency ms  total cost\nbaseline                89%       31/35   400                1099.0           $0.0074\ntop_k=8 title=on        100%      35/35   787                1160.7           $0.0129\ntop_k=12 title=on       100%      35/35   1154               1115.2           $0.0179\norder=ends title=on     100%      35/35   437                1151.4           $0.0079\norder=reverse title=on  100%      35/35   437                1041.8           $0.0078\nholdout, 16 cases\nsetting   accuracy  passed  mean input tokens  mean latency ms  total cost\nbaseline  88%       14/16   412                1148.5           $0.0035\ntitle=on  94%       15/16   424                1225.6           $0.0037\nSet title=on. Accuracy 89% -> 100% (holdout 88% -> 94%). Uses 9% more input tokens; mean latency 1099 ms -> 1112 ms.",
+   "seconds": 562.3133646999486
+  }
+ ],
+ "estimated_usd": 0.0258,
+ "spent_usd": 0.1499
+}

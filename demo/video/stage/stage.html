@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>contexteval demo stage</title>
+<link rel="stylesheet" href="stage.css">
+</head>
+<body>
+<div id="stage">
+  <div id="card">
+    <div id="card-title"></div>
+    <div id="card-sub"></div>
+    <div id="card-extra"></div>
+  </div>
+  <div id="window">
+    <div id="titlebar">
+      <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+      <span id="wtitle"></span>
+      <span id="speed"></span>
+    </div>
+    <div id="content">
+      <div id="zoom">
+        <div id="term" class="layer"><div id="term-lines"></div></div>
+        <div id="dash" class="layer"><iframe id="ui" title="contexteval ui"></iframe></div>
+      </div>
+    </div>
+  </div>
+  <div id="ripple"></div>
+  <svg id="cursor" width="28" height="36" viewBox="0 0 28 36" aria-hidden="true">
+    <path d="M3 2 L3 28 L9.5 22 L14 33 L18.5 31 L14 20.5 L23 20.5 Z" fill="#fff" stroke="#111" stroke-width="2" stroke-linejoin="round"/>
+  </svg>
+  <div id="caption"></div>
+</div>
+<script src="stage.js"></script>
+</body>
+</html>

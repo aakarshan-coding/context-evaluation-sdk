@@ -2,6 +2,10 @@
 
 contexteval tells you why your RAG app gave a wrong answer. It runs your app on test questions, records what was retrieved and what reached the prompt, and labels each failure.
 
+![contexteval runs the demo bot, labels each failure, and sweeps for the setting that fixes it](https://raw.githubusercontent.com/aakarshan-coding/context-evaluation-sdk/main/docs/media/contexteval-demo.gif)
+
+The [full demo video](https://github.com/aakarshan-coding/context-evaluation-sdk/blob/main/docs/media/contexteval-demo.mp4) (87 seconds) also shows the dashboard and a run on a real support bot.
+
 Most RAG failures are context failures, and they come in three kinds:
 
 - **Missing.** The right passage never reached the prompt. Retrieval did not find it, or your code dropped it after retrieval.
