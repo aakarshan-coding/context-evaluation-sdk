@@ -11,7 +11,7 @@ from contexteval import _diagnose
 from contexteval import _text as text
 from contexteval._diagnose import GoldLocation, JudgeReplyError, diagnose_run, judge, locate_gold, parse_verdict
 from contexteval._intervention import BASELINE, GoldToTop, OnlyGold, apply_transform
-from contexteval._llm import FakeProvider, LLMRequest, Task
+from contexteval._llm import FakeProvider, Task
 from contexteval._runner import make_grader
 from contexteval._store import Store
 from contexteval.types import (
