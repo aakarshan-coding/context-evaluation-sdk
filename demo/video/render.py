@@ -17,6 +17,7 @@ from pathlib import Path
 
 import imageio_ffmpeg
 from playwright.sync_api import Route, sync_playwright
+from playwright.sync_api import TimeoutError as PlaywrightTimeout
 
 HERE = Path(__file__).resolve().parent
 FPS = 30
@@ -26,6 +27,18 @@ def serve_stage(route: Route) -> None:
     rel = route.request.url.split("/__stage/", 1)[1].split("?", 1)[0]
     path = HERE / rel if rel.startswith("captured/") else HERE / "stage" / rel
     route.fulfill(path=str(path))
+
+
+def screenshot(page) -> bytes:
+    # A long render once died on a single 30 s screenshot stall late in the timeline; retry it.
+    for attempt in range(3):
+        try:
+            return page.screenshot(type="png", timeout=60_000)
+        except PlaywrightTimeout:
+            if attempt == 2:
+                raise
+            time.sleep(2)
+    raise AssertionError("unreachable")
 
 
 def encoder(out: Path) -> subprocess.Popen:
@@ -65,7 +78,7 @@ def main() -> None:
             image, shots, start = b"", 0, time.monotonic()
             for n in range(total):
                 if page.evaluate("step()") or not image:
-                    image = page.screenshot(type="png")
+                    image = screenshot(page)
                     shots += 1
                 ff.stdin.write(image)
                 if n % 300 == 0:
