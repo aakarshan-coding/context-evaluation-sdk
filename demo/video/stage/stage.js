@@ -2,7 +2,7 @@
 // The renderer calls init() once, then step() once per frame. Every motion is a tween on a fixed
 // 30 fps clock, so the same captures always render the same video.
 
-const FPS = 30, W = 1760, H = 864, DASH_SCALE = 1.25;
+const FPS = 30, W = 1760, H = 864, DASH_SCALE = 1.25, COLS = 92;
 const $ = (id) => document.getElementById(id);
 const ease = (p) => (p < 0.5 ? 4 * p * p * p : 1 - Math.pow(-2 * p + 2, 3) / 2);
 const lerp = (a, b, p) => a + (b - a) * p;
@@ -53,13 +53,19 @@ function union(rects) {
 }
 function pad(r, px) { return { x: r.x - px, y: r.y - px, w: r.w + 2 * px, h: r.h + 2 * px }; }
 
-function zoomTo(getRect, dur = 0.9, max = 2.0) {
+// `keep`, when given, is a rect whose full width must stay on screen: the terminal's column.
+function zoomTo(getRect, dur = 0.9, max = 2.0, keep = null) {
   let from, to;
   seq(dur, () => {
     from = { ...view };
-    const r = getRect();
-    const s = clamp(Math.min((0.9 * W) / r.w, (0.8 * H) / r.h), 1, max);
-    to = { s, fx: clamp(r.x + r.w / 2, W / (2 * s), W - W / (2 * s)), fy: clamp(r.y + r.h / 2, H / (2 * s), H - H / (2 * s)) };
+    const r = getRect(), k = keep && keep(), margin = 18;
+    let s = clamp(Math.min((0.9 * W) / r.w, (0.8 * H) / r.h), 1, max);
+    let fx = r.x + r.w / 2;
+    if (k) {
+      s = Math.max(1, Math.min(s, W / (k.w + 2 * margin)));
+      fx = clamp(fx, k.x + k.w + margin - W / (2 * s), k.x - margin + W / (2 * s));
+    }
+    to = { s, fx: clamp(fx, W / (2 * s), W - W / (2 * s)), fy: clamp(r.y + r.h / 2, H / (2 * s), H - H / (2 * s)) };
   }, (p) => {
     const e = ease(p);
     view.s = lerp(from.s, to.s, e); view.fx = lerp(from.fx, to.fx, e); view.fy = lerp(from.fy, to.fy, e);
@@ -90,9 +96,19 @@ function fadeWindow(show, dur = 0.8) {
 function setCard(title, sub, extra) {
   fire(() => { $("card-title").textContent = title; $("card-sub").textContent = sub; $("card-extra").innerHTML = extra || ""; });
 }
+const TITLEBAR = { dark: [[27, 33, 53], [170, 178, 207]], light: [[236, 236, 234], [85, 85, 79]] };
+const mix = (a, b, p) => `rgb(${a.map((v, i) => Math.round(lerp(v, b[i], p))).join(",")})`;
+// The outgoing layer fades out before the incoming one fades in, so the two never show at once.
 function showLayer(name, title, dur = 0.6) {
-  fire(() => { $("wtitle").textContent = title; $("window").classList.toggle("light", name === "dash"); });
-  par(dur, null, (p) => { $("dash").style.opacity = name === "dash" ? p : 1 - p; });
+  const toDash = name === "dash";
+  fire(() => { $("wtitle").textContent = title; });
+  par(dur, null, (p) => {
+    const out = ease(clamp(p / 0.45, 0, 1)), inn = ease(clamp((p - 0.45) / 0.55, 0, 1));
+    $(toDash ? "term-lines" : "dash").style.opacity = 1 - out;
+    $(toDash ? "dash" : "term-lines").style.opacity = toDash ? inn : Math.max(inn, 1 - out);
+    const light = toDash ? ease(p) : 1 - ease(p);
+    Object.assign($("titlebar").style, { background: mix(TITLEBAR.dark[0], TITLEBAR.light[0], light), color: mix(TITLEBAR.dark[1], TITLEBAR.light[1], light) });
+  });
 }
 function speedBadge(text, show, dur = 0.4) {
   if (show) fire(() => { $("speed").textContent = text; });
@@ -140,8 +156,7 @@ function output(text, { perLine = 0.03, max = 1.0, after = 0.25 } = {}) {
     while (block.nodes.length < Math.ceil(p * lines.length)) {
       const text = lines[block.nodes.length];
       const d = Object.assign(document.createElement("div"), { className: "line", textContent: text });
-      // A wrapped line continues under its own indent, as the reader expects from aligned columns.
-      const indent = text.length - text.trimStart().length;
+      const indent = hang(text);
       Object.assign(d.style, { paddingLeft: `calc(8px + ${indent}ch)`, textIndent: `-${indent}ch` });
       $("term-lines").append(d);
       block.nodes.push(d);
@@ -149,18 +164,29 @@ function output(text, { perLine = 0.03, max = 1.0, after = 0.25 } = {}) {
   });
   return block;
 }
-function textRect(node, chars) {
-  const range = document.createRange();
-  const textNode = node.firstChild;
-  range.setStart(textNode, 0);
-  range.setEnd(textNode, Math.min(chars ?? textNode.length, textNode.length));
-  return toContentRect(range.getBoundingClientRect());
+// A wrapped line continues under its own column: after a short "label: ", after a first column
+// set off by two or more spaces, or else under its leading indent.
+function hang(text) {
+  const label = /^\s*[^:\s][^:]{0,20}: /.exec(text);
+  if (label) return label[0].length;
+  const column = /^\s*\S+\s{2,}/.exec(text);
+  if (column && column[0].length <= 24) return column[0].length;
+  return text.length - text.trimStart().length;
+}
+const lineRect = (node) => toContentRect(node.getBoundingClientRect());
+function termColumn() {
+  const probe = Object.assign(document.createElement("div"), { className: "line", textContent: "0".repeat(COLS) });
+  probe.style.visibility = "hidden";
+  $("term-lines").append(probe);
+  const r = lineRect(probe);
+  probe.remove();
+  return r;
 }
 function linesMatching(block, re) { return block.nodes.filter((n) => re.test(n.textContent)); }
 function highlight(block, re) { fire(() => linesMatching(block, re).forEach((n) => n.classList.add("hl"))); }
 function unhighlight() { fire(() => document.querySelectorAll(".line.hl").forEach((n) => n.classList.remove("hl"))); }
-function zoomLines(block, re, chars, max) {
-  zoomTo(() => pad(union(linesMatching(block, re).map((n) => textRect(n, chars))), 14), 0.9, max);
+function zoomLines(block, re, max) {
+  zoomTo(() => pad(union(linesMatching(block, re).map(lineRect)), 14), 0.9, max, termColumn);
 }
 function updateTerm() {
   const lines = $("term-lines");
@@ -285,19 +311,19 @@ function build(demo, real) {
   caption("Run every case through the demo bot");
   command(demo[4].cmd, { cps: 24 });
   const run = out(demo[4]);
-  highlight(run, /cases, \d+ passed/); zoomLines(run, /cases, \d+ passed/, undefined, 1.9); wait(1.8); zoomOut(); unhighlight();
+  highlight(run, /cases, \d+ passed/); zoomLines(run, /cases, \d+ passed/, 1.9); marks.run = T; wait(1.8); zoomOut(); unhighlight();
 
   caption("Diagnose: every failure gets a label and its evidence");
   command(demo[5].cmd, { cps: 24 });
   const labels = /^ {2}(missing|irrelevant|ignored|not_context|flaky) /;
   const diag = out(demo[5], { max: 0.8 });
-  highlight(diag, labels); zoomLines(diag, labels, undefined, 1.8); wait(2.4); zoomOut(); unhighlight();
+  highlight(diag, labels); zoomLines(diag, labels, 1.8); marks.diagnose = T; wait(2.4); zoomOut(); unhighlight();
 
   caption("Sweep: try the settings the labels call for");
   command(demo[6].cmd, { cps: 24 });
   const sweep = out(demo[6], { max: 1.2 });
   wait(0.8);
-  highlight(sweep, /^Set /); zoomLines(sweep, /^Set /, 50, 2.0); wait(2.4); zoomOut(); unhighlight();
+  highlight(sweep, /^Set /); zoomLines(sweep, /^Set /, 2.0); marks.sweep = T; wait(2.4); zoomOut(); unhighlight();
 
   marks.gifEnd = T;
   // The dashboard over the same project.
@@ -334,12 +360,12 @@ function build(demo, real) {
   const final = real[real.length - 1];
   command(final.cmd, { cps: 30 });
   const minutes = Math.round(final.seconds / 60);
-  speedBadge(`▶▶ sped up:${minutes} min of sweep in 3 s`, true);
+  speedBadge(`▶▶  sped up: ${minutes} min of sweep in 3 s`, true);
   const realSweep = out(final, { perLine: 0.08, max: 3.0 });
   speedBadge("", false);
   wait(0.6);
   caption("The sweep's recommendation, checked on holdout cases");
-  highlight(realSweep, /^Set /); zoomLines(realSweep, /^Set /, 57, 2.0); wait(3.0); zoomOut(); unhighlight();
+  highlight(realSweep, /^Set /); zoomLines(realSweep, /^Set /, 2.0); marks.realSweep = T; wait(3.0); zoomOut(); unhighlight();
 
   // End card.
   caption("");

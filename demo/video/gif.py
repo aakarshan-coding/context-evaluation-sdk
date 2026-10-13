@@ -8,7 +8,7 @@ import sys
 
 import imageio_ffmpeg
 
-START, DURATION = 15.4, 20.0
+START, DURATION = 15.5, 20.5
 
 src, out = sys.argv[1], sys.argv[2]
 start, duration = (float(sys.argv[3]), float(sys.argv[4])) if len(sys.argv) > 4 else (START, DURATION)

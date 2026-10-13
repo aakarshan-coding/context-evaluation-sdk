@@ -43,15 +43,16 @@ html, body { margin: 0; width: 1920px; height: 1080px; overflow: hidden; backgro
 .dot.r { background: #ff5f57; } .dot.y { background: #febc2e; } .dot.g { background: #28c840; }
 #wtitle { position: absolute; left: 0; right: 0; text-align: center; pointer-events: none; }
 #speed {
-  margin-left: auto; position: relative; font-size: 20px; font-weight: 700; color: #1a1f3a; background: #ffd56b;
-  border-radius: 999px; padding: 4px 18px; opacity: 0; box-shadow: 0 0 0 4px rgba(255, 213, 107, 0.25);
+  margin: 0 4px 0 auto; position: relative; font-size: 16px; line-height: 1.2; font-weight: 700; color: #1a1f3a; background: #ffd56b;
+  border-radius: 999px; padding: 4px 16px; opacity: 0; box-shadow: 0 0 0 3px rgba(255, 213, 107, 0.22); white-space: nowrap;
 }
 #content { position: relative; width: 1760px; height: 864px; overflow: hidden; }
 #zoom { position: absolute; left: 0; top: 0; width: 1760px; height: 864px; transform-origin: 0 0; }
 .layer { position: absolute; inset: 0; }
 #term { background: var(--term-bg); overflow: hidden; }
-#term-lines { position: absolute; left: 0; right: 0; top: 0; padding: 26px 34px; font: 19px/1.55 var(--mono); color: var(--term-text); }
-.line { white-space: pre-wrap; overflow-wrap: anywhere; border-radius: 6px; margin: 0 -8px; padding: 0 8px; }
+#term-lines { position: absolute; left: 0; right: 0; top: 0; padding: 26px 34px; font: 20px/1.55 var(--mono); color: var(--term-text); }
+/* The terminal is 92 columns wide, so a zoom that shows the whole column never cuts a line. */
+.line { white-space: pre-wrap; overflow-wrap: break-word; border-radius: 6px; margin: 0 -8px; padding: 0 8px; max-width: calc(92ch + 16px); }
 .line.cmd { color: #fff; margin-top: 10px; }
 .line.cmd:first-child { margin-top: 0; }
 .line .prompt { color: var(--term-prompt); }
