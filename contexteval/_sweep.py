@@ -101,9 +101,9 @@ class Baseline:
 @dataclass(frozen=True)
 class Scaled:
     """An integer knob set relative to the baseline: top_k and max_chunks to k (top_k=2k widens
-    retrieval, max_chunks=k/2 narrows the prompt), chunk_size and overlap to chunk_chars."""
+    retrieval, max_chunks=k/2 narrows the prompt), chunk_size to chunk_chars."""
 
-    knob: Literal["top_k", "max_chunks", "chunk_size", "overlap"]
+    knob: Literal["top_k", "max_chunks", "chunk_size"]
     factor: float
 
     def resolve(self, base: Baseline) -> Setting | None:
@@ -118,7 +118,25 @@ class Scaled:
         return Setting(**{self.knob: value})  # type: ignore[arg-type]
 
 
-Candidate = Union[Setting, Scaled]
+@dataclass(frozen=True)
+class Overlap:
+    """An overlap of `fraction` of chunk_chars, proposed together with chunk_size=chunk_chars.
+    An overlap is only valid below the chunk size it is built with. Proposed alone, it would be
+    built against the app's own size, which contexteval never sees: the demo's own chunking is
+    one paragraph per chunk, expressed as chunk_size=1, so a lone overlap=29 was refused at build.
+    Naming the size the overlap was measured against makes the candidate valid for any app."""
+
+    fraction: float
+
+    def resolve(self, base: Baseline) -> Setting | None:
+        """None when no overlap below chunk_chars exists, including when no chunk was delivered."""
+        overlap = max(1, round(base.chunk_chars * self.fraction))
+        if overlap >= base.chunk_chars:
+            return None
+        return Setting(chunk_size=base.chunk_chars, overlap=overlap)
+
+
+Candidate = Union[Setting, Scaled, Overlap]
 
 
 @dataclass(frozen=True)
@@ -148,7 +166,7 @@ POLICY: Mapping[Cause, Fixable | Unfixable] = {
         "the context held the answer and the model still got it wrong; look at the prompt, the model, or the expected answer"
     ),
     FailureKind.FLAKY: Unfixable("the unchanged app passed on rerun; a setting cannot make the model deterministic"),
-    Signal.SPLIT_GOLD: Fixable((Scaled("chunk_size", 2), Scaled("overlap", 0.25))),
+    Signal.SPLIT_GOLD: Fixable((Scaled("chunk_size", 2), Overlap(0.25))),
 }
 
 
@@ -158,7 +176,7 @@ def candidates_for(cause: Cause, base: Baseline) -> list[Setting]:
         return []
     settings = []
     for candidate in rule.candidates:
-        setting = candidate.resolve(base) if isinstance(candidate, Scaled) else candidate
+        setting = candidate if isinstance(candidate, Setting) else candidate.resolve(base)
         if setting is not None and setting != BASELINE and setting not in settings:
             settings.append(setting)
     return settings

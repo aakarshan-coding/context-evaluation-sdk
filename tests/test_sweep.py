@@ -73,7 +73,7 @@ def test_policy_maps_each_label_to_its_candidates_and_the_unfixable_to_none() ->
     ignored = resolved[FailureKind.IGNORED]
     assert {"order": "ends"} in ignored and {"order": "reverse"} in ignored and any(set(c) == {"compress"} for c in ignored)
     assert {"title": True} in ignored
-    assert resolved[Signal.SPLIT_GOLD] == [{"chunk_size": 800}, {"overlap": 100}]
+    assert resolved[Signal.SPLIT_GOLD] == [{"chunk_size": 800}, {"chunk_size": 400, "overlap": 100}]
 
     for kind in (FailureKind.DROPPED, FailureKind.NOT_CONTEXT, FailureKind.FLAKY):
         rule = _sweep.POLICY[kind]
@@ -93,8 +93,21 @@ def test_relative_candidates_follow_the_observed_baseline_and_drop_no_ops() -> N
     assert [_knobs(s)["top_k"] for s in _sweep.candidates_for(FailureKind.NOT_RETRIEVED, _sweep.Baseline(1, 400))] == [2, 3]
     assert all(_knobs(s).get("max_chunks", 0) < 12 for s in _sweep.candidates_for(FailureKind.IRRELEVANT, _sweep.Baseline(12, 400)))
     assert not any("max_chunks" in _knobs(s) for s in _sweep.candidates_for(FailureKind.IRRELEVANT, _sweep.Baseline(1, 400)))
-    assert [_knobs(s) for s in _sweep.candidates_for(Signal.SPLIT_GOLD, _sweep.Baseline(4, 1000))] == [{"chunk_size": 2000}, {"overlap": 250}]
+    assert [_knobs(s) for s in _sweep.candidates_for(Signal.SPLIT_GOLD, _sweep.Baseline(4, 1000))] == [{"chunk_size": 2000}, {"chunk_size": 1000, "overlap": 250}]
     assert _sweep.candidates_for(Signal.SPLIT_GOLD, _sweep.Baseline(4, 0)) == []
+
+
+def test_an_overlap_candidate_carries_the_chunk_size_it_was_measured_against() -> None:
+    """Defect (the demo sweep's "overlap=29 ... must be smaller than chunk_size (1)"): an overlap
+    scaled from the longest delivered chunk was proposed alone, so the app built it against its
+    own chunk size, which contexteval never sees and which can be smaller than the overlap. Every
+    candidate that sets an overlap must name a chunk size it is valid for, whatever the app's own."""
+    for chars in range(0, 300):
+        for setting in _sweep.candidates_for(Signal.SPLIT_GOLD, _sweep.Baseline(4, chars)):
+            chunking = setting.chunking
+            if chunking.overlap is not None:
+                assert chunking.chunk_size is not None and chunking.overlap < chunking.chunk_size, (chars, setting.name)
+            chunking.with_defaults(chunk_size=1, overlap=0, title=False)
 
 
 def test_every_diagnosis_has_a_failure_kind() -> None:
@@ -132,10 +145,10 @@ def test_candidates_are_ranked_by_how_many_failures_carry_their_label() -> None:
     assert all(r.weight >= 1 for r in ranked) and ranked == sorted(ranked, key=lambda r: -r.weight)
     assert _sweep.rank_candidates({FailureKind.DROPPED: 2, FailureKind.FLAKY: 1}, BASE) == []
     split = _sweep.rank_candidates({FailureKind.NOT_CONTEXT: 2, Signal.SPLIT_GOLD: 2}, BASE)
-    assert [(r.setting.name, r.weight, r.kinds) for r in split] == [("chunk_size=800", 2, (Signal.SPLIT_GOLD,)), ("overlap=100", 2, (Signal.SPLIT_GOLD,))]
+    assert [(r.setting.name, r.weight, r.kinds) for r in split] == [("chunk_size=800", 2, (Signal.SPLIT_GOLD,)), ("chunk_size=400 overlap=100", 2, (Signal.SPLIT_GOLD,))]
     # A signal is direct evidence, so at equal weight its candidates outrank a label's and survive --max-settings.
     tied = [r.setting.name for r in _sweep.rank_candidates({FailureKind.NOT_RETRIEVED: 1, Signal.SPLIT_GOLD: 1}, BASE)]
-    assert tied == ["chunk_size=800", "overlap=100", "top_k=8", "top_k=12"]
+    assert tied == ["chunk_size=800", "chunk_size=400 overlap=100", "top_k=8", "top_k=12"]
 
 
 def test_no_candidate_setting_can_carry_gold() -> None:
@@ -145,7 +158,7 @@ def test_no_candidate_setting_can_carry_gold() -> None:
     for ranked in _sweep.rank_candidates(counts, BASE):
         transforms = ranked.setting.intervention().transforms
         assert not any(isinstance(t, GOLD_TRANSFORMS) for t in transforms), ranked.setting.name
-    assert all(isinstance(c, (Setting, _sweep.Scaled)) for rule in _sweep.POLICY.values() if isinstance(rule, Fixable) for c in rule.candidates)
+    assert all(isinstance(c, (Setting, _sweep.Scaled, _sweep.Overlap)) for rule in _sweep.POLICY.values() if isinstance(rule, Fixable) for c in rule.candidates)
 
 
 def test_merge_combines_disjoint_knobs_and_names_overlaps() -> None:
@@ -234,7 +247,7 @@ def test_split_gold_proposes_chunking_candidates_only_when_the_app_has_a_builder
         elif case.id == CaseId("c01"):
             store.save_diagnosis(trace_id, Missing("not_retrieved", True, RERUN))
     longest = max(len(c.text) for s in store.traces(run) for e in s.trace.retrievals for c in e.delivered)
-    chunking = [Setting(chunk_size=2 * longest), Setting(overlap=round(longest * 0.25))]
+    chunking = [Setting(chunk_size=2 * longest), Setting(chunk_size=longest, overlap=round(longest * 0.25))]
 
     with_builder, _ = _sweep.plan_sweep(store, store.run(run), rounds=2, max_settings=6, holdout=0, seed=0, tolerance=None, builder=True)
     assert with_builder.baseline == _sweep.Baseline(K, longest) and with_builder.split_gold == 1 and with_builder.chunking_pointers == 1
@@ -571,8 +584,8 @@ def test_demo_sweep_tries_the_chunking_the_split_case_asks_for_and_names_the_dro
     not_retrieved case does not lead to a top_k candidate; the split case does not lead to a
     chunk_size candidate scaled from the longest baseline chunk, or that candidate is cut by the
     default --max-settings behind the label candidates of equal weight, or it runs on the demo's
-    own index so the split case still fails under it; a build the app refuses (an overlap on the
-    demo's one-paragraph chunks) stops the sweep instead of being listed as not applicable; the
+    own index so the split case still fails under it; an overlap candidate built against the
+    demo's own size (one paragraph per chunk), so the build refuses it and the row is lost; the
     dropped case is offered a setting instead of the reason none can help; --holdout 0 is refused
     or not warned about; or the sweep is stored as a manual experiment. On 9 tune cases the
     default near-tie window is 0."""
@@ -597,9 +610,9 @@ def test_demo_sweep_tries_the_chunking_the_split_case_asks_for_and_names_the_dro
         source = store.traces(report.source_run)
         longest = max(len(c.text) for s in source for e in s.trace.retrievals for c in e.delivered)
         candidates = out.split("candidates, heaviest first")[1].splitlines()[0]
-        assert f"chunk_size={2 * longest} (1)" in candidates and f"overlap={round(longest / 4)} (1)" in candidates
+        assert f"chunk_size={2 * longest} (1)" in candidates and f"chunk_size={longest} overlap={round(longest / 4)} (1)" in candidates
         assert "title=on (2)" in candidates and "top_k=8 (1)" in candidates and "top_k=12 (1)" in candidates
-        assert f"not applicable: overlap={round(longest / 4)}: build(overlap={round(longest / 4)}) raised ValueError: overlap" in out
+        assert "not applicable" not in out
         final = out.rstrip().splitlines()[-1]
         assert final.startswith("Set ") and f"chunk_size={2 * longest}" in final and "(no holdout cases, so this is unconfirmed)" in final
 
@@ -896,14 +909,14 @@ def test_sweep_with_a_builder_tries_the_chunking_the_split_signal_asks_for_and_r
     assert _cli.main(["sweep", "--holdout", "0", "--yes"]) == 0
     out = capsys.readouterr().out
     assert "sweep: 2 labeled failures among the tune cases (missing/not_retrieved 1, missing/dropped 1); 1 with the evidence split across two adjacent chunks; the baseline retrieved up to 3 chunks of up to 22 characters" in out
-    assert "candidates, heaviest first (4 of 4; the number is how many failures ask for it): chunk_size=44 (1), overlap=6 (1), top_k=6 (1), top_k=9 (1)" in out
+    assert "candidates, heaviest first (4 of 4; the number is how many failures ask for it): chunk_size=44 (1), chunk_size=22 overlap=6 (1), top_k=6 (1), top_k=9 (1)" in out
     assert "chunking:" not in out
     final = _final(out)
     # The app records no input tokens, so every row that passes 3 of 4 ties and latency picks
     # among them; a round-2 combination with a top_k may win, but a chunking knob is always in it.
-    assert final.startswith("Set ") and ("chunk_size=44" in final or "overlap=6" in final), final
+    assert final.startswith("Set ") and ("chunk_size=44" in final or "chunk_size=22 overlap=6" in final), final
     builds = sys.modules["split_app_build"].BUILDS  # type: ignore[attr-defined]
-    assert builds[:2] == [Chunking(chunk_size=44), Chunking(overlap=6)] and len(builds) == len(set(builds))
+    assert builds[:2] == [Chunking(chunk_size=44), Chunking(chunk_size=22, overlap=6)] and len(builds) == len(set(builds))
     store = Store.open(project)
     try:
         report, runs = _sweep_runs(store)
@@ -925,7 +938,7 @@ def test_sweep_without_a_builder_says_what_chunking_would_buy_and_goes_on_with_r
     assert _cli.main(["sweep", "--holdout", "0", "--yes"]) == 0
     out = capsys.readouterr().out
     assert (
-        f"chunking: 1 failure points at chunking, but {spec} has no build(chunking), so chunk_size=44, overlap=6 cannot be tried; "
+        f"chunking: 1 failure points at chunking, but {spec} has no build(chunking), so chunk_size=44, chunk_size=22 overlap=6 cannot be tried; "
         "add `def build(chunking: contexteval.Chunking)` beside answer that rebuilds the index with contexteval.chunk_text"
     ) in out
     assert "candidates, heaviest first (2 of 2; the number is how many failures ask for it): top_k=6 (1), top_k=9 (1)" in out
